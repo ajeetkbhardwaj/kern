@@ -42,12 +42,15 @@ export interface CreateAgentSessionOptions {
   thinkingLevel?: ThinkingLevel;
   /** Resume the most recent session instead of creating a new one. */
   resume?: boolean;
+  /** Resume a specific session by session ID or file path. */
+  resumeSession?: string;
 }
 
 export interface AgentSession {
   prompt(text: string, opts?: { signal?: AbortSignal }): Promise<void>;
   subscribe(listener: AgentEventListener): () => void;
   budgetUsage(): { turns: number; totalToolCalls: number; wallTimeMs: number };
+  budgetLimits?(): BudgetLimits;
   isBusy(): boolean;
   setModel(adapter: ModelAdapter): Promise<void>;
   modelInfo(): ModelInfo;
@@ -109,9 +112,16 @@ async function createSessionRuntime(options: CreateAgentSessionOptions): Promise
   const logger = options.logger ?? createLogger("info");
   const policyConfig = { ...DEFAULT_POLICY_CONFIG, ...(options.policy ?? {}) };
   const store = new SessionStore({ storageRoot: options.storageRoot, logger });
-  const manager = options.resume
-    ? await SessionManager.resume(store, options.cwd)
-    : await SessionManager.create(store, options.cwd);
+  let manager: SessionManager;
+  if (options.resumeSession) {
+    const found = await store.findSessionById(options.cwd, options.resumeSession);
+    if (found) manager = await SessionManager.resume(store, options.cwd, found.filePath);
+    else manager = await SessionManager.create(store, options.cwd);
+  } else if (options.resume) {
+    manager = await SessionManager.resume(store, options.cwd);
+  } else {
+    manager = await SessionManager.create(store, options.cwd);
+  }
 
   return buildSessionWithRuntime(options, manager, logger);
 }
@@ -132,7 +142,7 @@ async function buildSessionWithRuntime(
   tools.register(createReadTool(options.cwd));
   tools.register(createWriteTool(options.cwd));
   tools.register(createEditTool(options.cwd));
-  tools.register(createBashTool(options.cwd));
+  tools.register(createBashTool({ root: options.cwd }));
   for (const extra of options.extraTools ?? []) {
     if (tools.has(extra.name)) {
       logger.warn("extra_tool_name_collision", { name: extra.name });
@@ -153,8 +163,18 @@ async function buildSessionWithRuntime(
       fileHints: query.split(/\s+/).filter((part) => part.length > 2),
       symbolHints: query.split(/\s+/).filter((part) => /[A-Z]/.test(part) || part.includes("-") || part.includes("_")),
     };
-    const hits = await semanticSearch.retrieve(intent);
-    const notes = await projectMemory.search(query);
+    let hits: Awaited<ReturnType<typeof semanticSearch.retrieve>> = [];
+    let notes: Awaited<ReturnType<typeof projectMemory.search>> = [];
+    try {
+      hits = await semanticSearch.retrieve(intent);
+    } catch (error) {
+      logger.warn("repo_context_search_failed", { error: error instanceof Error ? error.message : String(error) });
+    }
+    try {
+      notes = await projectMemory.search(query);
+    } catch (error) {
+      logger.warn("project_memory_search_failed", { error: error instanceof Error ? error.message : String(error) });
+    }
     return {
       query,
       likelyFiles: hits.slice(0, 8).map((hit) => hit.path),
@@ -198,6 +218,7 @@ async function buildSessionWithRuntime(
     prompt: (text, opts) => runtime.runUserTurn(text, opts ?? {}),
     subscribe: (l) => events.subscribe(l),
     budgetUsage: () => runtime.budgetUsage(),
+    budgetLimits: () => runtime.budgetLimits(),
     isBusy: () => runtime.isBusy(),
     setModel: (adapter) => runtime.setModel(adapter),
     modelInfo: () => runtime.modelInfo(),

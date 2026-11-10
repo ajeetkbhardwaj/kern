@@ -243,5 +243,73 @@ describe("openai adapter", () => {
     expect(calls.length).toBeGreaterThan(0);
     const body = JSON.parse(calls[0]!.body);
     expect(body.reasoning_effort).toBe("medium");
+    expect(body.max_tokens).toBe(4000);
+    expect(body.tools?.length).toBe(1);
+    expect(body.tool_choice).toBe("auto");
+  });
+
+  it("classifies context-length HTTP errors correctly", async () => {
+    const adapter = createOpenAIAdapter({
+      provider: "test",
+      modelId: "gpt-4o-mini",
+      baseUrl: "https://example.com/v1",
+      apiKey: "k",
+      contextWindow: 128000,
+      maxOutputTokens: 4000,
+      fetchImpl: (async () =>
+        new Response("maximum context length exceeded", {
+          status: 400,
+          statusText: "Bad Request",
+        })),
+    });
+
+    await expect(
+      (async () => {
+        for await (const _ of adapter.stream({
+          systemPrompt: "sys",
+          messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: new Date().toISOString() }],
+          tools: [],
+        })) {
+          // drain
+        }
+      })(),
+    ).rejects.toMatchObject({ kind: "context_length", retryable: false });
+  });
+
+  it("omits tools/tool_choice when no tools are provided", async () => {
+    const calls: Array<{ body: string }> = [];
+    const adapter = createOpenAIAdapter({
+      provider: "test",
+      modelId: "gpt-4o-mini",
+      baseUrl: "https://example.com/v1",
+      apiKey: "k",
+      contextWindow: 128000,
+      maxOutputTokens: 4000,
+      fetchImpl: (async (_url, init) => {
+        calls.push({ body: String((init as any)?.body ?? "") });
+        return {
+          ok: true,
+          status: 200,
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(`data: [DONE]\n\n`));
+              controller.close();
+            },
+          }),
+        } as any;
+      }) as typeof fetch,
+    });
+
+    for await (const _ of adapter.stream({
+      systemPrompt: "sys",
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: new Date().toISOString() }],
+      tools: [],
+    })) {
+      // drain
+    }
+
+    const body = JSON.parse(calls[0]!.body);
+    expect(body.tools).toBeUndefined();
+    expect(body.tool_choice).toBeUndefined();
   });
 });

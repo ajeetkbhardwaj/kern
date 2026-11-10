@@ -1,4 +1,4 @@
-import type { RepoIndex, RepoFileRecord } from "@kern/repo-index";
+import type { RepoIndex } from "@kern/repo-index";
 import type { SymbolStore } from "@kern/symbol-store";
 import { RetrievalRanker, type RetrievalCandidate } from "./retrieval-ranker.js";
 
@@ -17,37 +17,47 @@ export class SemanticSearch {
   ) {}
 
   async retrieve(intent: SearchIntent): Promise<RetrievalCandidate[]> {
-    await this.repoIndex.ensureLoaded();
-    await this.symbolStore.indexRepo();
+    if (this.repoIndex.getLastRefreshedAt()) {
+      await this.repoIndex.refresh({ incremental: true });
+    } else {
+      await this.repoIndex.ensureLoaded();
+    }
+    await this.symbolStore.indexRepo({ incremental: !!this.symbolStore.getLastIndexedAt() });
 
-    const query = intent.query.toLowerCase();
+    const query = intent.query.trim();
     const results = new Map<string, RetrievalCandidate>();
 
     for (const file of this.repoIndex.all()) {
-      const score = this.ranker.score(query, file.path, this.lookupSymbols(file.path));
-      if (score.score > 0) results.set(file.path, score);
+      const symbols = this.lookupSymbols(file.path);
+      const candidate = this.ranker.score(query, file.path, symbols, {
+        taskType: intent.taskType,
+        ...(file.modifiedAt ? { modifiedAt: file.modifiedAt } : {}),
+      });
+      if (candidate.score > 0) results.set(file.path, candidate);
     }
 
-    for (const hint of intent.fileHints ?? []) {
+    for (const hint of (intent.fileHints ?? []).map((h) => h.trim()).filter(Boolean)) {
       for (const file of this.repoIndex.searchByName(hint)) {
-        const current = results.get(file.path) ?? this.ranker.score(hint, file.path, this.lookupSymbols(file.path));
-        current.score += 15;
-        current.reasons.push("file hint");
+        const current = results.get(file.path) ?? this.ranker.score(hint, file.path, this.lookupSymbols(file.path), { taskType: intent.taskType });
+        current.score += 18;
+        current.reasons = [...new Set([...current.reasons, "file hint"])];
+        current.confidence = current.score >= 50 ? "high" : current.score >= 20 ? "medium" : "low";
         results.set(file.path, current);
       }
     }
 
-    for (const symbol of intent.symbolHints ?? []) {
+    for (const symbol of (intent.symbolHints ?? []).map((h) => h.trim()).filter(Boolean)) {
       for (const match of this.symbolStore.findByName(symbol)) {
-        const current = results.get(match.file) ?? this.ranker.score(symbol, match.file, [match.name]);
-        current.score += 25;
+        const current = results.get(match.file) ?? this.ranker.score(symbol, match.file, [match.name], { taskType: intent.taskType });
+        current.score += 28;
         current.symbolMatches = [...new Set([...(current.symbolMatches ?? []), match.name])];
-        current.reasons.push("symbol hint");
+        current.reasons = [...new Set([...current.reasons, "symbol hint"])];
+        current.confidence = current.score >= 50 ? "high" : current.score >= 20 ? "medium" : "low";
         results.set(match.file, current);
       }
     }
 
-    return [...results.values()].sort((a, b) => b.score - a.score).slice(0, 25);
+    return [...results.values()].sort((a, b) => b.score - a.score || a.path.localeCompare(b.path)).slice(0, 25);
   }
 
   private lookupSymbols(filePath: string): string[] {

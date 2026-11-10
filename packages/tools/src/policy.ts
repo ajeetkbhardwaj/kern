@@ -31,7 +31,7 @@ const SENSITIVE_CMD_PATTERNS = [
 ];
 
 export class AllowAllPolicy implements ToolPolicyEngine {
-  async evaluate(): Promise<PolicyDecision> {
+  async evaluate(_input: PolicyInput): Promise<PolicyDecision> {
     return { decision: "allow" };
   }
 }
@@ -77,7 +77,7 @@ export class DefaultPolicy implements ToolPolicyEngine {
       if (SENSITIVE_CMD_PATTERNS.some((re) => re.test(cmd))) {
         return { decision: "deny", reason: "Bash command touches sensitive credentials path" };
       }
-      if (DESTRUCTIVE_PATTERNS.some((re) => re.test(cmd))) {
+      if (DESTRUCTIVE_PATTERNS.some((re) => re.test(cmd)) && this.config.destructiveAlwaysRequiresApproval) {
         return { decision: "require_approval", prompt: `Destructive command detected. Approve? ${cmd}` };
       }
       if (this.config.approvalMode === "ask" && !auto) {

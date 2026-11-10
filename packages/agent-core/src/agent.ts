@@ -23,6 +23,7 @@ import {
   serializeError,
   KernError,
   redact,
+  classifyModelError,
 } from "@kern/protocol";
 import { SessionManager } from "@kern/session-store";
 import { ToolRegistry } from "@kern/tools";
@@ -85,6 +86,10 @@ export class AgentRuntime {
 
   budgetUsage() {
     return this.budgets.usage();
+  }
+
+  budgetLimits(): BudgetLimits {
+    return this.budgets.limitsSnapshot;
   }
 
   /** Token usage of the most recent context build (null before first turn). */
@@ -169,6 +174,8 @@ export class AgentRuntime {
     this.turn = 0;
     this.activeAbortController = opts.signal ? null : new AbortController();
     const signal = opts.signal ?? this.activeAbortController?.signal;
+    let pendingQueuedFlush = false;
+    let caughtError: unknown;
     try {
       await this.sessions.appendUserMessage(userText);
       await this.ensureCompactIfNeeded("before_prompt", signal);
@@ -198,7 +205,7 @@ export class AgentRuntime {
           this.events.emit({ type: "agent_end", reason: "final_response" });
           await this.ensureCompactIfNeeded("after_agent_end", signal);
           this.events.emit({ type: "agent_settled" });
-          await this.flushQueuedTurn();
+          pendingQueuedFlush = true;
           return;
         }
         this.budgets.checkToolBatch(toolCalls.length);
@@ -219,7 +226,7 @@ export class AgentRuntime {
         });
         this.events.emit({ type: "agent_end", reason: "aborted" });
         this.events.emit({ type: "agent_settled" });
-        await this.flushQueuedTurn();
+        pendingQueuedFlush = true;
         return;
       }
       const serialized = serializeError(error);
@@ -231,11 +238,17 @@ export class AgentRuntime {
       });
       this.events.emit({ type: "agent_error", error: serialized });
       this.events.emit({ type: "agent_settled" });
-      await this.flushQueuedTurn();
-      throw error;
+      pendingQueuedFlush = true;
+      caughtError = error;
     } finally {
       this.busy = false;
       this.activeAbortController = null;
+    }
+    if (pendingQueuedFlush) {
+      await this.flushQueuedTurn();
+    }
+    if (caughtError !== undefined) {
+      throw caughtError;
     }
   }
 
@@ -300,29 +313,42 @@ export class AgentRuntime {
 
   private async streamModel(request: Parameters<ModelAdapter["stream"]>[0], signal?: AbortSignal): Promise<ChatMessage> {
     return withRetry(
-      async () => {
+      async (attempt) => {
         const assembler = new AssistantMessageAssembler();
         this.events.emit({ type: "message_start", message: { role: "assistant" } });
-        for await (const event of this.model.stream(request)) {
-          this.throwIfAborted(signal);
-          switch (event.type) {
-            case "text_delta":
-              this.events.emit({ type: "text_delta", delta: event.delta });
-              break;
-            case "reasoning_delta":
-              this.events.emit({ type: "reasoning_delta", delta: event.delta });
-              break;
-            case "tool_call_complete":
-            case "tool_call_delta":
-            case "usage":
-            case "finished":
-              break;
+        try {
+          for await (const event of this.model.stream(request)) {
+            this.throwIfAborted(signal);
+            switch (event.type) {
+              case "text_delta":
+                this.events.emit({ type: "text_delta", delta: event.delta });
+                break;
+              case "reasoning_delta":
+                this.events.emit({ type: "reasoning_delta", delta: event.delta });
+                break;
+              case "usage":
+                this.events.emit(event);
+                break;
+              case "tool_call_complete":
+              case "tool_call_delta":
+              case "finished":
+                break;
+            }
+            assembler.apply(event);
           }
-          assembler.apply(event);
+          const message = assembler.finalize(now());
+          this.events.emit({ type: "message_end", message });
+          return message;
+        } catch (error) {
+          // On retryable failures mid-stream, the next attempt will emit a fresh message_start.
+          // Avoid leaving consumers without a terminal signal for this attempt.
+          if (attempt < this.retry.maxAttempts && classifyError(error) !== "cancelled") {
+            const reason = classifyError(error);
+            // no synthetic message_end; listeners observe retry/error events and next message_start
+            void reason;
+          }
+          throw error;
         }
-        const message = assembler.finalize(now());
-        this.events.emit({ type: "message_end", message });
-        return message;
       },
       classifyError,
       this.retry,
@@ -382,7 +408,7 @@ export class AgentRuntime {
 function classifyError(error: unknown): ModelErrorKind {
   if (error instanceof KernError && error.kind) return error.kind;
   if (error instanceof Error && error.name === "AbortError") return "cancelled";
-  return "unknown";
+  return classifyModelError(error);
 }
 
 function isCancelled(error: unknown, signal?: AbortSignal): boolean {

@@ -7,10 +7,14 @@ interface CliFlags {
   prompt: string;
   readOnly: boolean;
   maxTurns?: number;
+  maxWallTimeMs?: number;
+  maxToolCallsPerTurn?: number;
+  maxTotalToolCalls?: number;
   cwd: string;
   noResources: boolean;
   noCompaction: boolean;
   resume: boolean;
+  resumeSession?: string;
   listModels: boolean;
   interactive: boolean;
   print: boolean;
@@ -30,7 +34,12 @@ function parseArgs(argv: string[]): CliFlags {
     else if (arg === "--no-resources") flags.noResources = true;
     else if (arg === "--no-compaction") flags.noCompaction = true;
     else if (arg === "--resume") flags.resume = true;
-    else if (arg === "--interactive" || arg === "-i") flags.interactive = true;
+    else if (arg === "--session") {
+      const next = argv[++i];
+      if (!next) throw new Error("--session requires a session id or path");
+      flags.resumeSession = next;
+      flags.resume = true;
+    } else if (arg === "--interactive" || arg === "-i") flags.interactive = true;
     else if (arg === "--print") flags.print = true;
     else if (arg === "--list-models") flags.listModels = true;
     else if (arg === "--provider") {
@@ -54,6 +63,21 @@ function parseArgs(argv: string[]): CliFlags {
       const n = next !== undefined ? Number(next) : NaN;
       if (!Number.isInteger(n) || n <= 0) throw new Error("--max-turns requires a positive integer");
       flags.maxTurns = n;
+    } else if (arg === "--max-wall-time-ms") {
+      const next = argv[++i];
+      const n = next !== undefined ? Number(next) : NaN;
+      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-wall-time-ms requires a positive integer");
+      flags.maxWallTimeMs = n;
+    } else if (arg === "--max-tool-calls-per-turn") {
+      const next = argv[++i];
+      const n = next !== undefined ? Number(next) : NaN;
+      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-tool-calls-per-turn requires a positive integer");
+      flags.maxToolCallsPerTurn = n;
+    } else if (arg === "--max-total-tool-calls") {
+      const next = argv[++i];
+      const n = next !== undefined ? Number(next) : NaN;
+      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-total-tool-calls requires a positive integer");
+      flags.maxTotalToolCalls = n;
     } else if (arg === "--cwd") {
       const next = argv[++i];
       if (!next) throw new Error("--cwd requires a directory");
@@ -74,7 +98,7 @@ function parseArgs(argv: string[]): CliFlags {
 
 function printHelp(): void {
   process.stdout.write(
-    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] "<prompt>"\n\nFlags:\n  --read-only       Only read/grep/find/ls-class tools (here: read only)\n  --max-turns N     Cap agent turns for this run\n  --cwd DIR         Workspace root (default: cwd)\n  --no-resources    Skip AGENTS.md / skill discovery\n  --no-compaction   Disable automatic compaction\n  --resume          Resume the most recent session\n  --interactive, -i  Interactive TUI (default when TTY and no prompt given)\n  --print           Force single-prompt print mode\n  --list-models     List available models (configured + live) and exit\n  --provider NAME   Provider from models.json (or KERN_PROVIDER)\n  --model ID        Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL    Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY     Override API key (or KERN_API_KEY)\n  --help, -h        This message\n`,
+    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n\nFlags:\n  --read-only                 Only read/grep/find/ls-class tools (here: read only)\n  --max-turns N               Cap agent turns for this run\n  --max-wall-time-ms MS       Cap wall-clock runtime for the session (default: 600000)\n  --max-tool-calls-per-turn N Cap tool calls per turn (default: 30)\n  --max-total-tool-calls N    Cap total tool calls for the session (default: 200)\n  --cwd DIR                   Workspace root (default: cwd)\n  --no-resources              Skip AGENTS.md / skill discovery\n  --no-compaction             Disable automatic compaction\n  --resume                    Resume the most recent session\n  --session ID|PATH           Resume a specific session by ID or JSONL file path\n  --interactive, -i            Start interactive TUI\n  --print                     Force single-prompt print mode (no TUI)\n  --list-models               List available models (configured + live) and exit\n  --provider NAME             Provider from models.json (or KERN_PROVIDER)\n  --model ID                  Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL              Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY               Override API key (or KERN_API_KEY)\n  --help, -h                  This message\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
   );
 }
 
@@ -143,14 +167,21 @@ async function main() {
     adapter = await createModelRuntime(file, { model, baseUrl, apiKey }, logger);
     process.stderr.write(`[model ${providerName ?? "custom"}/${model} @ ${baseUrl}]\n`);
   }
+  const budgets = {
+    ...(flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : {}),
+    ...(flags.maxWallTimeMs !== undefined ? { maxWallTimeMs: flags.maxWallTimeMs } : {}),
+    ...(flags.maxToolCallsPerTurn !== undefined ? { maxToolCallsPerTurn: flags.maxToolCallsPerTurn } : {}),
+    ...(flags.maxTotalToolCalls !== undefined ? { maxTotalToolCalls: flags.maxTotalToolCalls } : {}),
+  };
   const sessionOptions = {
     cwd: flags.cwd,
     logger,
     loadResources: !flags.noResources,
     enableCompaction: !flags.noCompaction,
     resume: flags.resume,
+    ...(flags.resumeSession ? { resumeSession: flags.resumeSession } : {}),
     policy: flags.readOnly ? { allowlistTools: ["read"] } : undefined,
-    budgets: flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : undefined,
+    ...(Object.keys(budgets).length > 0 ? { budgets } : {}),
     requestApproval: (prompt: string, meta?: { toolName: string }) => (approvalHook.current ? approvalHook.current(prompt, meta) : askApproval(prompt)),
     ...(adapter ? { model: adapter } : {}),
     ...await loadMcpExtraTools(flags.cwd, logger),
@@ -158,9 +189,10 @@ async function main() {
   const startSession = () => createAgentSession({ ...sessionOptions });
   const { session, manager } = await startSession();
 
-  const wantInteractive =
-    flags.interactive || (!flags.print && !flags.hadPrompt && process.stdin.isTTY && process.stdout.isTTY);
+  const canUseTui = process.stdin.isTTY && process.stdout.isTTY;
+  const wantInteractive = !flags.print && (flags.interactive || canUseTui);
   if (wantInteractive) {
+    if (!canUseTui) throw new Error("Interactive mode requires a TTY");
     const { runInteractive } = await import("@kern/tui");
     await runInteractive({
       session,
@@ -173,6 +205,7 @@ async function main() {
       cwd: flags.cwd,
       logger,
       approvalHook,
+      ...(flags.hadPrompt ? { initialPrompt: flags.prompt } : {}),
     });
     return;
   }

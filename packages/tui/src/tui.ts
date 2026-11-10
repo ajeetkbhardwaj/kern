@@ -19,8 +19,9 @@
  *   local `OverlayDialog` that forwards keys to the interactive child.
  */
 
-import { writeFile, readFile, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { writeFile, readFile, stat, mkdir, unlink, readdir } from "node:fs/promises";
+import { join, resolve, dirname, relative } from "node:path";
+import { spawn } from "node:child_process";
 import type { AgentEvent, Logger, ModelAdapter } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
 import type { AgentSession } from "@kern/coding-agent";
@@ -32,16 +33,18 @@ import {
   Editor,
   SelectList,
   Markdown,
-  Loader,
   ScrollView,
   VStack,
+  HStack,
   matchesKey,
   type Component,
   type OverlayHandle,
 } from "@earendil-works/pi-tui";
+import { KillRing } from "@earendil-works/pi-tui/dist/kill-ring.js";
 import { theme, buildMarkdownTheme, buildSelectTheme, buildEditorTheme } from "./theme.js";
-import { Box, StatusBar, ToolCard, Rule, Container, Text, Spacer } from "./components.js";
+import { Box, StatusBar, ToolCard, Rule, SidebarPanel, Container, Text, Spacer, CollapsibleText } from "./components.js";
 import { buildAutocomplete } from "./autocomplete.js";
+import { homedir } from "node:os";
 
 export interface InteractiveOptions {
   session: AgentSession;
@@ -56,14 +59,17 @@ export interface InteractiveOptions {
   logger?: Logger;
   /** Called by the kernel approval sink. Set by the CLI wiring. */
   approvalHook: { current: ((prompt: string, meta?: { toolName: string }) => Promise<boolean | "session">) | null };
+  /** Optional prompt to submit automatically when the TUI starts. */
+  initialPrompt?: string;
 }
 
 const COMMANDS = [
   { name: "help", description: "show the command list" },
-  { name: "name", description: "name the current session" },
+  { name: "session", description: "manage sessions (list/switch/rename/new/info/export)" },
   { name: "model", description: "pick provider/model" },
-  { name: "switch", description: "switch sessions" },
   { name: "connect", description: "connect or re-auth a provider" },
+  { name: "undo", description: "undo file changes from the last turn" },
+  { name: "redo", description: "redo previously undone file changes" },
   { name: "new", description: "start a fresh session" },
   { name: "export", description: "export the transcript" },
   { name: "clear", description: "clear the transcript" },
@@ -73,21 +79,21 @@ const COMMANDS = [
 const ADVANCED_COMMANDS = {
   compact: "summarize history into a checkpoint",
   diff: "show working-tree changes",
-  budget: "show usage and timing",
+  budget: "show usage, limits, and timing",
   keys: "re-auth the current provider",
   branch: "record a branch summary",
 };
 
-const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · Ctrl+C abort";
-const QUICK_HELP = "Quick actions: /model · /switch · /connect · /new · /help";
+const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · click headers to expand/collapse details · Ctrl+C abort";
+const QUICK_HELP = "Quick actions: /model · /session · /connect · /undo · /redo · /help";
 const MAX_QUEUE = 5;
 // Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
 const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
 
 /**
- * Overlay root: renders a teammate-owned Box, forwards keys to the
+ * Overlay root: renders a teammate-owned Box, forwards keys/mouse to the
  * interactive child. pi-tui focuses the overlay root component, so without
- * this wrapper keys would never reach a SelectList/Editor nested inside.
+ * this wrapper keys/clicks would never reach a SelectList/Editor nested inside.
  */
 class OverlayDialog implements Component {
   constructor(
@@ -100,12 +106,31 @@ class OverlayDialog implements Component {
   handleInput(data: string): void {
     this.target.handleInput?.(data);
   }
+  handleMouse(event: any): any {
+    const targetHandler = (this.target as any).handleMouse?.bind(this.target);
+    if (targetHandler) {
+      const res = targetHandler(event);
+      if (res) return res;
+    }
+    const rootHandler = (this.root as any).handleMouse?.bind(this.root);
+    if (rootHandler) return rootHandler(event);
+    return undefined;
+  }
   invalidate(): void {
     this.root.invalidate();
   }
 }
 
 const OVERLAY_OPTS = { anchor: "center" as const, width: "80%" as const, maxHeight: "80%" as const };
+
+// Compute adaptive overlay options based on current terminal width.
+// Narrow terminals (<100 cols): full width, taller. Wide: centered 80%.
+function getOverlayOpts(): { anchor: "center"; width: "80%" | "90%" | "95%"; maxHeight: "80%" | "85%" | "90%" } {
+  const cols = process.stdout.columns ?? 80;
+  if (cols < 80) return { anchor: "center", width: "95%", maxHeight: "90%" };
+  if (cols < 120) return { anchor: "center", width: "90%", maxHeight: "85%" };
+  return OVERLAY_OPTS;
+}
 
 export async function runInteractive(options: InteractiveOptions): Promise<void> {
   const logger = options.logger ?? nullLogger;
@@ -118,6 +143,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const tui = new TuiAltScreen(new ProcessTerminal());
   const transcript = new Container();
+
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  const handleResize = () => {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      try { applyLayout(); } catch { /* best-effort */ }
+      try { updateSidebar(); } catch { /* best-effort */ }
+      tui.requestRender();
+    }, 50);
+  };
+  if (process.stdout.isTTY) {
+    process.on("SIGWINCH", handleResize);
+  }
   const statusBar = new StatusBar();
   const editor = new Editor(tui, buildEditorTheme(), { autocompleteMaxVisible: 8 });
   const autocomplete = buildAutocomplete(COMMANDS, cwd);
@@ -127,8 +165,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let abort: AbortController | null = null;
   let exiting = false;
   let unsubscribe: (() => void) | null = null;
-  let activity = "thinking";
-  let loader: Loader | null = null;
+  let activity = "ready";
   let queue: string[] = [];
   let lastExitAttempt = 0;
   let stash = "";
@@ -139,10 +176,84 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let handleAuthError: (message: string) => void = () => {};
   /** Open text-prompt dialog (Esc cancels via the input listener). */
   let promptDialog: { cancel: () => void } | null = null;
+  /** Session state persisted across TUI restarts (draft text, recent prompts, queue). */
+  let draftText = "";
+  let searchQuery: string = "";
+  let searchResults: number[] = [];
+  let searchActiveIndex = 0;
+  let searchOpen = false;
+  /** Transcript lines for search (plain text, no ANSI). */
+  const transcriptLines: string[] = [];
+  /** Add line to transcript history for search. */
+  const addTranscriptLine = (text: string) => {
+    transcriptLines.push(text.replace(/\x1b\[[0-9;]*m/g, ""));
+    if (transcriptLines.length > 10000) transcriptLines.shift();
+  };
   /** Empty-state suggestion overlay state (digits 1-3 fill, never send). */
   let suggestionsOpen = false;
   let suggestionPick: ((value: string) => void) | null = null;
   const SUGGESTION_DIGITS = ["1", "2", "3"] as const;
+
+  // Kill ring for Emacs-style kill/yank (copy/paste within TUI).
+  const killRing = new KillRing();
+
+  // State saved to ~/.kern/tui-state.json alongside the kernel session.
+  const STATE_FILE = join(homedir(), ".tui-state.json");
+
+  const saveState = async (): Promise<void> => {
+    try {
+      await writeFile(STATE_FILE, JSON.stringify({
+        draftText,
+        recentPrompts,
+        stash,
+        queue,
+        lastUserPrompt,
+      }), "utf8");
+    } catch { /* best-effort */ }
+  };
+
+  const loadState = async (): Promise<void> => {
+    try {
+      const raw = await readFile(STATE_FILE, "utf8");
+      const data = JSON.parse(raw);
+      if (typeof data === "object" && data !== null) {
+        if (typeof data.draftText === "string") draftText = data.draftText;
+        if (Array.isArray(data.recentPrompts)) recentPrompts.push(...data.recentPrompts);
+        if (typeof data.stash === "string") stash = data.stash;
+        if (Array.isArray(data.queue)) queue.push(...data.queue);
+        if (typeof data.lastUserPrompt === "string") lastUserPrompt = data.lastUserPrompt;
+      }
+    } catch { /* best-effort */ }
+  };
+  void loadState().then(() => {
+    if (draftText) editor.setText(draftText);
+  });
+
+  // Batched rendering: accumulate render requests and flush at ~60fps
+  // to avoid layout thrashing during high-frequency streaming/scrolling.
+  let renderBatched = false;
+  const requestRender = () => {
+    if (!renderBatched) {
+      renderBatched = true;
+      setTimeout(() => {
+        renderBatched = false;
+        tui.requestRender();
+      }, 16);
+    }
+  };
+  const requestRenderBatched = requestRender;
+  const MAX_TRANSCRIPT_CHILDREN = 300;
+  const pruneTranscript = () => {
+    const children = (transcript as any).children as unknown[] | undefined;
+    if (!Array.isArray(children)) return;
+    const excess = children.length - MAX_TRANSCRIPT_CHILDREN;
+    if (excess <= 0) return;
+    for (let i = 0; i < excess; i++) {
+      const first = children[0];
+      if (!first) break;
+      transcript.removeChild(first as any);
+    }
+  };
 
   // Toasts live one row above the queue panel: transient notices that
   // auto-expire without disturbing the transcript. Errors stay persistent
@@ -183,6 +294,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       if (activityPulse) clearInterval(activityPulse);
       activityPulse = null;
       activityLine.setText(theme.muted("ready"));
+      if (typeof updateSidebar === "function") updateSidebar();
       tui.requestRender();
       return;
     }
@@ -192,6 +304,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       activityDots = (activityDots + 1) % ACTIVITY_SPINNER.length;
       renderActivityLine();
     }, 180);
+    if (typeof updateSidebar === "function") updateSidebar();
   };
 
   // Queue visibility: numbered list above the editor. Reads `queue` live;
@@ -211,7 +324,252 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     },
     invalidate(): void {},
   };
-  const renderQueue = () => tui.requestRender();
+  const renderQueue = () => {
+    updateSidebar();
+    tui.requestRender();
+  };
+
+  // --- best-effort file undo/redo (workspace snapshots around turns) -----------------------
+  type FileSnapshot = Map<string, Uint8Array | null>; // relative path -> bytes, null means deleted/missing
+  interface FileHistoryEntry {
+    label: string;
+    before: FileSnapshot;
+    after: FileSnapshot;
+  }
+  const undoStack: FileHistoryEntry[] = [];
+  const redoStack: FileHistoryEntry[] = [];
+  const MAX_UNDO = 20;
+  const MAX_SNAPSHOT_FILE_BYTES = 2_000_000;
+  let pendingHistoryBefore: FileSnapshot | null = null;
+  let pendingHistoryLabel = "";
+  let fileHistorySupported: boolean | null = null;
+
+  const runGit = (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> =>
+    new Promise((resolveRun) => {
+      const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("error", (e) => resolveRun({ code: 1, stdout: "", stderr: String(e) }));
+      child.on("close", (code) => resolveRun({ code: code ?? 1, stdout, stderr }));
+    });
+
+  const runGitBuffer = (args: string[]): Promise<{ code: number; stdout: Uint8Array }> =>
+    new Promise((resolveRun) => {
+      const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] });
+      const chunks: Buffer[] = [];
+      child.stdout.on("data", (d) => chunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+      child.on("error", () => resolveRun({ code: 1, stdout: new Uint8Array() }));
+      child.on("close", (code) => resolveRun({ code: code ?? 1, stdout: new Uint8Array(Buffer.concat(chunks)) }));
+    });
+
+  const readHeadVersion = async (relPath: string): Promise<Uint8Array | null | undefined> => {
+    // Returns bytes if file exists in HEAD, null if not in HEAD, undefined on error/too large/unsupported.
+    try {
+      const exists = await runGit(["cat-file", "-e", `HEAD:${relPath}`]);
+      if (exists.code !== 0) return null;
+      const out = await runGitBuffer(["show", `HEAD:${relPath}`]);
+      if (out.code !== 0) return undefined;
+      if (out.stdout.byteLength > MAX_SNAPSHOT_FILE_BYTES) return undefined;
+      return out.stdout;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const getWorkspaceChangedPaths = async (): Promise<string[] | null> => {
+    const res = await runGit(["status", "--porcelain", "-z", "--untracked-files=all"]);
+    if (res.code !== 0) return null;
+    const out = res.stdout;
+    const paths = new Set<string>();
+    for (let i = 0; i < out.length; ) {
+      const code = out.slice(i, i + 2);
+      i += 3; // "XY "
+      if (i > out.length) break;
+      const nul = out.indexOf("\0", i);
+      if (nul < 0) break;
+      let path = out.slice(i, nul);
+      i = nul + 1;
+      // renames/copies: "R  old\0new\0" or "C  old\0new\0"
+      if ((code.startsWith("R") || code.startsWith("C")) && i <= out.length) {
+        const nul2 = out.indexOf("\0", i);
+        if (nul2 >= 0) {
+          path = out.slice(i, nul2); // new path
+          i = nul2 + 1;
+        }
+      }
+      path = path.replace(/\\/g, "/");
+      if (path) paths.add(path);
+    }
+    return [...paths].sort();
+  };
+
+  const snapshotWorkspaceFiles = async (paths: string[]): Promise<FileSnapshot> => {
+    const snap: FileSnapshot = new Map();
+    for (const rel of paths) {
+      if (!rel || rel.includes("\0")) continue;
+      const abs = resolve(cwd, rel);
+      const relNorm = relative(cwd, abs).replace(/\\/g, "/");
+      if (!relNorm || relNorm.startsWith("..")) continue;
+      try {
+        const st = await stat(abs);
+        if (!st.isFile()) {
+          snap.set(relNorm, null);
+          continue;
+        }
+        if (st.size > MAX_SNAPSHOT_FILE_BYTES) {
+          // too large to snapshot safely; mark as unsupported by omitting? keep placeholder
+          // we cannot restore reliably, so skip this path from snapshot tracking
+          continue;
+        }
+        const data = await readFile(abs);
+        snap.set(relNorm, new Uint8Array(data));
+      } catch {
+        snap.set(relNorm, null);
+      }
+    }
+    return snap;
+  };
+
+  const snapshotsEqual = (a: FileSnapshot, b: FileSnapshot): boolean => {
+    if (a.size !== b.size) return false;
+    for (const [k, av] of a) {
+      const bv = b.get(k);
+      if (bv === undefined) return false;
+      if (av === null && bv === null) continue;
+      if (av === null || bv === null) return false;
+      if (av.byteLength !== bv.byteLength) return false;
+      for (let i = 0; i < av.byteLength; i++) if (av[i] !== bv[i]) return false;
+    }
+    return true;
+  };
+
+  const applySnapshotState = async (paths: string[], state: FileSnapshot): Promise<void> => {
+    for (const rel of paths) {
+      const abs = resolve(cwd, rel);
+      const relNorm = relative(cwd, abs).replace(/\\/g, "/");
+      if (!relNorm || relNorm.startsWith("..")) continue;
+      const value = state.get(relNorm);
+      if (value && value.byteLength >= 0) {
+        await mkdir(dirname(abs), { recursive: true });
+        await writeFile(abs, value);
+      } else {
+        // null or absent => remove file if exists
+        try {
+          await unlink(abs);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  };
+
+  const beginTurnHistory = async (label: string): Promise<void> => {
+    try {
+      const paths = await getWorkspaceChangedPaths();
+      if (paths === null) {
+        fileHistorySupported = false;
+        return; // not a git repo / unavailable
+      }
+      fileHistorySupported = true;
+      pendingHistoryBefore = await snapshotWorkspaceFiles(paths);
+      pendingHistoryLabel = label;
+    } catch {
+      pendingHistoryBefore = null;
+      pendingHistoryLabel = "";
+    }
+  };
+
+  const commitTurnHistory = async (): Promise<void> => {
+    if (!pendingHistoryBefore) return;
+    const before = pendingHistoryBefore;
+    const label = pendingHistoryLabel || "turn";
+    pendingHistoryBefore = null;
+    pendingHistoryLabel = "";
+    try {
+      const paths = await getWorkspaceChangedPaths();
+      if (paths === null) {
+        fileHistorySupported = false;
+        return;
+      }
+      fileHistorySupported = true;
+      const union = [...new Set([...before.keys(), ...paths])].sort();
+      if (union.length === 0) return;
+      const after = await snapshotWorkspaceFiles(union);
+      // normalize maps to union keys for comparison/apply
+      const beforeNorm: FileSnapshot = new Map();
+      const afterNorm: FileSnapshot = new Map();
+      for (const p of union) {
+        let beforeVal: Uint8Array | null = before.has(p) ? (before.get(p) ?? null) : null;
+        if (!before.has(p)) {
+          // File was clean (or untracked-absent) before turn but changed during turn.
+          const head = await readHeadVersion(p);
+          if (head === undefined) {
+            // Can't determine/restore safely (e.g. too large) -> skip this path from history.
+            continue;
+          }
+          beforeVal = head; // null if not in HEAD (created during turn), else HEAD content
+        }
+        const afterVal = after.has(p) ? (after.get(p) ?? null) : null;
+        beforeNorm.set(p, beforeVal);
+        afterNorm.set(p, afterVal);
+      }
+      if (beforeNorm.size === 0) return;
+      if (snapshotsEqual(beforeNorm, afterNorm)) return;
+      undoStack.push({ label, before: beforeNorm, after: afterNorm });
+      if (undoStack.length > MAX_UNDO) undoStack.splice(0, undoStack.length - MAX_UNDO);
+      redoStack.length = 0;
+    } catch {
+      /* best-effort */
+    }
+  };
+
+  const runUndo = async (): Promise<void> => {
+    if (busy) {
+      toast("Wait for the current turn to settle before undo.");
+      return;
+    }
+    const entry = undoStack.pop();
+    if (!entry) {
+      if (fileHistorySupported === false) toast("Undo/redo unavailable: requires a git workspace.");
+      else toast("Nothing to undo.");
+      return;
+    }
+    try {
+      const paths = [...new Set([...entry.before.keys(), ...entry.after.keys()])];
+      await applySnapshotState(paths, entry.before);
+      redoStack.push(entry);
+      ok(`Undid changes from ${entry.label} (${paths.length} file${paths.length === 1 ? "" : "s"}).`);
+    } catch (error) {
+      undoStack.push(entry);
+      err(`Undo failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const runRedo = async (): Promise<void> => {
+    if (busy) {
+      toast("Wait for the current turn to settle before redo.");
+      return;
+    }
+    const entry = redoStack.pop();
+    if (!entry) {
+      if (fileHistorySupported === false) toast("Undo/redo unavailable: requires a git workspace.");
+      else toast("Nothing to redo.");
+      return;
+    }
+    try {
+      const paths = [...new Set([...entry.before.keys(), ...entry.after.keys()])];
+      await applySnapshotState(paths, entry.after);
+      undoStack.push(entry);
+      ok(`Redid changes from ${entry.label} (${paths.length} file${paths.length === 1 ? "" : "s"}).`);
+    } catch (error) {
+      redoStack.push(entry);
+      err(`Redo failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
 
   // Pi-style fullscreen dock: scrollable transcript on top, prompt +
   // status pinned to the viewport bottom (editor never floats mid-screen).
@@ -223,17 +581,154 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     { component: editor, shrink: 1, minSize: 3 },
     { component: statusBar, shrink: 1, minSize: 0 },
   ]);
-  tui.setLayoutRoot(
-    new VStack([
-      { component: scrollTranscript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-      { component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
-    ]),
-  );
+  const mainPane = new VStack([
+    { component: scrollTranscript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+    { component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+  ]);
+  const sidebarPanel = new SidebarPanel({ leftBorder: true });
+  const sidebarScroll = new ScrollView(sidebarPanel);
+  let sidebarVisible = false;
+  const modelUsageHistory = new Map<string, { provider: string; model: string; switches: number; lastContext?: string; turns: number; tools: number }>();
+  const noteModelUsage = () => {
+    try {
+      const m = session.modelInfo();
+      const key = `${m.provider}/${m.modelId}`;
+      const u = session.budgetUsage();
+      const usage = session.contextUsage();
+      const ctx =
+        usage && m.contextWindow > 0
+          ? `${usage.totalTokens.toLocaleString()}/${m.contextWindow.toLocaleString()} (${Math.round((usage.totalTokens / m.contextWindow) * 100)}%)`
+          : undefined;
+      const prev = modelUsageHistory.get(key);
+      modelUsageHistory.set(key, {
+        provider: m.provider,
+        model: m.modelId,
+        switches: (prev?.switches ?? 0),
+        lastContext: ctx ?? prev?.lastContext,
+        turns: u.turns,
+        tools: u.totalToolCalls,
+      });
+    } catch {
+      /* best-effort */
+    }
+  };
+  const applyLayout = () => {
+    const cols = process.stdout.columns ?? 80;
+    const wantSidebar = cols >= 110;
+    if (wantSidebar === sidebarVisible) return;
+    sidebarVisible = wantSidebar;
+    if (wantSidebar) {
+      tui.setLayoutRoot(
+        new HStack([
+          { component: mainPane, basis: 0, grow: 1, shrink: 1, minSize: 40 },
+          { component: sidebarScroll, basis: 39, grow: 0, shrink: 0, minSize: 0 },
+        ]),
+      );
+    } else {
+      tui.setLayoutRoot(mainPane);
+    }
+    tui.setFocus(editor);
+    try { updateSidebar(); } catch { /* best-effort */ }
+  };
+  const updateSidebar = () => {
+    try {
+      noteModelUsage();
+      const cols = process.stdout.columns ?? 80;
+      if (cols < 110) {
+        sidebarPanel.setSections([{ key: "info", title: "Session info", lines: [theme.muted("Widen terminal to show panel")], collapsible: false }]);
+        return;
+      }
+      const m = session.modelInfo();
+      const u = session.budgetUsage();
+      const limits = session.budgetLimits?.();
+      const usage = session.contextUsage();
+      const ctx =
+        usage && m.contextWindow > 0
+          ? `${usage.totalTokens.toLocaleString()} / ${m.contextWindow.toLocaleString()} (${Math.round((usage.totalTokens / m.contextWindow) * 100)}%)`
+          : "—";
+      const wallSecs = Number.isFinite(u.wallTimeMs) ? (u.wallTimeMs / 1000).toFixed(1) : "0.0";
+      const sessionName = session.sessionName() ?? "—";
+      const modelLines = [...modelUsageHistory.values()].slice(-8).flatMap((entry) => {
+        const current = entry.provider === m.provider && entry.model === m.modelId ? theme.accent(" (current)") : "";
+        return [
+          `${theme.muted("•")} ${entry.provider}/${entry.model}${current}`,
+          `  ${theme.muted("ctx")} ${entry.lastContext ?? "—"}`,
+          `  ${theme.muted("session totals at last use")} ${entry.turns} turns · ${entry.tools} tools`,
+        ];
+      });
+      if (modelLines.length === 0) modelLines.push(theme.muted("No model usage tracked yet."));
+      const sessionId = manager.sessionId ?? "—";
+      sidebarPanel.setSections([
+        {
+          key: "session",
+          title: "Session",
+          collapsible: true,
+          lines: [
+            `${theme.muted("Model")}`,
+            `  ${m.provider}/${m.modelId}`,
+            `${theme.muted("ID")} ${sessionId}`,
+            `${theme.muted("Name")} ${sessionName}`,
+            `${theme.muted("Mode")} ${modeLabel()}`,
+            `${theme.muted("State")} ${busy ? `running (${activity})` : "ready"}`,
+            `${theme.muted("CWD")}`,
+            `  ${cwd}`,
+          ],
+        },
+        {
+          key: "usage",
+          title: "Usage",
+          collapsible: true,
+          lines: [
+            `${theme.muted("Context")} ${ctx}`,
+            `${theme.muted("Input")} ${apiUsage.input.toLocaleString()}`,
+            `${theme.muted("Output")} ${apiUsage.output.toLocaleString()}`,
+            ...(apiUsage.cacheRead || apiUsage.cacheWrite
+              ? [
+                  `${theme.muted("Cache R/W")} ${apiUsage.cacheRead.toLocaleString()} / ${apiUsage.cacheWrite.toLocaleString()}`,
+                ]
+              : []),
+            `${theme.muted("Turns")} ${u.turns}`,
+            `${theme.muted("Tools")} ${u.totalToolCalls}`,
+            `${theme.muted("Wall")} ${wallSecs}s`,
+            `${theme.muted("Queue")} ${queue.length}/${MAX_QUEUE}`,
+          ],
+        },
+        {
+          key: "budgets",
+          title: "Budget limits",
+          collapsible: true,
+          defaultExpanded: false,
+          lines: limits
+            ? [
+                `${theme.muted("turns")} ${limits.maxTurns}`,
+                `${theme.muted("tools/turn")} ${limits.maxToolCallsPerTurn}`,
+                `${theme.muted("tools total")} ${limits.maxTotalToolCalls}`,
+                `${theme.muted("wall")} ${(limits.maxWallTimeMs / 1000).toFixed(0)}s`,
+              ]
+            : [theme.muted("Limits unavailable")],
+        },
+        {
+          key: "models",
+          title: "Models used (session)",
+          collapsible: true,
+          defaultExpanded: true,
+          lines: [...modelLines, theme.muted("Best-effort; totals are session-wide, not per-model attribution")],
+        },
+      ]);
+    } catch {
+      sidebarPanel.setSections([{ key: "error", title: "Session info", lines: [theme.muted("Unavailable")], collapsible: false }]);
+    }
+  };
+  applyLayout();
+  updateSidebar();
   tui.setFocus(editor);
 
   const say = (text: string) => {
     transcript.addChild(new Text(text, 0, 0));
-    tui.requestRender();
+    lastTranscriptBlock = "other";
+    pruneTranscript();
+    addTranscriptLine(text);
+    requestRender();
   };
   const info = (text: string) => say(theme.muted(text));
   const err = (text: string) => say(theme.error(text));
@@ -242,15 +737,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const setBusy = (running: boolean) => {
     busy = running;
     if (running) {
-      loader = new Loader(tui, theme.accent, theme.muted, activity);
-      transcript.addChild(loader);
-      loader.start();
-    } else if (loader) {
-      loader.stop();
-      transcript.removeChild(loader);
-      loader = null;
+      setActivity(activity || "model: thinking");
+    } else {
+      setActivity("ready");
     }
-    tui.requestRender();
+    updateSidebar();
+    requestRender();
   };
 
   const modeLabel = () => {
@@ -261,16 +753,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const printHeader = () => {
     const m = session.modelInfo();
     const name = session.sessionName() ? `  ·  ${session.sessionName()}` : "";
-    const head = new Box(
-      new Text(`${theme.bold("kern")}  ${m.provider}/${m.modelId}${name}  ·  ${modeLabel()}  ·  ${cwd}`, 1, 0),
-      { title: "session", mood: "info" },
-    );
-    transcript.addChild(head);
+    transcript.addChild(new Spacer(1));
+    transcript.addChild(new Text(`${theme.bold("kern")}  ${theme.muted(`${m.provider}/${m.modelId}${name} · ${modeLabel()} · ${cwd}`)}`, 0, 0));
     info("Type a task, or /help for commands.");
     info(HINTS);
     info(theme.muted(QUICK_HELP));
     transcript.addChild(new Rule());
-    tui.requestRender();
+    lastTranscriptBlock = "other";
+    pruneTranscript();
+    requestRender();
   };
 
   const renameSession = async () => {
@@ -340,16 +831,36 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       ctx,
       `${u.turns} turns · ${u.totalToolCalls} calls · ${wallSecs}s`,
     ]);
-    tui.requestRender();
+    updateSidebar();
+    requestRender();
+  };
+
+  const printBudgetDetails = () => {
+    const u = session.budgetUsage();
+    const limits = session.budgetLimits?.();
+    printStatus();
+    say(theme.bold("budget"));
+    say(`  usage: ${u.turns} turns, ${u.totalToolCalls} tool calls, ${(u.wallTimeMs / 1000).toFixed(1)}s wall`);
+    if (limits) {
+      say(
+        `  limits: ${limits.maxTurns} turns, ${limits.maxTotalToolCalls} total tool calls, ${limits.maxToolCallsPerTurn} per turn, ${(limits.maxWallTimeMs / 1000).toFixed(0)}s wall`,
+      );
+    } else {
+      info("  limits: unavailable from session runtime");
+    }
+    info("Tip: adjust with --max-turns, --max-wall-time-ms, --max-tool-calls-per-turn, --max-total-tool-calls");
   };
 
   // --- event → transcript -----------------------------------------------------
   let md: Markdown | null = null;
   let mdText = "";
-  let reasoningText: Text | null = null;
+  let reasoningView: CollapsibleText | null = null;
   let reasoningBuffer = "";
   let turnNumber = 0;
   const cards = new Map<string, ToolCard>();
+  let lastTranscriptBlock: "none" | "user" | "assistant" | "reasoning" | "tool" | "other" = "none";
+  /** Cumulative API token usage (best-effort from usage events). */
+  let apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   /** Pending approval finish callbacks — resolved fail-closed (deny) on abort/exit. */
   const pendingApprovals = new Set<(value: string | null) => void>();
   const denyPendingApprovals = () => {
@@ -370,50 +881,51 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     mdText = "";
   };
   const closeReasoning = () => {
-    reasoningText = null;
+    if (reasoningView) reasoningView.setStreaming(false);
+    reasoningView = null;
     reasoningBuffer = "";
   };
-  const addTranscriptGap = () => {
+  const addTranscriptGap = (force = false) => {
+    if (!force && (lastTranscriptBlock === "reasoning" || lastTranscriptBlock === "tool")) return;
     transcript.addChild(new Spacer(1));
-    transcript.addChild(new Rule());
-    transcript.addChild(new Spacer(0));
-  };
-  const turnLabel = (kind: "user" | "assistant" | "reasoning" | "tool") => {
-    const label =
-      kind === "user" ? "user" : kind === "assistant" ? "assistant" : kind === "reasoning" ? "reasoning" : "tool";
-    return `${label.toUpperCase()} · turn ${turnNumber}`;
   };
 
   const renderUserPrompt = (text: string) => {
-    addTranscriptGap();
-    const body = new Text(`${theme.user("you")}\n${theme.muted(text)}`, 0, 0);
-    transcript.addChild(new Box(body, { title: turnLabel("user"), mood: "info" }));
-    tui.requestRender();
+    addTranscriptGap(true);
+    transcript.addChild(new Text(theme.user("you"), 0, 0));
+    transcript.addChild(new Text(text, 0, 0));
+    lastTranscriptBlock = "user";
+    pruneTranscript();
+    addTranscriptLine(`you: ${text}`);
+    requestRender();
   };
   const renderAssistantBlock = () => {
     if (md) return;
-    addTranscriptGap();
+    if (lastTranscriptBlock !== "user") addTranscriptGap();
+    transcript.addChild(new Text(theme.accent("assistant"), 0, 0));
     md = new Markdown("", 0, 0, buildMarkdownTheme());
-    transcript.addChild(new Box(md, { title: turnLabel("assistant"), mood: "accent" }));
-    tui.requestRender();
+    transcript.addChild(md);
+    lastTranscriptBlock = "assistant";
+    pruneTranscript();
+    requestRender();
   };
   const renderReasoningBlock = () => {
-    if (reasoningText) return;
-    addTranscriptGap();
-    reasoningText = new Text("", 0, 0);
-    transcript.addChild(new Box(reasoningText, { title: turnLabel("reasoning"), mood: "info" }));
-    tui.requestRender();
+    if (reasoningView) return;
+    if (lastTranscriptBlock !== "reasoning" && lastTranscriptBlock !== "tool") addTranscriptGap();
+    reasoningView = new CollapsibleText("thinking", { expanded: false, style: theme.muted, streaming: true });
+    transcript.addChild(reasoningView);
+    lastTranscriptBlock = "reasoning";
+    pruneTranscript();
+    requestRender();
   };
 
   /** Persistent error card for auth failures; recovery choices follow via overlay. */
   const showAuthCard = (message: string) => {
-    addTranscriptGap();
-    const body = new Text(
-      `${theme.error("Auth failed — the model rejected our credentials.")}\n${theme.muted(message)}\n${theme.muted("Pick a fix in the dialog above (Esc dismisses). /keys re-auths, /model switches.")}`,
-      0,
-      0,
-    );
-    transcript.addChild(new Box(body, { title: "auth error", mood: "error" }));
+    addTranscriptGap(true);
+    transcript.addChild(new Text(theme.error("Auth failed — the model rejected our credentials."), 0, 0));
+    transcript.addChild(new Text(theme.muted(message), 0, 0));
+    transcript.addChild(new Text(theme.muted("Pick a fix in the dialog above (Esc dismisses). /keys re-auths, /model switches."), 0, 0));
+    lastTranscriptBlock = "other";
     tui.requestRender();
   };
 
@@ -421,100 +933,130 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     unsubscribe?.();
     unsubscribe = session.subscribe((event: AgentEvent) => {
       if (exiting) return;
-      switch (event.type) {
-        case "text_delta":
-          renderAssistantBlock();
-          mdText += event.delta;
-          md?.setText(mdText);
-          setActivity("writing response");
-          tui.requestRender();
-          break;
-        case "reasoning_delta":
-          setActivity("thinking");
-          if (loader) loader.setMessage("thinking");
-          renderReasoningBlock();
-          reasoningBuffer += event.delta;
-          reasoningText?.setText(theme.muted(reasoningBuffer));
-          tui.requestRender();
-          break;
-        case "message_end":
-          closeAssistant();
-          closeReasoning();
-          settleCards(false);
-          setActivity("ready");
-          transcript.addChild(new Spacer(1));
-          transcript.addChild(new Rule());
-          tui.requestRender();
-          break;
-        case "tool_execution_start": {
-          closeAssistant();
-          const next = `running ${event.toolName}`;
-          setActivity(next);
-          if (loader) loader.setMessage(next);
-          const card = new ToolCard(event.toolName, summarizeArgs(event.arguments));
-          cards.set(event.toolCallId, card);
-          addTranscriptGap();
-          transcript.addChild(new Box(card, { title: turnLabel("tool"), mood: "info" }));
-          tui.requestRender();
-          break;
-        }
-        case "tool_execution_update": {
-          const next = `running ${event.toolName}`;
-          setActivity(next);
-          if (loader) loader.setMessage(next);
-          const card = cards.get(event.toolCallId);
-          if (card && typeof event.delta === "string") card.appendOutput(event.delta);
-          tui.requestRender();
-          break;
-        }
-        case "tool_execution_end": {
-          const card = cards.get(event.toolCallId);
-          cards.delete(event.toolCallId);
-          const output = event.result
-            ? event.result.content.map((c) => c.text).join("\n")
-            : "";
-          if (card) {
-            if (output) card.appendOutput(output);
-            card.finish(event.isError);
-          } else {
-            say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
+      try {
+        switch (event.type) {
+          case "text_delta":
+            renderAssistantBlock();
+            mdText += event.delta;
+            md?.setText(mdText);
+            setActivity("model: responding");
+            requestRenderBatched();
+            break;
+          case "reasoning_delta":
+            setActivity("model: thinking");
+            renderReasoningBlock();
+            reasoningBuffer += event.delta;
+            reasoningView?.setText(reasoningBuffer);
+            requestRenderBatched();
+            break;
+          case "message_end":
+            closeAssistant();
+            closeReasoning();
+            settleCards(false);
+            setActivity("ready");
+            if (mdText) addTranscriptLine(`assistant: ${mdText}`);
+            if (reasoningBuffer) addTranscriptLine(`reasoning: ${reasoningBuffer}`);
+            noteModelUsage();
+            updateSidebar();
+            requestRender();
+            break;
+          case "tool_execution_start": {
+            closeAssistant();
+            setActivity(`tool: ${event.toolName}`);
+            const card = new ToolCard(event.toolName, summarizeArgs(event.arguments));
+            cards.set(event.toolCallId, card);
+            if (lastTranscriptBlock !== "tool" && lastTranscriptBlock !== "reasoning") {
+              transcript.addChild(new Spacer(1));
+            }
+            transcript.addChild(card);
+            lastTranscriptBlock = "tool";
+            pruneTranscript();
+            requestRender();
+            break;
           }
-          setActivity(event.isError ? "tool failed" : "ready");
-          tui.requestRender();
-          break;
-        }
-        case "auto_compaction_start":
-          setActivity("compacting context");
-          if (loader) loader.setMessage("compacting context");
-          toast(`compacting context (${event.phase})…`);
-          break;
-        case "auto_compaction_end":
-          toast("context compacted");
-          break;
-        case "auto_retry_start":
-          setActivity(`retrying (${event.reason})`);
-          if (loader) loader.setMessage(`retrying (${event.reason})`);
-          toast(`retry ${event.attempt} (${event.reason}) in ${event.delayMs}ms`);
-          break;
-        case "agent_error":
-          closeAssistant();
-          closeReasoning();
-          settleCards(true);
-          setActivity("error");
-          err(`[error ${event.error.code}] ${event.error.message}`);
-          if (event.error.code === "E_MODEL_AUTH") {
-            showAuthCard(event.error.message);
-            handleAuthError(event.error.message);
+          case "tool_execution_update": {
+            setActivity(`tool: ${event.toolName}`);
+            const card = cards.get(event.toolCallId);
+            if (card && typeof event.delta === "string") card.appendOutput(event.delta);
+            requestRenderBatched();
+            break;
           }
-          break;
-        case "agent_settled":
-          closeAssistant();
-          closeReasoning();
-          settleCards(false);
-          setActivity("ready");
-          break;
-        default:
-          break;
+          case "tool_execution_end": {
+            const card = cards.get(event.toolCallId);
+            cards.delete(event.toolCallId);
+            const output = event.result
+              ? event.result.content.map((c) => c.text).join("\n")
+              : "";
+            if (card) {
+              if (output && (!card.hasOutput() || event.isError)) card.appendOutput(output);
+              if (event.isError && !card.hasOutput()) card.appendOutput(`Tool ${event.toolName} failed.`);
+              card.finish(event.isError);
+              lastTranscriptBlock = "tool";
+            } else {
+              say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
+              if (output) info(output.split("\n").slice(0, 20).join("\n"));
+            }
+            if (output) addTranscriptLine(`${event.toolName}: ${output}`);
+            setActivity(event.isError ? "tool failed" : "ready");
+            updateSidebar();
+            requestRender();
+            break;
+          }
+          case "auto_compaction_start":
+            setActivity("compacting context");
+            toast(`compacting context (${event.phase})…`);
+            break;
+          case "auto_compaction_end":
+            toast("context compacted");
+            break;
+          case "auto_retry_start":
+            setActivity(`retrying (${event.reason})`);
+            toast(`retry ${event.attempt} (${event.reason}) in ${event.delayMs}ms`);
+            break;
+          case "usage": {
+            const u = (event as any).usage ?? {};
+            apiUsage.input += Number(u.input) || 0;
+            apiUsage.output += Number(u.output) || 0;
+            apiUsage.cacheRead += Number(u.cacheRead) || 0;
+            apiUsage.cacheWrite += Number(u.cacheWrite) || 0;
+            updateSidebar();
+            printStatus();
+            break;
+          }
+          case "agent_error":
+            closeAssistant();
+            closeReasoning();
+            settleCards(true);
+            setActivity("error");
+            err(`[error ${event.error.code}] ${event.error.message}`);
+            if (event.error.code === "E_MODEL_AUTH") {
+              showAuthCard(event.error.message);
+              handleAuthError(event.error.message);
+            } else if (event.error.code === "E_BUDGET_EXCEEDED") {
+              const limits = session.budgetLimits?.();
+              if (limits) {
+                info(
+                  `Tip: split/resume the task or raise limits (current: ${limits.maxTurns} turns, ${limits.maxTotalToolCalls} total calls, ${limits.maxToolCallsPerTurn}/turn, ${(limits.maxWallTimeMs / 1000).toFixed(0)}s wall).`,
+                );
+              } else {
+                info("Tip: split the task, resume later, or increase limits (e.g. --max-wall-time-ms / --max-turns / --max-tool-calls-*).");
+              }
+            }
+            break;
+          case "agent_settled":
+            closeAssistant();
+            closeReasoning();
+            settleCards(false);
+            setActivity("ready");
+            noteModelUsage();
+            printStatus();
+            break;
+          default:
+            break;
+        }
+      } catch (e) {
+        err(`Event handler error: ${e instanceof Error ? e.message : String(e)}`);
+        // Continue processing other events; don't crash the TUI
       }
     });
   };
@@ -538,7 +1080,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   /** Wrap content + interactive child in a centered overlay; keys forward to the child. */
   const showDialog = (content: Component, target: Component, framed = true): OverlayHandle => {
     const root = framed ? new Box(content, {}) : content;
-    return tui.showOverlay(new OverlayDialog(root, target), OVERLAY_OPTS);
+    return tui.showOverlay(new OverlayDialog(root, target), getOverlayOpts());
   };
 
   /** Titled single-choice SelectList in a centered overlay. Resolves null on Esc. */
@@ -596,7 +1138,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       try {
         const pretty = JSON.stringify(runtimeArgs, null, 2);
         argsFull = pretty;
-        argsDetail = pretty.length > 800 ? pretty.slice(0, 800) + "\n[…truncated… full command hidden — deny if unsure]" : pretty;
+        argsDetail = pretty.length > 800 ? pretty.slice(0, 800) + "\n[…truncated… full details hidden — deny if unsure]" : pretty;
       } catch {
         argsDetail = String(runtimeArgs).slice(0, 800);
         argsFull = argsDetail;
@@ -606,18 +1148,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const picked = await new Promise<string | null>((resolve) => {
       const body = new Container();
       body.addChild(new Text(danger ? theme.error(prompt) : theme.warn(prompt), 0, 0));
+      body.addChild(new Text(theme.muted(`tool: ${tool}`), 0, 0));
       if (argsDetail) {
-        body.addChild(new Text(theme.muted("arguments:"), 0, 0));
+        body.addChild(new Text(theme.muted("arguments/context:"), 0, 0));
         body.addChild(new Text(theme.muted(argsDetail), 0, 0));
+      } else {
+        body.addChild(new Text(theme.muted("(no additional arguments provided by policy prompt)"), 0, 0));
       }
       if (danger) {
-        body.addChild(new Text(theme.error("! destructive pattern detected — review carefully"), 0, 0));
+        body.addChild(new Text(theme.error("! destructive pattern detected — review carefully before approving"), 0, 0));
       }
+      body.addChild(new Text(theme.muted("Fail-closed: Esc/cancel denies. Session allow applies only to this tool in this session."), 0, 0));
       const list = new SelectList(
         [
           { value: "once", label: "Yes, run once", description: "allow just this call" },
-          { value: "session", label: `Yes, always allow ${tool}`, description: "no more prompts this session" },
-          { value: "no", label: "No", description: "deny (Esc)" },
+          { value: "session", label: `Yes, always allow ${tool}`, description: "no more prompts for this tool in this session" },
+          { value: "no", label: "No, deny", description: "block this call (Esc)" },
         ],
         5,
         buildSelectTheme(),
@@ -627,7 +1173,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         title: danger ? `approval (DANGER): ${tool}` : `approval: ${tool}`,
         mood: danger ? "error" : "default",
       });
-      const handle = tui.showOverlay(new OverlayDialog(box, list), OVERLAY_OPTS);
+      const handle = tui.showOverlay(new OverlayDialog(box, list), getOverlayOpts());
       let done = false;
       const finish = (value: string | null) => {
         if (done) return;
@@ -642,11 +1188,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       list.onCancel = () => finish(null);
     });
     if (picked === "session") {
-      ok(`Always allowing ${tool} for this session.`);
+      ok(`Approved for session: ${tool} (future calls to this tool won't prompt).`);
       return "session";
     }
     const approved = picked === "once";
-    say(approved ? theme.success("approved") : theme.muted("denied"));
+    say(approved ? theme.success(`approved once: ${tool}`) : theme.muted(`denied: ${tool}`));
     return approved;
   };
 
@@ -698,15 +1244,26 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const expandMentions = async (text: string): Promise<{ text: string; missing: string[] }> => {
     const missing: string[] = [];
     const rawRefs = [...new Set([...text.matchAll(/(^|\s)@([^\s]+)/g)].map((m) => m[2] ?? ""))].filter(Boolean);
-    const refs = rawRefs.map((r) => r.replace(/[.,:;!?)\]]+$/, "")).filter(Boolean);
+    const refs = rawRefs.map((r) => r.replace(/[.,:;!?)\]}>]+$/, "")).filter(Boolean);
     let out = text;
     for (const ref of refs) {
       const abs = resolve(cwd, ref);
+      const relNorm = relative(cwd, abs).replace(/\\/g, "/");
+      if (!relNorm || relNorm === ".." || relNorm.startsWith("../")) {
+        missing.push(ref);
+        info(`@${ref}: outside workspace — sent literally.`);
+        continue;
+      }
       let content: string;
       try {
         const st = await stat(abs);
         if (!st.isFile()) {
           info(`@${ref}: not a file — sent literally.`);
+          continue;
+        }
+        if (st.size > 400_000) {
+          missing.push(ref);
+          info(`@${ref}: file too large (${st.size} bytes) — sent literally.`);
           continue;
         }
         content = await readFile(abs, "utf8");
@@ -720,7 +1277,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         missing.push(ref);
         continue;
       }
-      out = out.split(`@${ref}`).join(`<file path="${ref}">\n${content}\n</file>`);
+      out = out.split(`@${ref}`).join(`<file path="${relNorm}">\n${content}\n</file>`);
     }
     return { text: out, missing };
   };
@@ -834,6 +1391,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         await session.setModel(adapter);
         await recordLastUsed(provider, id).catch(() => undefined);
         ok(`Model: ${provider}/${id}`);
+        printStatus();
       } catch (error) {
         err(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1238,6 +1796,154 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     else err(`Retest failed: ${retest.message}`);
   };
 
+  const switchSessionTo = async (file: string): Promise<void> => {
+    try {
+      const next = await session.switchSession?.(file);
+      if (!next) {
+        toast("Session switch is unavailable right now.");
+        return;
+      }
+      unsubscribe?.();
+      session = next.session;
+      manager = next.manager;
+      queue = [];
+      apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      cards.clear();
+      closeAssistant();
+      closeReasoning();
+      lastUserPrompt = "";
+      undoStack.length = 0;
+      redoStack.length = 0;
+      pendingHistoryBefore = null;
+      pendingHistoryLabel = "";
+      renderQueue();
+      subscribe();
+      transcript.clear();
+      lastTranscriptBlock = "none";
+      printHeader();
+      printStatus();
+      ok(`Session switched: ${file}`);
+    } catch (error) {
+      err(`Session switch failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const sessionSwitcher = async (): Promise<void> => {
+    if (busy) {
+      toast("Wait for the current turn to settle before switching sessions.");
+      return;
+    }
+    try {
+      const items = await manager.listSessions?.() ?? [];
+      if (items.length === 0) {
+        toast("No saved sessions yet.");
+        return;
+      }
+      const currentPath = String((manager as any).sessionFile ?? "");
+      const list = new SelectList(
+        items.map((path) => ({
+          value: path,
+          label: `${path === currentPath ? "● " : "  "}${path.split(/[\\/]/).at(-1) ?? path}`,
+          description: path,
+        })),
+        10,
+        buildSelectTheme(),
+      );
+      const body = new Container();
+      body.addChild(new Text(theme.bold("session · switch"), 0, 0));
+      body.addChild(new Text(theme.muted("Select a saved session to load from its path."), 0, 0));
+      body.addChild(list);
+      const handle = showDialog(body, list);
+      await new Promise<void>((resolve) => {
+        let done = false;
+        const finish = (run: (() => Promise<void> | void) | null) => {
+          if (done) return;
+          done = true;
+          handle.hide();
+          tui.setFocus(editor);
+          void Promise.resolve(run?.()).finally(() => resolve());
+        };
+        list.onSelect = (item) => finish(() => switchSessionTo(item.value));
+        list.onCancel = () => finish(null);
+      });
+    } catch (error) {
+      err(`Session list failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const showSessionInfo = () => {
+    const m = session.modelInfo();
+    const name = session.sessionName() ?? "—";
+    const id = manager.sessionId ?? "—";
+    const path = (manager as any).sessionFile ?? (manager as any).getActivePath?.() ?? "—";
+    say(theme.bold("session"));
+    say(`  ${theme.muted("id")}    ${id}`);
+    say(`  ${theme.muted("name")}  ${name}`);
+    say(`  ${theme.muted("model")} ${m.provider}/${m.modelId}`);
+    say(`  ${theme.muted("cwd")}   ${cwd}`);
+    say(`  ${theme.muted("path")}  ${String(path)}`);
+    info("Tip: resume later with `kern --session <id|path>` (or `--resume` for most recent).");
+  };
+
+  const runSessionCommand = async (arg: string): Promise<void> => {
+    const [subRaw, ...rest] = arg.trim().split(/\s+/).filter(Boolean);
+    const sub = (subRaw ?? "").toLowerCase();
+    const subArg = rest.join(" ").trim();
+    if (!sub) {
+      if (busy) {
+        toast("Wait for the current turn to settle before managing sessions.");
+        return;
+      }
+      const choice = await pickOne("session", [
+        { value: "switch", label: "Switch session", description: "pick another saved session" },
+        { value: "rename", label: "Rename session", description: "set a name for this session" },
+        { value: "new", label: "New session", description: "start a fresh session" },
+        { value: "info", label: "Session info", description: "show id, name, path, model" },
+        { value: "export", label: "Export transcript", description: "save transcript to markdown" },
+      ]);
+      if (choice === null) return;
+      if (choice === "switch") return sessionSwitcher();
+      if (choice === "rename") return renameSession();
+      if (choice === "new") return runCommand("/new").then(() => undefined);
+      if (choice === "info") return showSessionInfo();
+      if (choice === "export") {
+        try { await exportTranscript(); } catch (error) { err(`Export failed: ${error instanceof Error ? error.message : String(error)}`); }
+        return;
+      }
+      return;
+    }
+    if (sub === "list" || sub === "switch") {
+      await sessionSwitcher();
+      return;
+    }
+    if (sub === "rename" || sub === "name") {
+      if (subArg) {
+        try {
+          const name = await session.setSessionName?.(subArg);
+          if (name) { toast(`Session renamed to ${name}.`); printStatus(); }
+        } catch (error) {
+          err(`Rename failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } else {
+        await renameSession();
+      }
+      return;
+    }
+    if (sub === "new") {
+      await runCommand("/new");
+      return;
+    }
+    if (sub === "info" || sub === "id" || sub === "path" || sub === "current") {
+      showSessionInfo();
+      return;
+    }
+    if (sub === "export") {
+      try { await exportTranscript(subArg || undefined); } catch (error) { err(`Export failed: ${error instanceof Error ? error.message : String(error)}`); }
+      return;
+    }
+    err(`Unknown session action: ${sub}. Try /session, /session switch, /session rename, /session new, /session info.`);
+  };
+
   // --- slash commands -------------------------------------------------------------------
   const runCommand = async (line: string): Promise<boolean> => {
     const [cmd, ...rest] = line.trim().split(/\s+/);
@@ -1246,14 +1952,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     switch (normalized) {
       case "/help":
         for (const c of COMMANDS) say(`  ${theme.accent("/" + c.name)}  ${theme.muted(c.description)}`);
-        const advanced = Object.entries(ADVANCED_COMMANDS);
-        if (advanced.length > 0) {
-          info(theme.muted(`Advanced: ${advanced.map(([name, description]) => `/${name} (${description})`).join(" · ")}`));
+        {
+          const advanced = Object.entries(ADVANCED_COMMANDS);
+          if (advanced.length > 0) {
+            info(theme.muted(`Advanced: ${advanced.map(([name, description]) => `/${name} (${description})`).join(" · ")}`));
+          }
         }
         info(HINTS);
-        return true;
-      case "/name":
-        await renameSession();
+        info(theme.muted("Tips: use @path to attach files, !cmd for shell. While running, thinking/tools show a running state; click headers after completion to expand/collapse details. /undo and /redo are best-effort in git workspaces. /budget shows session limits/usage."));
         return true;
       case "/branch":
         await recordBranchSummary();
@@ -1263,6 +1969,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         return false;
       case "/clear":
         transcript.clear();
+        lastTranscriptBlock = "none";
         cards.clear();
         closeAssistant();
         closeReasoning();
@@ -1270,16 +1977,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         printStatus();
         return true;
       case "/budget":
-        printStatus();
+        printBudgetDetails();
         return true;
       case "/model":
       case "/models":
         await pickModel(arg || undefined);
         return true;
-      case "/switch":
       case "/session":
-      case "/sessions":
-        await sessionSwitcher();
+        await runSessionCommand(arg);
         return true;
       case "/keys":
         await runReauth();
@@ -1295,7 +2000,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         try {
           const result = await session.compact(arg || undefined);
           if (!result) toast("Nothing to compact yet.");
-          else ok(`Compacted through ${result.replacesThroughId}.`);
+          else {
+            ok(`Compacted through ${result.replacesThroughId}.`);
+            printStatus();
+          }
         } catch (error) {
           err(`Compaction failed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -1303,19 +2011,40 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
       case "/diff": {
         try {
-          const res = await session.callToolAsUser("bash", { command: "git diff --stat; git status --short | head -20" });
-          const text = res.content.map((c) => c.text).join("\n") || "(clean)";
-          if (res.isError) err(text);
-          else {
-            say(theme.bold("working tree"));
-            say(text);
+          const res = await session.callToolAsUser("bash", {
+            command:
+              "echo '--- git status --short ---'; git status --short | head -40; echo '--- git diff --stat ---'; git diff --stat | head -40; echo '--- staged diff --stat ---'; git diff --cached --stat | head -40",
+          });
+          const text = res.content.map((c) => c.text).join("\n").replace(/\r\n/g, "\n").trim();
+          if (res.isError) {
+            err(text || "Failed to inspect working tree.");
+            info("Not a git repository, or git failed.");
+          } else {
+            const cleaned = text
+              .split("\n")
+              .filter((line, i, arr) => !(line.startsWith("---") && arr[i + 1]?.startsWith("---")))
+              .join("\n")
+              .trim();
+            const sections = cleaned.split("\n").map((l) => l.trimEnd());
+            const meaningful = sections.filter((l) => l && !l.startsWith("---"));
+            say(theme.bold("working tree review"));
+            if (meaningful.length === 0) say("(clean)");
+            else say(sections.join("\n"));
+            info("Tip: for full patch details run `!git diff` or inspect specific files.");
           }
-          if (res.isError) info("Not a git repository, or git failed.");
         } catch (error) {
           err(`Diff failed: ${error instanceof Error ? error.message : String(error)}`);
         }
         return true;
       }
+      case "/undo":
+        await runUndo();
+        printStatus();
+        return true;
+      case "/redo":
+        await runRedo();
+        printStatus();
+        return true;
       case "/new": {
         if (busy) {
           toast("Wait for the current turn to settle before starting a new session.");
@@ -1327,13 +2056,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           session = fresh.session;
           manager = fresh.manager;
           queue = [];
+          apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
           cards.clear();
           closeAssistant();
           closeReasoning();
           lastUserPrompt = "";
+          undoStack.length = 0;
+          redoStack.length = 0;
+          pendingHistoryBefore = null;
+          pendingHistoryLabel = "";
           renderQueue();
           subscribe();
           transcript.clear();
+          lastTranscriptBlock = "none";
           printHeader();
           printStatus();
           toast("New session started.");
@@ -1387,19 +2122,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     setBusy(true);
     turnNumber += 1;
     renderUserPrompt(text);
-    session
-      .prompt(text, { signal: abort.signal })
-      .catch((error: unknown) => {
+    void (async () => {
+      await beginTurnHistory(`turn ${turnNumber}`);
+      try {
+        await session.prompt(text, { signal: abort!.signal });
+      } catch (error: unknown) {
         if (error instanceof Error && (error.name === "AbortError" || /aborted|canceled|cancelled/i.test(error.message))) {
           info("Turn stopped.");
           return;
         }
         err(`Turn failed: ${error instanceof Error ? error.message : String(error)}`);
-      })
-      .finally(() => {
+      } finally {
         setBusy(false);
         busy = false;
         abort = null;
+        await commitTurnHistory();
         if (!exiting) {
           printStatus();
           const next = queue.shift();
@@ -1409,7 +2146,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             runTurn(next);
           }
         }
-      });
+      }
+    })();
   };
 
   const stopCurrentTurn = () => {
@@ -1421,11 +2159,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     denyPendingApprovals();
     closeAssistant();
     closeReasoning();
-    if (loader) {
-      loader.stop();
-      transcript.removeChild(loader);
-      loader = null;
-    }
+    // Global running state is shown in the dock activity line below the input.
+    void 0;
     toast("Stopped current run.");
     setActivity("ready");
     return true;
@@ -1444,11 +2179,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       if (!output.trim()) info("(no output)");
       else if (res.isError) err(output.split("\n").slice(0, 60).join("\n"));
       else say(theme.muted(output.split("\n").slice(0, 60).join("\n")));
-      if (output.split("\n").length > 60) info(`[…${output.split("\n").length - 60} more lines in context]`);
+      const lines = output.split("\n");
+      if (lines.length > 60) info(`[…${lines.length - 60} more lines in context]`);
       const capped = output.length > 12_000 ? output.slice(0, 12_000) + "\n[…truncated…]" : output;
-      runTurn(`I ran \`${command}\` in shell mode. Output:\n${capped}\n\nRespond to it.`);
+      const status = res.isError ? "failed" : "succeeded";
+      runTurn(`I ran \`${command}\` in shell mode (command ${status}). Output:\n${capped || "(no output)"}\n\nRespond to it.`);
     } catch (error) {
-      err(`Shell command failed: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      err(`Shell command failed: ${message}`);
+      runTurn(`I tried to run \`${command}\` in shell mode, but execution failed: ${message}\n\nRespond to it.`);
     }
   };
 
@@ -1458,6 +2197,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       const text = line.trim();
       if (!text) return;
       if (text.startsWith("/") || (text.startsWith("!") && !text.startsWith("!="))) {
+        const cmd = text.split(/\s+/)[0]?.toLowerCase();
+        if (cmd === "/help" || cmd === "/budget") {
+          editor.setText("");
+          editor.addToHistory(text);
+          void (async () => {
+            try { await runCommand(text); } catch (error) { err(String(error)); }
+          })();
+          return;
+        }
         toast("Commands wait for settle — type plain text to queue.");
         return;
       }
@@ -1569,12 +2317,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     denyPendingApprovals();
     if (activityPulse) clearInterval(activityPulse);
     if (toastTimer) clearTimeout(toastTimer);
+    if (resizeTimer) clearTimeout(resizeTimer);
+    if (process.stdout.isTTY) process.off("SIGWINCH", handleResize);
     options.approvalHook.current = null;
     unsubscribe?.();
     tui.stop();
     // Fullscreen alt-screen restores the previous screen on stop, so the
     // farewell must go to stdout after (it would vanish otherwise).
     process.stdout.write(theme.muted("bye.\n"));
+    void saveState();
     process.exit(0);
   };
 
@@ -1591,9 +2342,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   // --- global keys ----------------------------------------------------------------------------
   // Registered via addInputListener, which runs BEFORE focused components, so
   // Esc-cancel for prompt dialogs is emulated here (pi-tui's Editor has no
-  // onEscape): a handled Esc returns {consume:true} to preempt the dialog.
+  // onEscape): a handled Esc returns `{consume:true}` to preempt the dialog's editor.
   tui.addInputListener((key) => {
-    // Esc cancels an open text-prompt dialog (preempts the dialog's editor).
+    // Esc cancels an open text-prompt dialog (prevents the dialog's editor).
     if (promptDialog && matchesKey(key, "escape")) {
       promptDialog.cancel();
       return { consume: true };
@@ -1658,6 +2409,63 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       tui.requestRender();
       return { consume: true };
     }
+    // Ctrl+W: kill (copy) current editor line to kill ring.
+    if (matchesKey(key, "ctrl+w")) {
+      const text = editor.getText();
+      if (text) {
+        killRing.push(text, { prepend: false, accumulate: false });
+        toast(`Copied to kill ring: ${text.slice(0, 60)}${text.length > 60 ? "…" : ""}`);
+      }
+      return { consume: true };
+    }
+    // Ctrl+Y: yank (paste) from kill ring into editor.
+    if (matchesKey(key, "ctrl+y")) {
+      const yanked = killRing.peek();
+      if (yanked) {
+        editor.setText(editor.getText() + yanked);
+        tui.requestRender();
+      }
+      return { consume: true };
+    }
+    // Ctrl+F: search transcript text (shows matches; does not auto-scroll transcript).
+    if (matchesKey(key, "ctrl+f")) {
+      void (async () => {
+        const result = await promptText("search transcript", searchQuery);
+        if (result === null) return;
+        const q = result.trim();
+        searchQuery = q;
+        searchResults = [];
+        searchActiveIndex = 0;
+        if (!q) {
+          toast("Search cancelled (empty query).");
+          return;
+        }
+        const qLower = q.toLowerCase();
+        for (let i = 0; i < transcriptLines.length; i++) {
+          const line = transcriptLines[i] || "";
+          if (line.toLowerCase().includes(qLower)) searchResults.push(i);
+        }
+        if (searchResults.length === 0) {
+          toast("No matches found.");
+          return;
+        }
+        const picked = await pickOne(
+          `transcript search (${searchResults.length} match${searchResults.length === 1 ? "" : "es"})`,
+          searchResults.slice(0, 200).map((idx) => {
+            const ln = (transcriptLines[idx] || "").replace(/\s+/g, " ").trim();
+            const snippet = ln.length > 90 ? `${ln.slice(0, 90)}…` : ln || "(empty)";
+            return { value: String(idx), label: `L${idx + 1}: ${snippet}`, description: "select to print line to transcript" };
+          }),
+        );
+        if (picked === null) return;
+        const idx = Number(picked);
+        const ln = transcriptLines[idx] || "";
+        say(theme.bold(`search match L${idx + 1}`));
+        say(ln || "(empty line)");
+        info("Note: transcript search currently lists/prints matches; it does not auto-scroll the live transcript view.");
+      })();
+      return { consume: true };
+    }
     if (matchesKey(key, "shift+tab")) {
       if (!busy) cycleMode();
       return { consume: true };
@@ -1665,7 +2473,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     return undefined;
   });
 
+  updateSidebar();
   tui.start();
+  if (options.initialPrompt?.trim()) {
+    const initial = options.initialPrompt;
+    // Submit after the UI is ready; slight delay avoids racing initial render/state restore.
+    setTimeout(() => {
+      if (!exiting) submit(initial);
+    }, 0);
+  }
   await new Promise<void>((resolve) => {
     const timer = setInterval(() => {
       if (exiting) {
@@ -1674,71 +2490,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
     }, 100);
   });
-
-  const sessionSwitcher = async (): Promise<void> => {
-    if (busy) {
-      toast("Wait for the current turn to settle before switching sessions.");
-      return;
-    }
-    try {
-      const items = await manager.listSessions?.() ?? [];
-      if (items.length === 0) {
-        toast("No saved sessions yet.");
-        return;
-      }
-      const list = new SelectList(
-        items.map((path) => ({
-          value: path,
-          label: path.split(/[\\/]/).at(-1) ?? path,
-          description: path,
-        })),
-        10,
-        buildSelectTheme(),
-      );
-      const body = new Container();
-      body.addChild(new Text(theme.bold("switch session"), 0, 0));
-      body.addChild(list);
-      const handle = showDialog(body, list);
-      await new Promise<void>((resolve) => {
-        let done = false;
-        const finish = (run: (() => Promise<void> | void) | null) => {
-          if (done) return;
-          done = true;
-          handle.hide();
-          tui.setFocus(editor);
-          void Promise.resolve(run?.()).finally(() => resolve());
-        };
-        list.onSelect = (item) => finish(async () => {
-          try {
-            const next = await session.switchSession?.(item.value);
-            if (!next) {
-              toast("Session switch is unavailable right now.");
-              return;
-            }
-            unsubscribe?.();
-            session = next.session;
-            manager = next.manager;
-            queue = [];
-            cards.clear();
-            closeAssistant();
-            closeReasoning();
-            lastUserPrompt = "";
-            renderQueue();
-            subscribe();
-            transcript.clear();
-            printHeader();
-            printStatus();
-            toast("Session switched.");
-          } catch (error) {
-            err(`Session switch failed: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        });
-        list.onCancel = () => finish(null);
-      });
-    } catch (error) {
-      err(`Session list failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
 
   return;
 }

@@ -6,9 +6,26 @@ export interface FileGraphNode {
 
 export class FileGraph {
   private readonly nodes = new Map<string, FileGraphNode>();
+  private readonly importers = new Map<string, Set<string>>();
 
   add(path: string, imports: string[] = [], exports: string[] = []): void {
-    this.nodes.set(path, { path, imports: [...new Set(imports)], exports: [...new Set(exports)] });
+    const uniqueImports = [...new Set(imports)];
+    const uniqueExports = [...new Set(exports)];
+    const previous = this.nodes.get(path);
+    if (previous) {
+      for (const imp of previous.imports) {
+        const set = this.importers.get(imp);
+        if (!set) continue;
+        set.delete(path);
+        if (set.size === 0) this.importers.delete(imp);
+      }
+    }
+    this.nodes.set(path, { path, imports: uniqueImports, exports: uniqueExports });
+    for (const imp of uniqueImports) {
+      const set = this.importers.get(imp) ?? new Set<string>();
+      set.add(path);
+      this.importers.set(imp, set);
+    }
   }
 
   get(path: string): FileGraphNode | undefined {
@@ -19,29 +36,31 @@ export class FileGraph {
     return [...this.nodes.values()];
   }
 
+  importersOf(path: string): string[] {
+    return [...(this.importers.get(path) ?? [])].sort();
+  }
+
   related(path: string, depth = 1): string[] {
-    const seen = new Set<string>();
+    const seen = new Set<string>([path]);
     const queue: Array<{ path: string; depth: number }> = [{ path, depth: 0 }];
     const result = new Set<string>();
 
     while (queue.length > 0) {
       const current = queue.shift()!;
-      if (current.depth > depth) continue;
+      if (current.depth >= depth) continue;
       const node = this.nodes.get(current.path);
-      if (!node) continue;
-      for (const p of node.imports) {
-        if (seen.has(p)) continue;
-        seen.add(p);
-        result.add(p);
-        queue.push({ path: p, depth: current.depth + 1 });
-      }
-      for (const p of node.exports) {
-        if (seen.has(p)) continue;
-        seen.add(p);
-        result.add(p);
+      const neighbors = [
+        ...(node?.imports ?? []),
+        ...this.importersOf(current.path),
+      ];
+      for (const next of neighbors) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        result.add(next);
+        queue.push({ path: next, depth: current.depth + 1 });
       }
     }
 
-    return [...result].filter((p) => p !== path);
+    return [...result].filter((p) => p !== path).sort();
   }
 }

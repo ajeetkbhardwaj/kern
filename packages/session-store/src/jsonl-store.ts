@@ -33,12 +33,22 @@ export interface SessionManifestEntry extends SessionFile {
   leafId?: string;
 }
 
+export interface ReadAllStats {
+  totalLines: number;
+  yielded: number;
+  malformed: number;
+  invalid: number;
+  empty: number;
+}
+
 export class SessionStore {
   private readonly storageRoot: string;
   private readonly logger: Logger;
   private readonly sessionDirEncoder: (cwd: string) => string;
   private readonly validateOnLoad: boolean;
-  private readonly quarantineLastMalformed: boolean;
+  readonly quarantineLastMalformed: boolean;
+  lastReadStats: ReadAllStats | null = null;
+  private readonly appendQueues = new Map<string, Promise<void>>();
 
   constructor(options: SessionStoreOptions = {}) {
     this.storageRoot = options.storageRoot ?? join(homedir(), ".kern", "agent", "sessions");
@@ -82,33 +92,55 @@ export class SessionStore {
   }
 
   async append(filePath: string, entry: SessionEntry): Promise<void> {
-    await appendJsonl(filePath, entry);
+    const previous = this.appendQueues.get(filePath) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => appendJsonl(filePath, entry));
+    this.appendQueues.set(filePath, next);
+    try {
+      await next;
+    } finally {
+      if (this.appendQueues.get(filePath) === next) {
+        this.appendQueues.delete(filePath);
+      }
+    }
   }
 
   async *readAll(filePath: string): AsyncIterable<SessionEntry> {
+    const stats: ReadAllStats = { totalLines: 0, yielded: 0, malformed: 0, invalid: 0, empty: 0 };
+    this.lastReadStats = stats;
     if (!existsSync(filePath)) return;
     const stream = createReadStream(filePath, { encoding: "utf8" });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
     for await (const line of rl) {
+      stats.totalLines += 1;
       const trimmed = line.trim();
-      if (trimmed.length === 0) continue;
+      if (trimmed.length === 0) {
+        stats.empty += 1;
+        continue;
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(trimmed);
       } catch {
+        stats.malformed += 1;
         this.logger.warn("jsonl_malformed_line_skipped", { filePath });
         continue;
       }
       if (this.validateOnLoad) {
         const v = safeValidateSessionEntry(parsed);
         if (!v.success) {
+          stats.invalid += 1;
           this.logger.warn("jsonl_invalid_line_skipped", { filePath });
           continue;
         }
+        stats.yielded += 1;
         yield v.data as SessionEntry;
         continue;
       }
+      stats.yielded += 1;
       yield parsed as SessionEntry;
+    }
+    if (stats.malformed > 0 || stats.invalid > 0) {
+      this.logger.warn("jsonl_read_had_corruption", { filePath, ...stats });
     }
   }
 
@@ -140,6 +172,31 @@ export class SessionStore {
   async findMostRecent(cwd: string): Promise<SessionFile | null> {
     const list = await this.listSessions(cwd, { limit: 1 });
     return list[0] ?? null;
+  }
+
+  async findSessionById(cwd: string, sessionIdOrPath: string): Promise<SessionFile | null> {
+    const needle = sessionIdOrPath.trim();
+    if (!needle) return null;
+    if (existsSync(needle)) {
+      const st = await stat(needle).catch(() => null);
+      if (st?.isFile()) {
+        const name = needle.split(/[\\/]/).at(-1) ?? needle;
+        const sid = extractSessionId(name) ?? "";
+        const ca = extractCreatedAt(name);
+        return {
+          filePath: needle,
+          sessionId: sid,
+          createdAt: ca ?? st.mtime.toISOString(),
+          mtimeMs: st.mtimeMs,
+          size: st.size,
+        };
+      }
+    }
+    const sessions = await this.listSessions(cwd);
+    const exact = sessions.find((s) => s.sessionId === needle || s.filePath === needle);
+    if (exact) return exact;
+    const lower = needle.toLowerCase();
+    return sessions.find((s) => s.filePath.toLowerCase().includes(lower) || s.sessionId.toLowerCase().includes(lower)) ?? null;
   }
 }
 

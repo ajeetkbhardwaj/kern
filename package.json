@@ -19,5 +19,8 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "1.1.0"
   }
 }

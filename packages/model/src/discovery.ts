@@ -208,9 +208,15 @@ export async function testProvider(
     if (/ENOTFOUND|ECONNREFUSED|EHOSTUNREACH/i.test(msg)) {
       return { ok: false, message: `Can't reach ${normalized}. Is the server running?` };
     }
-    const status = msg.match(/HTTP (401|403)\b/)?.[1];
+    const status = msg.match(/HTTP (401|403|429|5\d\d)\b/)?.[1];
     if (status === "401" || status === "403") {
       return { ok: false, message: `Key rejected (HTTP ${status}). Check the key, $VAR, or command output.` };
+    }
+    if (status === "429") {
+      return { ok: false, message: `Rate limited by provider (HTTP 429). Try again later.` };
+    }
+    if (status && /^5\d\d$/.test(status)) {
+      return { ok: false, message: `Provider unavailable (HTTP ${status}). Try again later.` };
     }
     if (/abort|timeout|timed out/i.test(msg)) {
       return { ok: false, message: `Timed out after ${timeoutS}s — behind a proxy/VPN, or wrong host?` };

@@ -12,7 +12,7 @@ export function validateArgs(schema: JsonSchema, args: unknown): string[] {
   return errors;
 }
 
-function checkValue(schema: { type?: string; properties?: Record<string, unknown>; required?: string[] }, value: unknown, path: string, errors: string[]): void {
+function checkValue(schema: { type?: string; properties?: Record<string, unknown>; required?: string[]; items?: unknown }, value: unknown, path: string, errors: string[]): void {
   const type = schema.type;
   if (type === undefined) return;
 
@@ -28,7 +28,7 @@ function checkValue(schema: { type?: string; properties?: Record<string, unknown
           errors.push(`${path}.${req}: required field missing`);
         }
       }
-      const props = (schema.properties ?? {}) as Record<string, { type?: string; properties?: Record<string, unknown>; required?: string[] }>;
+      const props = (schema.properties ?? {}) as Record<string, { type?: string; properties?: Record<string, unknown>; required?: string[]; items?: unknown }>;
       for (const [key, propSchema] of Object.entries(props)) {
         if (key in record && record[key] !== undefined) {
           checkValue(propSchema, record[key], `${path}.${key}`, errors);
@@ -39,6 +39,13 @@ function checkValue(schema: { type?: string; properties?: Record<string, unknown
     case "array": {
       if (!Array.isArray(value)) {
         errors.push(`${path}: expected array`);
+        return;
+      }
+      const items = schema.items as { type?: string; properties?: Record<string, unknown>; required?: string[]; items?: unknown } | undefined;
+      if (items && typeof items === "object") {
+        for (let i = 0; i < value.length; i++) {
+          checkValue(items, value[i], `${path}[${i}]`, errors);
+        }
       }
       break;
     }

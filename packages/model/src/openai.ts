@@ -168,16 +168,20 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions): ModelAdapter
 }
 
 function toOpenAIBody(request: ModelRequest, options: OpenAIAdapterOptions): Record<string, unknown> {
+  const maxOutput = request.maxOutputTokens ?? options.maxOutputTokens;
   const body: Record<string, unknown> = {
     model: options.modelId,
     messages: [{ role: "system", content: request.systemPrompt }, ...request.messages.map(toOpenAIMessage)],
-    tools: request.tools.map(toOpenAITool),
-    tool_choice: request.tools.length > 0 ? "auto" : undefined,
     stream: true,
     stream_options: { include_usage: true },
-    max_completion_tokens: request.maxOutputTokens ?? options.maxOutputTokens,
+    max_tokens: maxOutput,
     temperature: request.temperature ?? options.temperature ?? 0.2,
   };
+
+  if (request.tools.length > 0) {
+    body.tools = request.tools.map(toOpenAITool);
+    body.tool_choice = "auto";
+  }
 
   const wantsReasoning = request.thinkingLevel && request.thinkingLevel !== "off" && (options.supportsThinking ?? true);
   if (wantsReasoning) {
@@ -304,27 +308,27 @@ function toKernError(error: unknown, status: number | undefined, options: OpenAI
   if (error instanceof Error && error.name === "AbortError") {
     return KernError.model("cancelled", "Model request aborted");
   }
+  const message = error instanceof Error ? error.message : String(error);
   if (status === 401 || status === 403) {
     return KernError.model("auth", `Authentication failed for provider ${options.provider} (HTTP ${status})`, { status });
   }
   if (status === 429) {
     return KernError.model("rate_limit", `Rate limited by provider ${options.provider}`, { status });
   }
+  if (status === 413 || /context.*(too|long|exceed)|maximum.*context|token.*limit|prompt.*too.*long/i.test(message)) {
+    return KernError.model("context_length", `Context window exceeded for provider ${options.provider}`, { status, detail: message.slice(0, 300) });
+  }
   if (status !== undefined && status >= 500) {
     return KernError.model("overloaded", `Provider ${options.provider} unavailable (HTTP ${status})`, { status });
-  }
-  if (status === 400 || status === 404 || status === 422) {
-    return KernError.model("invalid_request", `Invalid request to provider ${options.provider} (HTTP ${status}): ${error instanceof Error ? error.message : String(error)}`, { status });
-  }
-  const message = error instanceof Error ? error.message : String(error);
-  if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|fetch failed|network/i.test(message)) {
-    return KernError.model("network", `Cannot reach ${options.baseUrl}: ${message}`);
   }
   if (status === 408) {
     return KernError.model("timeout", `Request to provider ${options.provider} timed out (HTTP ${status})`, { status });
   }
-  if (status === 413 || /context.*(too|long)|maximum.*context|token.*limit/i.test(message)) {
-    return KernError.model("context_length", `Context window exceeded for provider ${options.provider}`, { status });
+  if (status === 400 || status === 404 || status === 422) {
+    return KernError.model("invalid_request", `Invalid request to provider ${options.provider} (HTTP ${status}): ${message.slice(0, 300)}`, { status });
+  }
+  if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|fetch failed|network/i.test(message)) {
+    return KernError.model("network", `Cannot reach ${options.baseUrl}: ${message}`);
   }
   return KernError.model("unknown", `Model call failed: ${message}`);
 }

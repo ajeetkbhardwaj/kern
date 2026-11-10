@@ -16,6 +16,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { DefaultPolicy } from "./policy.js";
 import { safeResolveSync } from "./path-safety.js";
 import { validateArgs } from "./validate-args.js";
+import { spawnSandboxed, type SandboxOptions, DEFAULT_SANDBOX_OPTIONS } from "./bash-sandbox.js";
+import { createAuditLogger, type AuditLogger, type ToolAuditEntry } from "./audit-logger.js";
 
 export { AllowAllPolicy } from "./policy.js";
 
@@ -31,6 +33,12 @@ export interface ToolRegistryOptions {
   maxToolMs?: number;
   /** Fallback approval handler when policy demands approval. */
   requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
+  /** Optional audit logger for tool execution tracking. */
+  auditLogger?: AuditLogger;
+  /** Session ID for audit context. */
+  sessionId?: string;
+  /** User ID for audit context. */
+  userId?: string;
 }
 
 export interface ApprovalMeta {
@@ -49,12 +57,18 @@ export class ToolRegistry {
   private workspaceRoot: string;
   private maxToolMs: number;
   private requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
+  private auditLogger?: AuditLogger;
+  private sessionId?: string;
+  private userId?: string;
 
   constructor(options: ToolRegistryOptions) {
     this.policy = options.policy ?? new DefaultPolicy();
     this.workspaceRoot = resolve(options.workspaceRoot);
     this.maxToolMs = options.maxToolMs ?? 120_000;
     if (options.requestApproval !== undefined) this.requestApproval = options.requestApproval;
+    if (options.auditLogger !== undefined) this.auditLogger = options.auditLogger;
+    if (options.sessionId !== undefined) this.sessionId = options.sessionId;
+    if (options.userId !== undefined) this.userId = options.userId;
   }
 
   register(tool: ToolDefinition): void {
@@ -101,44 +115,68 @@ export class ToolRegistry {
       return textResult(`Unknown tool: ${name}`, true, { code: "E_TOOL_UNKNOWN" });
     }
 
+    const startedAt = Date.now();
+    const origin = opts.origin ?? "model";
+
     // 1. Validate arguments before policy or execution.
     const argErrors = validateArgs(tool.inputSchema, args);
     if (argErrors.length > 0) {
-      return textResult(`Invalid arguments for tool ${name}: ${argErrors.join("; ")}`, true, {
+      const result = textResult(`Invalid arguments for tool ${name}: ${argErrors.join("; ")}`, true, {
         code: "E_TOOL_INVALID_ARGS",
         errors: argErrors,
       });
+      await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: { decision: "deny", reason: "Invalid arguments" }, result, startedAt });
+      return result;
     }
 
     // 2. Policy decision.
-    const origin = opts.origin ?? "model";
-    const policy = await this.policy.evaluate({
+    const policyInput = {
       toolName: name,
       arguments: args,
       cwd: this.workspaceRoot,
       origin,
       sideEffect: tool.sideEffect,
-    });
+    };
+    const policy = await this.policy.evaluate(policyInput);
+
     if (policy.decision === "deny") {
-      return textResult(policy.reason, true, { code: "E_TOOL_DENIED" });
+      const result = textResult(policy.reason, true, { code: "E_TOOL_DENIED" });
+      await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+      return result;
     }
     if (policy.decision === "require_approval") {
       const handler = opts.requestApproval ?? this.requestApproval;
       if (!handler) {
-        return textResult(`Approval required: ${policy.prompt}`, true, { code: "E_TOOL_DENIED" });
+        const result = textResult(`Approval required for tool ${name}: ${policy.prompt}`, true, {
+          code: "E_TOOL_DENIED",
+          details: { reason: "no_approval_handler", toolName: name, origin },
+        });
+        await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+        return result;
       }
       let approved: boolean | "session" = false;
       try {
         approved = await handler(policy.prompt, { toolName: name, origin });
-      } catch {
-        approved = false;
+      } catch (error) {
+        const result = textResult(
+          `Approval handler failed for tool ${name}: ${error instanceof Error ? error.message : String(error)}`,
+          true,
+          { code: "E_TOOL_DENIED", details: { reason: "approval_handler_error", toolName: name, origin } },
+        );
+        await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+        return result;
       }
       if (approved === "session") {
         this.configurePolicy((p) => p.allowForSession(name));
         approved = true;
       }
       if (!approved) {
-        return textResult(`Denied by approver: ${policy.prompt}`, true, { code: "E_TOOL_DENIED" });
+        const result = textResult(`Denied by approver for tool ${name}: ${policy.prompt}`, true, {
+          code: "E_TOOL_DENIED",
+          details: { reason: "approval_denied", toolName: name, origin },
+        });
+        await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+        return result;
       }
     }
 
@@ -185,7 +223,34 @@ export class ToolRegistry {
       signal.removeEventListener("abort", onParentAbort);
     });
 
-    return Promise.race([runPromise, timeoutPromise]);
+    const result = await Promise.race([runPromise, timeoutPromise]);
+    await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+    return result;
+  }
+
+  private async logAudit(params: {
+    toolName: string;
+    args: unknown;
+    origin: PolicyInput["origin"];
+    sideEffect?: SideEffect;
+    policyDecision: PolicyDecision;
+    result: ToolResult;
+    startedAt: number;
+  }): Promise<void> {
+    if (!this.auditLogger) return;
+    const durationMs = Date.now() - params.startedAt;
+    await this.auditLogger.log({
+      toolName: params.toolName,
+      arguments: params.args,
+      origin: params.origin,
+      sideEffect: params.sideEffect,
+      policyDecision: params.policyDecision,
+      result: params.result,
+      durationMs,
+      workspaceRoot: this.workspaceRoot,
+      sessionId: this.sessionId,
+      userId: this.userId,
+    });
   }
 }
 
@@ -203,7 +268,7 @@ export function createReadTool(root: string): ToolDefinition<{ path: string; off
     description: "Read file contents or directory listing",
     inputSchema: {
       type: "object",
-      properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } },
+      properties: { path: { type: "string" }, offset: { type: "integer" }, limit: { type: "integer" } },
       required: ["path"],
     },
     sideEffect: "read",
@@ -285,10 +350,13 @@ export function createWriteTool(root: string): ToolDefinition<{ path: string; co
         if (st && !overwrite) return textResult(`File exists: ${args.path}`, true);
         await mkdir(dirname(target), { recursive: true });
         await writeFile(target, args.content, "utf8");
+        const bytes = Buffer.byteLength(args.content, "utf8");
+        const lines = args.content === "" ? 0 : args.content.split("\n").length;
+        const action = st ? "Updated" : "Wrote";
         return {
-          content: [{ type: "text", text: `Wrote ${args.path}` }],
+          content: [{ type: "text", text: `${action} ${args.path} (${lines} lines, ${bytes} bytes)` }],
           isError: false,
-          details: { changedPaths: [args.path] },
+          details: { changedPaths: [args.path], bytes, lines, created: !st },
         };
       } catch (error) {
         return textResult(String(error), true, { code: "E_TOOL_FAILED" });
@@ -339,12 +407,22 @@ export function createEditTool(
           count = 1;
         }
         await writeFile(target, next, "utf8");
-        const diff = unifiedHunk(text, next, 3);
-        const summary = `Replaced ${count} occurrence(s) in ${args.path}`;
+        const diff = unifiedHunk(text, next, 3, args.path);
+        const beforeLines = text === "" ? 0 : text.split("\n").length;
+        const afterLines = next === "" ? 0 : next.split("\n").length;
+        const delta = afterLines - beforeLines;
+        const deltaText = delta === 0 ? "no line-count change" : `${delta > 0 ? "+" : ""}${delta} lines`;
+        const summary = `Edited ${args.path} (${count} replacement${count === 1 ? "" : "s"}, ${deltaText})`;
         return {
           content: [{ type: "text", text: diff ? `${summary}\n${diff}` : summary }],
           isError: false,
-          details: { changedPaths: [args.path], replacements: count },
+          details: {
+            changedPaths: [args.path],
+            replacements: count,
+            beforeLines,
+            afterLines,
+            lineDelta: delta,
+          },
         };
       } catch (error) {
         return textResult(String(error), true, { code: "E_TOOL_FAILED" });
@@ -370,8 +448,8 @@ function killTree(proc: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void 
   }
 }
 
-/** Minimal unified hunk around the first changed region (for display). */
-function unifiedHunk(before: string, after: string, context: number): string {
+/** Unified diff hunk around changed regions (bounded, for display). */
+function unifiedHunk(before: string, after: string, context: number, path = "file"): string {
   const a = before.split("\n");
   const b = after.split("\n");
   let start = 0;
@@ -382,106 +460,177 @@ function unifiedHunk(before: string, after: string, context: number): string {
     endA--;
     endB--;
   }
-  const out: string[] = [];
-  for (let i = Math.max(0, start - context); i < start; i++) out.push(`  ${a[i]}`);
-  for (let i = start; i <= endA; i++) out.push(`- ${a[i]}`);
-  for (let i = start; i <= endB; i++) out.push(`+ ${b[i]}`);
-  for (let i = endA + 1; i <= Math.min(a.length - 1, Math.max(endA, endB) + context); i++) {
-    if (i >= 0 && i < a.length) out.push(`  ${a[i]}`);
+
+  // No changes (should be rare here), return empty.
+  if (start > endA && start > endB) return "";
+
+  const ctx = Math.max(0, context);
+  const preStart = Math.max(0, start - ctx);
+  const preEnd = Math.min(a.length - 1, Math.max(endA, endB) + ctx);
+  const oldStart = a.length === 0 ? 0 : preStart + 1;
+  const oldCount = (start > endA ? 0 : endA - start + 1) + (start - preStart) + Math.max(0, preEnd - endA);
+  const newStart = b.length === 0 ? 0 : preStart + 1;
+  const newCount = (start > endB ? 0 : endB - start + 1) + (start - preStart) + Math.max(0, preEnd - Math.max(endA, start - 1));
+
+  const out: string[] = [
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    `@@ -${oldStart},${Math.max(0, oldCount)} +${newStart},${Math.max(0, newCount)} @@`,
+  ];
+  for (let i = preStart; i < start; i++) out.push(` ${a[i] ?? ""}`);
+  for (let i = start; i <= endA; i++) out.push(`-${a[i] ?? ""}`);
+  for (let i = start; i <= endB; i++) out.push(`+${b[i] ?? ""}`);
+  for (let i = endA + 1; i <= preEnd; i++) {
+    if (i >= 0 && i < a.length) out.push(` ${a[i] ?? ""}`);
   }
-  const MAX = 40;
-  return out.slice(0, MAX).join("\n") + (out.length > MAX ? `\n… ${out.length - MAX} more diff lines` : "");
+  const MAX = 80;
+  return out.length > MAX ? `${out.slice(0, MAX).join("\n")}\n… ${out.length - MAX} more diff lines` : out.join("\n");
 }
 
-export function createBashTool(root: string, timeoutMs = 120000): ToolDefinition<{ command: string; timeoutMs?: number }> {
+export interface CreateBashToolOptions {
+  root: string;
+  timeoutMs?: number;
+  sandbox?: SandboxOptions | false;
+}
+
+export function createBashTool(
+  options: CreateBashToolOptions | string,
+  timeoutMs?: number,
+): ToolDefinition<{ command: string; timeoutMs?: number }> {
+  const normalized: CreateBashToolOptions =
+    typeof options === "string"
+      ? { root: options, ...(timeoutMs !== undefined ? { timeoutMs } : {}) }
+      : options;
+  const { timeoutMs: defaultTimeoutMs = 120000, sandbox = false } = normalized;
   return {
     name: "bash",
     description: "Execute a shell command in the workspace",
     inputSchema: {
       type: "object",
-      properties: { command: { type: "string" }, timeoutMs: { type: "number" } },
+      properties: { command: { type: "string" }, timeoutMs: { type: "integer" } },
       required: ["command"],
     },
     sideEffect: "execute",
     async execute(args, ctx) {
       const cmd = args.command;
-      const t = Math.min(args.timeoutMs ?? timeoutMs, 600_000);
+      const t = Math.min(args.timeoutMs ?? defaultTimeoutMs, 600_000);
+      const useSandbox = sandbox !== false;
+      const sandboxOpts = useSandbox ? { ...sandbox, maxCpuTimeMs: t } : false;
+
       return await new Promise<ToolResult>((resolvePromise) => {
         let settled = false;
+        let sandboxResult: Awaited<ReturnType<typeof spawnSandboxed>> | null = null;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let killTimer: ReturnType<typeof setTimeout> | undefined;
+        let onAbort: (() => void) | undefined;
+
         const finish = (result: ToolResult) => {
           if (settled) return;
           settled = true;
-          clearTimeout(timer);
-          clearTimeout(killTimer);
-          ctx.signal.removeEventListener("abort", onAbort);
+          if (timer) clearTimeout(timer);
+          if (killTimer) clearTimeout(killTimer);
+          if (onAbort) ctx.signal.removeEventListener("abort", onAbort);
+          if (sandboxResult) sandboxResult.cleanup();
           resolvePromise(result);
         };
 
-        const proc = spawn("bash", ["-c", cmd], {
-          cwd: ctx.workspaceRoot,
-          stdio: "pipe",
-          detached: process.platform !== "win32",
-          windowsHide: true,
-        });
         const startedAt = Date.now();
         let stdout = "";
         let stdoutCapped = false;
         let stderr = "";
         let stderrCapped = false;
-        const timer = setTimeout(() => {
-          killTree(proc, "SIGTERM");
-          killTimer = setTimeout(() => killTree(proc, "SIGKILL"), 2000);
-          const durationMs = Date.now() - startedAt;
-          const out = boundText(stdout);
-          const err = boundText(stderr);
-          let text = `Exit code: 124 (timeout after ${t}ms)\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
-          if (out.text) text += `\nstdout:\n${out.text}`;
-          if (err.text) text += `\nstderr:\n${err.text}`;
-          finish({
-            content: [{ type: "text", text }],
-            isError: true,
-            details: { code: "E_TOOL_TIMEOUT", exitCode: 124, durationMs, timeoutMs: t },
-          });
-        }, t);
-        let killTimer: ReturnType<typeof setTimeout> | undefined;
 
-        const onAbort = () => {
-          killTree(proc, "SIGTERM");
-          killTimer = setTimeout(() => killTree(proc, "SIGKILL"), 2000);
+        const run = async () => {
+          try {
+            if (sandboxOpts) {
+              sandboxResult = await spawnSandboxed("bash", ["-c", cmd], {
+                ...sandboxOpts,
+                cwd: ctx.workspaceRoot,
+                stdio: "pipe",
+              });
+            } else {
+              sandboxResult = {
+                process: spawn("bash", ["-c", cmd], {
+                  cwd: ctx.workspaceRoot,
+                  stdio: "pipe",
+                  detached: process.platform !== "win32",
+                  windowsHide: true,
+                }),
+                cleanup: async () => {},
+                active: false,
+              };
+            }
+
+            const proc = sandboxResult.process;
+
+            timer = setTimeout(() => {
+              if (sandboxResult) sandboxResult.cleanup();
+              killTimer = setTimeout(() => {
+                if (sandboxResult) sandboxResult.cleanup();
+              }, 2000);
+              const durationMs = Date.now() - startedAt;
+              const out = boundText(stdout);
+              const err = boundText(stderr);
+              let text = `Exit code: 124 (timeout after ${t}ms)\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
+              if (out.text) text += `\nstdout:\n${out.text}`;
+              if (err.text) text += `\nstderr:\n${err.text}`;
+              finish({
+                content: [{ type: "text", text }],
+                isError: true,
+                details: { code: "E_TOOL_TIMEOUT", exitCode: 124, durationMs, timeoutMs: t, sandboxed: sandboxResult?.active ?? false },
+              });
+            }, t);
+
+            onAbort = () => {
+              if (sandboxResult) sandboxResult.cleanup();
+              killTimer = setTimeout(() => {
+                if (sandboxResult) sandboxResult.cleanup();
+              }, 2000);
+            };
+            if (ctx.signal.aborted) onAbort();
+            else ctx.signal.addEventListener("abort", onAbort, { once: true });
+
+            if (proc.stdout) {
+              proc.stdout.on("data", (d: Buffer) => {
+                if (stdout.length < MAX_CAPTURE_BYTES) stdout += d.toString();
+                else stdoutCapped = true;
+              });
+            }
+            if (proc.stderr) {
+              proc.stderr.on("data", (d: Buffer) => {
+                if (stderr.length < MAX_CAPTURE_BYTES) stderr += d.toString();
+                else stderrCapped = true;
+              });
+            }
+            proc.on("close", (code, signal) => {
+              const durationMs = Date.now() - startedAt;
+              const out = boundText(stdout);
+              const err = boundText(stderr);
+              let text = `Exit code: ${code ?? -1}${signal ? ` (signal ${signal})` : ""}\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
+              if (out.text) text += `\nstdout:\n${out.text}`;
+              if (err.text) text += `\nstderr:\n${err.text}`;
+              finish({
+                content: [{ type: "text", text }],
+                isError: code !== 0,
+                details: {
+                  exitCode: code ?? -1,
+                  durationMs,
+                  stdoutTruncated: out.truncated || stdoutCapped,
+                  stderrTruncated: err.truncated || stderrCapped,
+                  timeoutMs: t,
+                  sandboxed: sandboxResult?.active ?? false,
+                },
+              });
+            });
+            proc.on("error", (e) => {
+              finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
+            });
+          } catch (e) {
+            finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
+          }
         };
-        if (ctx.signal.aborted) onAbort();
-        else ctx.signal.addEventListener("abort", onAbort, { once: true });
 
-        proc.stdout.on("data", (d: Buffer) => {
-          if (stdout.length < MAX_CAPTURE_BYTES) stdout += d.toString();
-          else stdoutCapped = true;
-        });
-        proc.stderr.on("data", (d: Buffer) => {
-          if (stderr.length < MAX_CAPTURE_BYTES) stderr += d.toString();
-          else stderrCapped = true;
-        });
-        proc.on("close", (code, signal) => {
-          const durationMs = Date.now() - startedAt;
-          const out = boundText(stdout);
-          const err = boundText(stderr);
-          let text = `Exit code: ${code ?? -1}${signal ? ` (signal ${signal})` : ""}\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
-          if (out.text) text += `\nstdout:\n${out.text}`;
-          if (err.text) text += `\nstderr:\n${err.text}`;
-          finish({
-            content: [{ type: "text", text }],
-            isError: code !== 0,
-            details: {
-              exitCode: code ?? -1,
-              durationMs,
-              stdoutTruncated: out.truncated || stdoutCapped,
-              stderrTruncated: err.truncated || stderrCapped,
-              timeoutMs: t,
-            },
-          });
-        });
-        proc.on("error", (e) => {
-          finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
-        });
+        run();
       });
     },
   };

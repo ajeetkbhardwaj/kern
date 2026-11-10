@@ -65,8 +65,16 @@ export class SessionManager {
       file = await store.findMostRecent(cwd);
     }
     if (!file) return SessionManager.create(store, cwd);
-    await mgr.loadFromFile(file.filePath);
-    return mgr;
+    try {
+      await mgr.loadFromFile(file.filePath);
+      return mgr;
+    } catch (error) {
+      mgr.logger.warn("session_resume_failed_falling_back", {
+        filePath: file.filePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return SessionManager.create(store, cwd);
+    }
   }
 
   private async loadFromFile(filePath: string): Promise<void> {
@@ -85,8 +93,18 @@ export class SessionManager {
       }
       lastId = entry.id;
     }
+    const readStats = this.store.lastReadStats;
+    if (readStats && (readStats.malformed > 0 || readStats.invalid > 0)) {
+      await this.quarantineCorruptSession(filePath, readStats);
+      throw new Error(
+        `Session file corrupted (${readStats.malformed} malformed, ${readStats.invalid} invalid line(s)): ${filePath}`,
+      );
+    }
     if (!header || lastId === null) {
-      throw new Error(`Session file missing header: ${filePath}`);
+      const corruptInfo = readStats && (readStats.malformed > 0 || readStats.invalid > 0)
+        ? ` (corruption detected: ${readStats.malformed} malformed, ${readStats.invalid} invalid; a quarantine copy may exist)`
+        : "";
+      throw new Error(`Session file missing header: ${filePath}${corruptInfo}`);
     }
     let lastSeq = 0;
     for (const e of entries.values()) {
@@ -223,6 +241,7 @@ export class SessionManager {
   }
 
   async appendModelChange(provider: string, model: string, thinkingLevel?: string): Promise<ModelChangeEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
     const entry: ModelChangeEntry = { id: newId("v"), parentId, timestamp: now(), type: "model_change", provider, model, seq: this.nextSeq() };
@@ -234,9 +253,11 @@ export class SessionManager {
     this.state.children.set(parentId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async appendCompaction(summary: string, replacesThroughId: string): Promise<CompactionEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
     const entry: CompactionEntry = { id: newId("c"), parentId, timestamp: now(), type: "compaction", summary, replacesThroughId, seq: this.nextSeq() };
@@ -247,9 +268,11 @@ export class SessionManager {
     this.state.children.set(parentId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async appendBranch(note?: string): Promise<BranchEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const forkedFromId = this.state.activeLeafId;
     const entry: BranchEntry = { id: newId("b"), parentId: forkedFromId, timestamp: now(), type: "branch", forkedFromId, note, seq: this.nextSeq() };
@@ -260,9 +283,11 @@ export class SessionManager {
     this.state.children.set(forkedFromId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async appendBranchSummary(fromId: string, summary: string): Promise<BranchSummaryEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
     const entry: BranchSummaryEntry = { id: newId("bs"), parentId, timestamp: now(), type: "branch_summary", fromId, summary, seq: this.nextSeq() };
@@ -273,9 +298,11 @@ export class SessionManager {
     this.state.children.set(parentId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async setSessionName(name: string): Promise<SessionNameEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
     const entry: SessionNameEntry = { id: newId("n"), parentId, timestamp: now(), type: "session_name", name, seq: this.nextSeq() };
@@ -286,9 +313,11 @@ export class SessionManager {
     this.state.children.set(parentId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async appendDiagnostic(d: Omit<DiagnosticEntry, "id" | "parentId" | "timestamp" | "type" | "seq">): Promise<DiagnosticEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
     const entry: DiagnosticEntry = { id: newId("d"), parentId, timestamp: now(), type: "diagnostic", seq: this.nextSeq(), ...d };
@@ -299,6 +328,7 @@ export class SessionManager {
     this.state.children.set(parentId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async deleteSession(filePath: string): Promise<boolean> {
@@ -316,5 +346,25 @@ export class SessionManager {
     const cwd = this.cwd || process.cwd();
     const files = await store.listSessions(cwd, { limit });
     return files.map((file) => file.filePath);
+  }
+
+  private async quarantineCorruptSession(
+    filePath: string,
+    readStats: { malformed: number; invalid: number; totalLines: number; yielded: number; empty: number },
+  ): Promise<void> {
+    const shouldQuarantine = (this.store as { quarantineLastMalformed?: boolean }).quarantineLastMalformed ?? true;
+    if (!shouldQuarantine) return;
+    try {
+      const { copyFile } = await import("node:fs/promises");
+      const quarantinePath = `${filePath}.corrupt-${Date.now()}`;
+      await copyFile(filePath, quarantinePath);
+      this.logger.warn("session_quarantined", { filePath, quarantinePath, ...readStats });
+    } catch (error) {
+      this.logger.warn("session_quarantine_failed", {
+        filePath,
+        error: error instanceof Error ? error.message : String(error),
+        ...readStats,
+      });
+    }
   }
 }
