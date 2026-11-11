@@ -1,6 +1,6 @@
 {
   "name": "@kern/semantic-search",
-  "version": "0.0.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Repo-aware retrieval and ranking for task-specific file selection.",

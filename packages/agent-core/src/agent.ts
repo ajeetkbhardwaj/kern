@@ -77,7 +77,7 @@ export class AgentRuntime {
     this.contextBuilder = options.contextBuilder;
     this.events = options.events;
     this.logger = options.logger ?? nullLogger;
-    this.budgets = new BudgetTracker(options.budgets ?? {});
+    this.budgets = new BudgetTracker(options.budgets ?? {}, (event) => this.events.emit(event));
     this.compactor = options.compactor === undefined ? new Compactor({ logger: this.logger }) : options.compactor;
     this.retry = options.retry ?? DEFAULT_RETRY_CONFIG;
     this.thinkingLevel = options.defaultThinkingLevel ?? "medium";
@@ -183,7 +183,6 @@ export class AgentRuntime {
       while (true) {
         this.throwIfAborted(signal);
         this.turn += 1;
-        this.budgets.checkTurn(this.turn);
         this.events.emit({ type: "turn_start", turn: this.turn });
 
         const ctx = await this.contextBuilder.build(this.sessions);
@@ -208,14 +207,12 @@ export class AgentRuntime {
           pendingQueuedFlush = true;
           return;
         }
-        this.budgets.checkToolBatch(toolCalls.length);
         for (const call of toolCalls) {
           this.throwIfAborted(signal);
           const toolMsg = await this.executeTool(call, signal);
           this.throwIfAborted(signal);
           await this.sessions.appendToolResult(toolMsg);
         }
-        this.budgets.recordToolCalls(toolCalls.length);
       }
     } catch (error) {
       if (isCancelled(error, signal)) {
@@ -327,7 +324,7 @@ export class AgentRuntime {
                 this.events.emit({ type: "reasoning_delta", delta: event.delta });
                 break;
               case "usage":
-                this.events.emit(event);
+                this.budgets.recordUsage(event.usage.input, event.usage.output, 0, this.model.info.modelId);
                 break;
               case "tool_call_complete":
               case "tool_call_delta":
@@ -337,6 +334,7 @@ export class AgentRuntime {
             assembler.apply(event);
           }
           const message = assembler.finalize(now());
+          message.model = this.model.info.modelId;
           this.events.emit({ type: "message_end", message });
           return message;
         } catch (error) {

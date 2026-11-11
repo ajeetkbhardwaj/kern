@@ -63,6 +63,8 @@ export const ChatMessageSchema = z.object({
   role: RoleSchema,
   content: z.array(ContentBlockSchema),
   timestamp: z.string().datetime(),
+  cost: z.number().nonnegative().optional(),
+  model: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -229,6 +231,49 @@ export const ModelStreamEventSchema: z.ZodType<ModelStreamEvent> = z.discriminat
   }),
   z.object({ type: z.literal("finished"), reason: StopReasonSchema }),
 ]);
+
+// ---------------------------------------------------------------------------
+// Budget events & cost snapshot schemas
+// ---------------------------------------------------------------------------
+
+export const BudgetLimitKindSchema = z.enum(["max_cost", "max_tokens"]);
+
+export const BudgetWarningEventSchema = z.object({
+  type: z.literal("budget_warning"),
+  kind: BudgetLimitKindSchema,
+  current: z.number().nonnegative(),
+  limit: z.number().nonnegative(),
+  message: z.string(),
+});
+
+export const BudgetExceededEventSchema = z.object({
+  type: z.literal("budget_exceeded"),
+  kind: BudgetLimitKindSchema,
+  current: z.number().nonnegative(),
+  limit: z.number().nonnegative(),
+  message: z.string(),
+});
+
+export const TokenUsageEventSchema = z.object({
+  type: z.literal("token_usage"),
+  input: z.number().int().nonnegative(),
+  output: z.number().int().nonnegative(),
+  cost: z.number().nonnegative(),
+  model: z.string(),
+});
+
+export const CostSnapshotSchema = z.object({
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cost: z.number().nonnegative(),
+  byModel: z.record(
+    z.object({
+      input: z.number().int().nonnegative(),
+      output: z.number().int().nonnegative(),
+      cost: z.number().nonnegative(),
+    }),
+  ),
+});
 
 // ---------------------------------------------------------------------------
 // Validation helpers

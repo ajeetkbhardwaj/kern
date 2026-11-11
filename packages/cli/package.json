@@ -1,6 +1,6 @@
 {
   "name": "@kern/cli",
-  "version": "0.0.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Command-line entry point and argument parsing.",

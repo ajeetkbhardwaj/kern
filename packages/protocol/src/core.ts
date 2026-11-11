@@ -48,6 +48,10 @@ export interface ChatMessage {
   content: ContentBlock[];
   /** ISO-8601. Set by the runtime at persist time, never by the provider. */
   timestamp: string;
+  /** Monetary cost of producing this message (USD). Best-effort; providers may not report it. */
+  cost?: number;
+  /** Model that produced this message, for per-model cost attribution. */
+  model?: string;
 }
 
 export interface ToolResultDetails {
@@ -248,11 +252,26 @@ export type AgentEvent =
   | { type: "agent_end"; reason: "final_response" | "aborted" | "queued_work_remaining" }
   | { type: "agent_error"; error: SerializedError }
   | { type: "agent_settled" }
-  | { type: "session_diagnostic"; diagnostic: DiagnosticEntry };
+  | { type: "session_diagnostic"; diagnostic: DiagnosticEntry }
+  | { type: "budget_warning"; kind: BudgetLimitKind; current: number; limit: number; message: string }
+  | { type: "budget_exceeded"; kind: BudgetLimitKind; current: number; limit: number; message: string }
+  | { type: "token_usage"; input: number; output: number; cost: number; model: string };
 
 export type CompactionPhase = "before_prompt" | "after_agent_end";
 
 export type AgentEventType = AgentEvent["type"];
+
+/** Kinds of consumable resource limits that can trip a budget. */
+export type BudgetLimitKind = "max_cost" | "max_tokens";
+
+/** Snapshot of cumulative token and cost usage, optionally broken down per model. */
+export interface CostSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  /** Per-model attribution: model id -> { input, output, cost }. */
+  byModel: Record<string, { input: number; output: number; cost: number }>;
+}
 
 export type Unsubscribe = () => void;
 

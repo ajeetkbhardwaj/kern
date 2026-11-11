@@ -68,7 +68,7 @@ const COMMANDS = [
   { name: "session", description: "manage sessions (list/switch/rename/new/info/export)" },
   { name: "model", description: "pick provider/model" },
   { name: "safety", description: "pick safety mode (strict/balanced/restricted/autonomous)" },
-  { name: "budget", description: "configure session limits (turns, time, tool calls)" },
+  { name: "budget", description: "configure session cost and token limits" },
   { name: "connect", description: "connect or re-auth a provider" },
   { name: "undo", description: "undo file changes from the last turn" },
   { name: "redo", description: "redo previously undone file changes" },
@@ -590,7 +590,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const sidebarPanel = new SidebarPanel({ leftBorder: true });
   const sidebarScroll = new ScrollView(sidebarPanel);
   let sidebarVisible = false;
-  const modelUsageHistory = new Map<string, { provider: string; model: string; switches: number; lastContext?: string; turns: number; tools: number }>();
+  const modelUsageHistory = new Map<string, { provider: string; model: string; switches: number; lastContext?: string; cost: number; input: number; output: number }>();
   const noteModelUsage = () => {
     try {
       const m = session.modelInfo();
@@ -601,14 +601,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         usage && m.contextWindow > 0
           ? `${usage.totalTokens.toLocaleString()}/${m.contextWindow.toLocaleString()} (${Math.round((usage.totalTokens / m.contextWindow) * 100)}%)`
           : undefined;
+      const mu = u.byModel[key];
       const prev = modelUsageHistory.get(key);
       modelUsageHistory.set(key, {
         provider: m.provider,
         model: m.modelId,
         switches: (prev?.switches ?? 0),
         lastContext: ctx ?? prev?.lastContext,
-        turns: u.turns,
-        tools: u.totalToolCalls,
+        cost: mu?.cost ?? 0,
+        input: mu?.input ?? 0,
+        output: mu?.output ?? 0,
       });
     } catch {
       /* best-effort */
@@ -648,14 +650,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         usage && m.contextWindow > 0
           ? `${usage.totalTokens.toLocaleString()} / ${m.contextWindow.toLocaleString()} (${Math.round((usage.totalTokens / m.contextWindow) * 100)}%)`
           : "—";
-      const wallSecs = Number.isFinite(u.wallTimeMs) ? (u.wallTimeMs / 1000).toFixed(1) : "0.0";
       const sessionName = session.sessionName() ?? "—";
       const modelLines = [...modelUsageHistory.values()].slice(-8).flatMap((entry) => {
         const current = entry.provider === m.provider && entry.model === m.modelId ? theme.accent(" (current)") : "";
         return [
           `${theme.muted("•")} ${entry.provider}/${entry.model}${current}`,
           `  ${theme.muted("ctx")} ${entry.lastContext ?? "—"}`,
-          `  ${theme.muted("session totals at last use")} ${entry.turns} turns · ${entry.tools} tools`,
+          `  ${theme.muted("cost")} $${entry.cost.toFixed(4)} · ${theme.muted("in/out")} ${entry.input.toLocaleString()}/${entry.output.toLocaleString()} tok`,
         ];
       });
       if (modelLines.length === 0) modelLines.push(theme.muted("No model usage tracked yet."));
@@ -684,14 +685,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             `${theme.muted("Context")} ${ctx}`,
             `${theme.muted("Input")} ${apiUsage.input.toLocaleString()}`,
             `${theme.muted("Output")} ${apiUsage.output.toLocaleString()}`,
+            `${theme.muted("Cost")} $${u.cost.toFixed(4)}`,
             ...(apiUsage.cacheRead || apiUsage.cacheWrite
               ? [
                   `${theme.muted("Cache R/W")} ${apiUsage.cacheRead.toLocaleString()} / ${apiUsage.cacheWrite.toLocaleString()}`,
                 ]
               : []),
-            `${theme.muted("Turns")} ${u.turns}`,
-            `${theme.muted("Tools")} ${u.totalToolCalls}`,
-            `${theme.muted("Wall")} ${wallSecs}s`,
             `${theme.muted("Queue")} ${queue.length}/${MAX_QUEUE}`,
           ],
         },
@@ -702,10 +701,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           defaultExpanded: false,
           lines: limits
             ? [
-                `${theme.muted("turns")} ${limits.maxTurns}`,
-                `${theme.muted("tools/turn")} ${limits.maxToolCallsPerTurn}`,
-                `${theme.muted("tools total")} ${limits.maxTotalToolCalls}`,
-                `${theme.muted("wall")} ${(limits.maxWallTimeMs / 1000).toFixed(0)}s`,
+                `${theme.muted("cost")} $${limits.maxCost === 0 ? "∞" : limits.maxCost.toFixed(4)}`,
+                `${theme.muted("input tokens")} ${limits.maxInputTokens === 0 ? "∞" : limits.maxInputTokens.toLocaleString()}`,
+                `${theme.muted("output tokens")} ${limits.maxOutputTokens === 0 ? "∞" : limits.maxOutputTokens.toLocaleString()}`,
+                `${theme.muted("total tokens")} ${limits.maxTotalTokens === 0 ? "∞" : limits.maxTotalTokens.toLocaleString()}`,
               ]
             : [theme.muted("Limits unavailable")],
         },
@@ -714,7 +713,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           title: "Models used (session)",
           collapsible: true,
           defaultExpanded: true,
-          lines: [...modelLines, theme.muted("Best-effort; totals are session-wide, not per-model attribution")],
+          lines: [...modelLines, theme.muted("Per-model cost and token attribution")],
         },
       ]);
     } catch {
@@ -826,14 +825,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         ? `ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%`
         : "ctx —";
     const sessionName = session.sessionName() ? ` · ${session.sessionName()}` : "";
-    const wallSecs = Number.isFinite(u.wallTimeMs) ? (u.wallTimeMs / 1000).toFixed(1) : "0.0";
     const safetyMode = session.safetyMode?.() ?? "balanced";
     statusBar.setSegments([
       `${m.provider}/${m.modelId}${sessionName}`,
       modeLabel(),
       `safety: ${safetyMode}`,
       ctx,
-      `${u.turns} turns · ${u.totalToolCalls} calls · ${wallSecs}s`,
+      `$${u.cost.toFixed(4)} · ${u.inputTokens.toLocaleString()} in / ${u.outputTokens.toLocaleString()} out`,
     ]);
     updateSidebar();
     requestRender();
@@ -844,15 +842,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const limits = session.budgetLimits?.();
     printStatus();
     say(theme.bold("budget"));
-    say(`  usage: ${u.turns} turns, ${u.totalToolCalls} tool calls, ${(u.wallTimeMs / 1000).toFixed(1)}s wall`);
+    say(`  usage: $${u.cost.toFixed(4)} cost, ${u.inputTokens.toLocaleString()} in / ${u.outputTokens.toLocaleString()} out tokens`);
     if (limits) {
       say(
-        `  limits: ${limits.maxTurns} turns, ${limits.maxTotalToolCalls} total tool calls, ${limits.maxToolCallsPerTurn} per turn, ${(limits.maxWallTimeMs / 1000).toFixed(0)}s wall`,
+        `  limits: $${limits.maxCost === 0 ? "∞" : limits.maxCost.toFixed(4)} cost, ${limits.maxInputTokens === 0 ? "∞" : limits.maxInputTokens.toLocaleString()} in, ${limits.maxOutputTokens === 0 ? "∞" : limits.maxOutputTokens.toLocaleString()} out, ${limits.maxTotalTokens === 0 ? "∞" : limits.maxTotalTokens.toLocaleString()} total`,
       );
     } else {
       info("  limits: unavailable from session runtime");
     }
-    info("Tip: adjust with --max-turns, --max-wall-time-ms, --max-tool-calls-per-turn, --max-total-tool-calls");
+    if (u.byModel && Object.keys(u.byModel).length > 0) {
+      say(theme.bold("  per-model:"));
+      for (const [model, mu] of Object.entries(u.byModel)) {
+        say(`    ${model}: $${mu.cost.toFixed(4)} · ${mu.input.toLocaleString()} in / ${mu.output.toLocaleString()} out`);
+      }
+    }
+    info("Tip: adjust with --max-cost, --max-input-tokens, --max-output-tokens, --max-total-tokens");
   };
 
   // --- event → transcript -----------------------------------------------------
@@ -1031,13 +1035,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             setActivity(`retrying (${event.reason})`);
             toast(`retry ${event.attempt} (${event.reason}) in ${event.delayMs}ms`);
             break;
-          case "usage": {
-            const u = (event as any).usage ?? {};
-            apiUsage.input += Number(u.input) || 0;
-            apiUsage.output += Number(u.output) || 0;
-            apiUsage.cacheRead += Number(u.cacheRead) || 0;
-            apiUsage.cacheWrite += Number(u.cacheWrite) || 0;
+          case "token_usage": {
+            apiUsage.input += Number(event.input) || 0;
+            apiUsage.output += Number(event.output) || 0;
             updateSidebar();
+            printStatus();
+            break;
+          }
+          case "budget_warning": {
+            const u = session.budgetUsage();
+            toast(`⚠️ Budget warning: ${event.message} ($${u.cost.toFixed(4)} cost, ${(u.inputTokens + u.outputTokens).toLocaleString()} tok)`);
             printStatus();
             break;
           }
@@ -1052,12 +1059,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
               handleAuthError(event.error.message);
             } else if (event.error.code === "E_BUDGET_EXCEEDED") {
               const limits = session.budgetLimits?.();
+              const u = session.budgetUsage();
+              const kind = event.error.details?.budget;
               if (limits) {
                 info(
-                  `Tip: split/resume the task or raise limits (current: ${limits.maxTurns} turns, ${limits.maxTotalToolCalls} total calls, ${limits.maxToolCallsPerTurn}/turn, ${(limits.maxWallTimeMs / 1000).toFixed(0)}s wall).`,
+                  `Budget exceeded (${kind || "unknown"}). Current: $${u.cost.toFixed(4)} cost, ${u.inputTokens.toLocaleString()} in / ${u.outputTokens.toLocaleString()} out tok. Tip: split/resume the task or raise limits.`,
                 );
               } else {
-                info("Tip: split the task, resume later, or increase limits (e.g. --max-wall-time-ms / --max-turns / --max-tool-calls-*).");
+                info("Budget exceeded. Split the task, resume later, or increase limits (e.g. --max-cost / --max-total-tokens).");
               }
             }
             break;
@@ -1474,12 +1483,15 @@ await withOverlay("model", list, async (value) => {
       return;
     }
     const current = session.budgetLimits?.();
-    const currentValues: Record<string, number> = {
-      maxTurns: current?.maxTurns ?? 0,
-      maxWallTimeMs: current?.maxWallTimeMs ?? 0,
-      maxToolCallsPerTurn: current?.maxToolCallsPerTurn ?? 0,
-      maxTotalToolCalls: current?.maxTotalToolCalls ?? 0,
+    const currentValues: Record<string, number | string> = {
+      maxCost: current?.maxCost ?? 0,
+      maxInputTokens: current?.maxInputTokens ?? 0,
+      maxOutputTokens: current?.maxOutputTokens ?? 0,
+      maxTotalTokens: current?.maxTotalTokens ?? 0,
     };
+
+    const floatFields = new Set(["maxCost"]);
+    const intFields = new Set(["maxInputTokens", "maxOutputTokens", "maxTotalTokens"]);
 
     if (arg && arg.trim()) {
       const budgets: Record<string, number> = {};
@@ -1487,12 +1499,16 @@ await withOverlay("model", list, async (value) => {
       for (const pair of pairs) {
         const [key, valStr] = pair.split("=");
         if (!key || !valStr) {
-          err(`Invalid format: "${pair}". Use field=value (e.g. maxTurns=50)`);
+          err(`Invalid format: "${pair}". Use field=value (e.g. maxCost=0.05)`);
           return;
         }
         const val = Number(valStr);
-        if (!Number.isInteger(val) || val < 0) {
-          err(`Invalid value for ${key}: must be non-negative integer`);
+        if (!Number.isFinite(val) || val < 0) {
+          err(`Invalid value for ${key}: must be non-negative number`);
+          return;
+        }
+        if (intFields.has(key) && !Number.isInteger(val)) {
+          err(`Invalid value for ${key}: must be a non-negative integer`);
           return;
         }
         if (val > 0) budgets[key] = val;
@@ -1509,11 +1525,11 @@ await withOverlay("model", list, async (value) => {
     // Display current values directly (no overlay needed for read-only)
     printStatus();
     say(theme.bold("budget limits (0 = unlimited)"));
-    say(`  maxTurns: ${currentValues.maxTurns || "unlimited"}`);
-    say(`  maxWallTimeMs: ${currentValues.maxWallTimeMs || "unlimited"}`);
-    say(`  maxToolCallsPerTurn: ${currentValues.maxToolCallsPerTurn || "unlimited"}`);
-    say(`  maxTotalToolCalls: ${currentValues.maxTotalToolCalls || "unlimited"}`);
-    info("  (use /budget <field>=<value> to set, e.g. /budget maxTurns=50)");
+    say(`  maxCost: $${(currentValues.maxCost as number) === 0 ? "∞" : (currentValues.maxCost as number).toFixed(4)}`);
+    say(`  maxInputTokens: ${currentValues.maxInputTokens || "unlimited"}`);
+    say(`  maxOutputTokens: ${currentValues.maxOutputTokens || "unlimited"}`);
+    say(`  maxTotalTokens: ${currentValues.maxTotalTokens || "unlimited"}`);
+    info("  (use /budget <field>=<value> to set, e.g. /budget maxCost=0.05)");
   };
 
   /** `/connect` wizard: preset → key → test → model → save. Esc at any step cancels with nothing written. */

@@ -1,6 +1,6 @@
 {
   "name": "@kern/protocol",
-  "version": "0.0.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Shared types and contracts. Depends on nothing.",

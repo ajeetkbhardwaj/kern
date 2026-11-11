@@ -3,13 +3,13 @@ import { createLogger } from "@kern/protocol";
 import { discoverModels, loadModelsFile, createAdapterFor, createModelRuntime } from "@kern/model";
 import { createInterface } from "node:readline";
 
-interface CliFlags {
+export interface CliFlags {
   prompt: string;
   readOnly: boolean;
-  maxTurns?: number;
-  maxWallTimeMs?: number;
-  maxToolCallsPerTurn?: number;
-  maxTotalToolCalls?: number;
+  maxCost?: number;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  maxTotalTokens?: number;
   cwd: string;
   noResources: boolean;
   noCompaction: boolean;
@@ -62,26 +62,26 @@ function parseArgs(argv: string[]): CliFlags {
       const next = argv[++i];
       if (!next) throw new Error("--api-key requires a value");
       flags.apiKey = next;
-    } else if (arg === "--max-turns") {
+    } else if (arg === "--max-cost") {
       const next = argv[++i];
       const n = next !== undefined ? Number(next) : NaN;
-      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-turns requires a positive integer");
-      flags.maxTurns = n;
-    } else if (arg === "--max-wall-time-ms") {
+      if (!Number.isFinite(n) || n < 0) throw new Error("--max-cost requires a non-negative number");
+      flags.maxCost = n;
+    } else if (arg === "--max-input-tokens") {
       const next = argv[++i];
       const n = next !== undefined ? Number(next) : NaN;
-      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-wall-time-ms requires a positive integer");
-      flags.maxWallTimeMs = n;
-    } else if (arg === "--max-tool-calls-per-turn") {
+      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-input-tokens requires a positive integer");
+      flags.maxInputTokens = n;
+    } else if (arg === "--max-output-tokens") {
       const next = argv[++i];
       const n = next !== undefined ? Number(next) : NaN;
-      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-tool-calls-per-turn requires a positive integer");
-      flags.maxToolCallsPerTurn = n;
-    } else if (arg === "--max-total-tool-calls") {
+      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-output-tokens requires a positive integer");
+      flags.maxOutputTokens = n;
+    } else if (arg === "--max-total-tokens") {
       const next = argv[++i];
       const n = next !== undefined ? Number(next) : NaN;
-      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-total-tool-calls requires a positive integer");
-      flags.maxTotalToolCalls = n;
+      if (!Number.isInteger(n) || n <= 0) throw new Error("--max-total-tokens requires a positive integer");
+      flags.maxTotalTokens = n;
     } else if (arg === "--safety") {
       const next = argv[++i];
       if (!next) throw new Error("--safety requires a mode: strict, balanced, restricted, autonomous");
@@ -177,10 +177,10 @@ async function runRpcMode(
   }
 
   const budgets = {
-    ...(flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : {}),
-    ...(flags.maxWallTimeMs !== undefined ? { maxWallTimeMs: flags.maxWallTimeMs } : {}),
-    ...(flags.maxToolCallsPerTurn !== undefined ? { maxToolCallsPerTurn: flags.maxToolCallsPerTurn } : {}),
-    ...(flags.maxTotalToolCalls !== undefined ? { maxTotalToolCalls: flags.maxTotalToolCalls } : {}),
+    ...(flags.maxCost !== undefined ? { maxCost: flags.maxCost } : {}),
+    ...(flags.maxInputTokens !== undefined ? { maxInputTokens: flags.maxInputTokens } : {}),
+    ...(flags.maxOutputTokens !== undefined ? { maxOutputTokens: flags.maxOutputTokens } : {}),
+    ...(flags.maxTotalTokens !== undefined ? { maxTotalTokens: flags.maxTotalTokens } : {}),
   };
 
   const sessionOptions = {
@@ -289,7 +289,7 @@ async function runRpcMode(
 
 function printHelp(): void {
   process.stdout.write(
-    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n\nFlags:\n  --read-only                 Only read/grep/find/ls-class tools (here: read only)\n  --max-turns N               Cap agent turns for this run\n  --max-wall-time-ms MS       Cap wall-clock runtime for the session (default: 600000)\n  --max-tool-calls-per-turn N Cap tool calls per turn (default: 30)\n  --max-total-tool-calls N    Cap total tool calls for the session (default: 200)\n  --cwd DIR                   Workspace root (default: cwd)\n  --no-resources              Skip AGENTS.md / skill discovery\n  --no-compaction             Disable automatic compaction\n  --resume                    Resume the most recent session\n  --session ID|PATH           Resume a specific session by ID or JSONL file path\n  --interactive, -i            Start interactive TUI\n  --print                     Force single-prompt print mode (no TUI)\n  --list-models               List available models (configured + live) and exit\n  --provider NAME             Provider from models.json (or KERN_PROVIDER)\n  --model ID                  Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL              Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY               Override API key (or KERN_API_KEY)\n  --safety MODE               Safety mode: strict, balanced, restricted, autonomous (default: balanced)\n  --rpc                       JSON-RPC mode (stdin/stdout)\n  --validate-config           Validate config files and exit\n  --config PATH               Config file path (default: ~/.kern/models.json)\n  --help, -h                  This message\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
+    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n\nFlags:\n  --read-only                 Only read/grep/find/ls-class tools (here: read only)\n  --max-cost N               Cap session cost in USD\n  --max-input-tokens N       Cap input tokens for the session\n  --max-output-tokens N      Cap output tokens for the session\n  --max-total-tokens N       Cap total tokens for the session\n  --cwd DIR                   Workspace root (default: cwd)\n  --no-resources              Skip AGENTS.md / skill discovery\n  --no-compaction             Disable automatic compaction\n  --resume                    Resume the most recent session\n  --session ID|PATH           Resume a specific session by ID or JSONL file path\n  --interactive, -i            Start interactive TUI\n  --print                     Force single-prompt print mode (no TUI)\n  --list-models               List available models (configured + live) and exit\n  --provider NAME             Provider from models.json (or KERN_PROVIDER)\n  --model ID                  Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL              Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY               Override API key (or KERN_API_KEY)\n  --safety MODE               Safety mode: strict, balanced, restricted, autonomous (default: balanced)\n  --rpc                       JSON-RPC mode (stdin/stdout)\n  --validate-config           Validate config files and exit\n  --config PATH               Config file path (default: ~/.kern/models.json)\n  --help, -h                  This message\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
   );
 }
 
@@ -411,10 +411,10 @@ async function runRpcMode(
   }
 
   const budgets = {
-    ...(flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : {}),
-    ...(flags.maxWallTimeMs !== undefined ? { maxWallTimeMs: flags.maxWallTimeMs } : {}),
-    ...(flags.maxToolCallsPerTurn !== undefined ? { maxToolCallsPerTurn: flags.maxToolCallsPerTurn } : {}),
-    ...(flags.maxTotalToolCalls !== undefined ? { maxTotalToolCalls: flags.maxTotalToolCalls } : {}),
+    ...(flags.maxCost !== undefined ? { maxCost: flags.maxCost } : {}),
+    ...(flags.maxInputTokens !== undefined ? { maxInputTokens: flags.maxInputTokens } : {}),
+    ...(flags.maxOutputTokens !== undefined ? { maxOutputTokens: flags.maxOutputTokens } : {}),
+    ...(flags.maxTotalTokens !== undefined ? { maxTotalTokens: flags.maxTotalTokens } : {}),
   };
 
   const sessionOptions = {
@@ -495,7 +495,7 @@ async function runRpcMode(
   await new Promise(() => {});
 }
 
-async function main() {
+export async function main() {
   const logger = createLogger(process.env["KERN_LOG"] === "debug" ? "debug" : "warn");
   const flags = parseArgs(process.argv.slice(2));
   const provider = flags.provider ?? process.env["KERN_PROVIDER"];
@@ -541,10 +541,10 @@ async function main() {
     process.stderr.write(`[model ${providerName ?? "custom"}/${model} @ ${baseUrl}]\n`);
   }
   const budgets = {
-    ...(flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : {}),
-    ...(flags.maxWallTimeMs !== undefined ? { maxWallTimeMs: flags.maxWallTimeMs } : {}),
-    ...(flags.maxToolCallsPerTurn !== undefined ? { maxToolCallsPerTurn: flags.maxToolCallsPerTurn } : {}),
-    ...(flags.maxTotalToolCalls !== undefined ? { maxTotalToolCalls: flags.maxTotalToolCalls } : {}),
+    ...(flags.maxCost !== undefined ? { maxCost: flags.maxCost } : {}),
+    ...(flags.maxInputTokens !== undefined ? { maxInputTokens: flags.maxInputTokens } : {}),
+    ...(flags.maxOutputTokens !== undefined ? { maxOutputTokens: flags.maxOutputTokens } : {}),
+    ...(flags.maxTotalTokens !== undefined ? { maxTotalTokens: flags.maxTotalTokens } : {}),
   };
   const sessionOptions = {
     cwd: flags.cwd,

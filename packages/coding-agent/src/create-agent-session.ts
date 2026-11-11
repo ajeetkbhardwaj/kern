@@ -34,7 +34,7 @@ import {
   type PolicyConfig,
 } from "@kern/tools";
 import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition } from "@kern/protocol";
-import type { BudgetLimits, ContextUsage } from "@kern/agent-core";
+import type { BudgetLimits, BudgetUsage, ContextUsage } from "@kern/agent-core";
 import { RepoIndex } from "@kern/repo-index";
 import { SymbolStore } from "@kern/symbol-store";
 import { SemanticSearch } from "@kern/semantic-search";
@@ -74,7 +74,7 @@ export interface CreateAgentSessionOptions {
 export interface AgentSession {
   prompt(text: string, opts?: { signal?: AbortSignal }): Promise<void>;
   subscribe(listener: AgentEventListener): () => void;
-  budgetUsage(): { turns: number; totalToolCalls: number; wallTimeMs: number };
+  budgetUsage(): BudgetUsage;
   budgetLimits?(): BudgetLimits;
   isBusy(): boolean;
   setModel(adapter: ModelAdapter): Promise<void>;
