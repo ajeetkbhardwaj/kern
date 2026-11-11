@@ -6,8 +6,31 @@ import {
   createWriteTool,
   createEditTool,
   createBashTool,
+  createGitStatusTool,
+  createGitDiffTool,
+  createGitLogTool,
+  createGitCheckoutTool,
+  createMkdirTool,
+  createRmTool,
+  createCatTool,
+  createHeadTool,
+  createTailTool,
+  createWhichTool,
+  createCalculateTool,
+  createTimeTool,
+  createTypeCheckTool,
+  createTestTool,
+  createServeTool,
+  createFormatTool,
+  createMemoryTool,
+  createModelPickerTool,
+  createPlanTool,
+  createTodoTool,
+  createThinkTool,
+  createUserPromptTool,
   DefaultPolicy,
   DEFAULT_POLICY_CONFIG,
+  DEFAULT_SAFETY_POLICY_CONFIG,
   type PolicyConfig,
 } from "@kern/tools";
 import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition } from "@kern/protocol";
@@ -26,6 +49,8 @@ export interface CreateAgentSessionOptions {
   storageRoot?: string;
   /** Policy controls. Conservative defaults apply when omitted. */
   policy?: Partial<PolicyConfig>;
+  /** Safety mode: "strict" | "balanced" | "restricted" | "autonomous". Default "balanced". */
+  safetyMode?: "strict" | "balanced" | "restricted" | "autonomous";
   /** Resource budgets. Conservative defaults apply when omitted. */
   budgets?: Partial<BudgetLimits>;
   /** Approval callback for write/exec/destructive ops. Absent = deny. */
@@ -63,6 +88,9 @@ export interface AgentSession {
   contextUsage(): ContextUsage | null;
   approvalMode(): string;
   setApprovalMode(mode: "ask" | "never" | "auto-allowlist"): boolean;
+  /** Safety mode: "strict" | "balanced" | "restricted" | "autonomous". */
+  safetyMode(): "strict" | "balanced" | "restricted" | "autonomous";
+  setSafetyMode(mode: "strict" | "balanced" | "restricted" | "autonomous"): boolean;
   allowToolForSession(toolName: string): boolean;
   toolNames(): string[];
   callToolAsUser(name: string, args: unknown, signal?: AbortSignal): Promise<ToolResult>;
@@ -132,7 +160,7 @@ async function buildSessionWithRuntime(
   logger: Logger,
 ): Promise<{ session: AgentSession; manager: SessionManager }> {
   const policyConfig = { ...DEFAULT_POLICY_CONFIG, ...(options.policy ?? {}) };
-  const policy = new DefaultPolicy(policyConfig);
+  const policy = new DefaultPolicy(policyConfig, { ...DEFAULT_SAFETY_POLICY_CONFIG, mode: options.safetyMode ?? "balanced" });
   const tools = new ToolRegistry({
     workspaceRoot: options.cwd,
     policy,
@@ -143,6 +171,28 @@ async function buildSessionWithRuntime(
   tools.register(createWriteTool(options.cwd));
   tools.register(createEditTool(options.cwd));
   tools.register(createBashTool({ root: options.cwd }));
+  tools.register(createGitStatusTool(options.cwd));
+  tools.register(createGitDiffTool(options.cwd));
+  tools.register(createGitLogTool(options.cwd));
+  tools.register(createGitCheckoutTool(options.cwd));
+  tools.register(createMkdirTool(options.cwd));
+  tools.register(createRmTool(options.cwd));
+  tools.register(createCatTool(options.cwd));
+  tools.register(createHeadTool(options.cwd));
+  tools.register(createTailTool(options.cwd));
+  tools.register(createWhichTool(options.cwd));
+  tools.register(createCalculateTool(options.cwd));
+  tools.register(createTimeTool(options.cwd));
+  tools.register(createTypeCheckTool(options.cwd));
+  tools.register(createTestTool(options.cwd));
+  tools.register(createServeTool(options.cwd));
+  tools.register(createFormatTool(options.cwd));
+  tools.register(createMemoryTool(options.cwd));
+  tools.register(createModelPickerTool(options.cwd));
+  tools.register(createPlanTool(options.cwd));
+  tools.register(createTodoTool(options.cwd));
+  tools.register(createThinkTool(options.cwd));
+  tools.register(createUserPromptTool(options.cwd));
   for (const extra of options.extraTools ?? []) {
     if (tools.has(extra.name)) {
       logger.warn("extra_tool_name_collision", { name: extra.name });
@@ -228,6 +278,8 @@ async function buildSessionWithRuntime(
     contextUsage: () => runtime.contextUsage(),
     approvalMode: () => runtime.approvalMode(),
     setApprovalMode: (mode) => runtime.setApprovalMode(mode),
+    safetyMode: () => policy.safetyMode(),
+    setSafetyMode: (mode) => policy.setSafetyMode(mode),
     allowToolForSession: (toolName) => runtime.allowToolForSession(toolName),
     toolNames: () => runtime.toolNames(),
     callToolAsUser: (name, args, signal) => runtime.callToolAsUser(name, args, signal),

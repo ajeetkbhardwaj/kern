@@ -6,6 +6,31 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { platform } from "node:os";
 
+/** Environment variables stripped before spawning sandboxed processes. */
+const SANDBOX_ENV_DENYLIST = [
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "LD_DEBUG",
+  "PYTHONPATH",
+  "PERL5LIB",
+  "RUBYLIB",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "HISTFILE",
+  "HISTFILESIZE",
+];
+
+/** Remove dangerous environment variables from the environment. */
+function sanitizeEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined && !SANDBOX_ENV_DENYLIST.includes(key)) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
 type SpawnOptionsWithEnv = SpawnOptions & { env?: Record<string, string> };
 
 export interface SandboxOptions {
@@ -140,7 +165,7 @@ export async function spawnSandboxed(
   const child = spawn("bash", ["-c", fullCommand], {
     ...spawnOptions,
     cwd: workdir ?? spawnOptions.cwd ?? process.cwd(),
-    env: { ...process.env, ...env, ...(spawnOptions as SpawnOptionsWithEnv).env },
+    env: sanitizeEnv({ ...process.env, ...env, ...(spawnOptions as SpawnOptionsWithEnv).env }),
     stdio: spawnOptions.stdio ?? "pipe",
     detached: spawnOptions.detached ?? (platform() !== "win32"),
   });

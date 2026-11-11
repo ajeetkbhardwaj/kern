@@ -37,6 +37,11 @@ export interface ToolDefinition<TArgs = unknown> {
   description: string;
   inputSchema: JsonSchema;
   sideEffect: SideEffect;
+  /** MCP-style hints that feed directly into permission/safety classification. */
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+  };
   /** Rendered into the system prompt so the model knows what it may do. */
   instructions?: string;
   execute(args: TArgs, ctx: ToolContext): Promise<ToolResult>;

@@ -281,7 +281,7 @@ describe("DefaultPolicy", () => {
     const policy = new DefaultPolicy({ ...DEFAULT_POLICY_CONFIG, approvalMode: "ask" });
     const decision = await policy.evaluate({
       toolName: "bash",
-      arguments: { command: "rm -rf /" },
+      arguments: { command: "find /tmp -delete" },
       cwd: testRoot,
       origin: "model",
       sideEffect: "execute",
@@ -297,7 +297,7 @@ describe("DefaultPolicy", () => {
     });
     const decision = await policy.evaluate({
       toolName: "bash",
-      arguments: { command: "rm -rf /tmp/demo" },
+      arguments: { command: "find /tmp -delete" },
       cwd: testRoot,
       origin: "model",
       sideEffect: "execute",

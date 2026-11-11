@@ -23,10 +23,14 @@ interface CliFlags {
   model?: string;
   baseUrl?: string;
   apiKey?: string;
+  safetyMode?: "strict" | "balanced" | "restricted" | "autonomous";
+  rpc: boolean;
+  validateConfig: boolean;
+  config?: string;
 }
 
 function parseArgs(argv: string[]): CliFlags {
-  const flags: CliFlags = { prompt: "", readOnly: false, cwd: process.cwd(), noResources: false, noCompaction: false, resume: false, listModels: false, interactive: false, print: false };
+  const flags: CliFlags = { prompt: "", readOnly: false, cwd: process.cwd(), noResources: false, noCompaction: false, resume: false, listModels: false, interactive: false, print: false, rpc: false, validateConfig: false };
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -78,6 +82,193 @@ function parseArgs(argv: string[]): CliFlags {
       const n = next !== undefined ? Number(next) : NaN;
       if (!Number.isInteger(n) || n <= 0) throw new Error("--max-total-tool-calls requires a positive integer");
       flags.maxTotalToolCalls = n;
+    } else if (arg === "--safety") {
+      const next = argv[++i];
+      if (!next) throw new Error("--safety requires a mode: strict, balanced, restricted, autonomous");
+      if (!["strict", "balanced", "restricted", "autonomous"].includes(next)) {
+        throw new Error("--safety mode must be: strict, balanced, restricted, or autonomous");
+}
+
+/** Validate configuration files. */
+async function validateConfig(configPath: string, logger: ReturnType<typeof createLogger>): Promise<void> {
+  const { resolve } = await import("node:path");
+  const { readFile, stat } = await import("node:fs/promises");
+  const { loadModelsFile } = await import("@kern/model");
+
+  let modelsPath = configPath;
+  if (!modelsPath.endsWith(".json")) {
+    modelsPath = resolve(configPath, "models.json");
+  }
+
+  try {
+    await stat(modelsPath);
+  } catch {
+    throw new Error(`Config file not found: ${modelsPath}`);
+  }
+
+  try {
+    const raw = await readFile(modelsPath, "utf8");
+    JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Invalid JSON in ${modelsPath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const file = await loadModelsFile(configPath);
+  const errors: string[] = [];
+
+  // Validate provider configs
+  for (const [name, cfg] of Object.entries(file.providers ?? {})) {
+    if (!cfg.baseUrl) errors.push(`Provider "${name}" missing baseUrl`);
+    if (cfg.apiKey && cfg.apiKey.startsWith("$")) {
+      const envVar = cfg.apiKey.slice(1);
+      if (!process.env[envVar] && !cfg.apiKeyEnv) {
+        errors.push(`Provider "${name}" references unset env var $${envVar}`);
+      }
+    }
+    if (!cfg.models || cfg.models.length === 0) {
+      errors.push(`Provider "${name}" has no models configured`);
+    }
+  }
+
+  if (!file.defaultProvider && Object.keys(file.providers ?? {}).length > 0) {
+    errors.push("No defaultProvider set");
+  }
+
+  if (errors.length > 0) {
+    for (const e of errors) process.stderr.write(`[error] ${e}\n`);
+    throw new Error("Configuration validation failed");
+  }
+
+  process.stdout.write(`Configuration valid: ${modelsPath}\n`);
+  process.stdout.write(`  Providers: ${Object.keys(file.providers ?? {}).join(", ") || "none"}\n`);
+  process.stdout.write(`  Default provider: ${file.defaultProvider ?? "none"}\n`);
+  process.stdout.write(`  Default model: ${file.defaultModel ?? "none"}\n`);
+}
+
+/** JSON-RPC mode for programmatic use. */
+async function runRpcMode(
+  flags: Awaited<ReturnType<typeof parseArgs>>,
+  file: Awaited<ReturnType<typeof loadModelsFile>>,
+  logger: ReturnType<typeof createLogger>,
+): Promise<void> {
+  const { createAgentSession } = await import("@kern/coding-agent");
+  const { createAdapterFor } = await import("@kern/model");
+  const { createInterface } = await import("node:readline");
+
+  // `--model provider/id` splits; `--provider` + `--model id` also works.
+  const provider = flags.provider ?? process.env["KERN_PROVIDER"];
+  let model = flags.model ?? process.env["KERN_MODEL"];
+  const baseUrl = flags.baseUrl ?? process.env["KERN_BASE_URL"];
+  const apiKey = flags.apiKey ?? process.env["KERN_API_KEY"];
+
+  let providerName = provider ?? file.defaultProvider;
+  if (model && model.includes("/")) {
+    const [p, ...rest] = model.split("/");
+    providerName = p;
+    model = rest.join("/");
+  }
+  model ??= file.defaultModel;
+
+  let adapter = undefined;
+  if (providerName && model) {
+    adapter = await createModelRuntime(file, { provider: providerName, model, baseUrl, apiKey }, logger);
+  } else if (baseUrl && model) {
+    adapter = await createModelRuntime(file, { model, baseUrl, apiKey }, logger);
+  }
+
+  const budgets = {
+    ...(flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : {}),
+    ...(flags.maxWallTimeMs !== undefined ? { maxWallTimeMs: flags.maxWallTimeMs } : {}),
+    ...(flags.maxToolCallsPerTurn !== undefined ? { maxToolCallsPerTurn: flags.maxToolCallsPerTurn } : {}),
+    ...(flags.maxTotalToolCalls !== undefined ? { maxTotalToolCalls: flags.maxTotalToolCalls } : {}),
+  };
+
+  const sessionOptions = {
+    cwd: flags.cwd,
+    logger,
+    loadResources: !flags.noResources,
+    enableCompaction: !flags.noCompaction,
+    resume: flags.resume,
+    ...(flags.resumeSession ? { resumeSession: flags.resumeSession } : {}),
+    policy: flags.readOnly ? { allowlistTools: ["read"] } : undefined,
+    ...(Object.keys(budgets).length > 0 ? { budgets } : {}),
+    ...(flags.safetyMode ? { safetyMode: flags.safetyMode } : {}),
+    ...(adapter ? { model: adapter } : {}),
+  };
+
+  const { session, manager } = await createAgentSession(sessionOptions);
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+  let requestId = 0;
+
+  rl.on("line", async (line) => {
+    if (!line.trim()) return;
+    let req: { id?: number; method?: string; params?: unknown } = {};
+    try {
+      req = JSON.parse(line);
+      const id = req.id ?? ++requestId;
+      const method = req.method;
+      const params = (req.params ?? {}) as Record<string, unknown>;
+
+      let result: unknown;
+      switch (method) {
+        case "prompt": {
+          await session.prompt((params.text as string) ?? "");
+          result = { ok: true };
+          break;
+        }
+        case "tools": {
+          result = { tools: session.toolNames() };
+          break;
+        }
+        case "session": {
+          result = { id: manager.sessionId, name: session.sessionName() };
+          break;
+        }
+        case "budget": {
+          result = { usage: session.budgetUsage(), limits: session.budgetLimits?.() };
+          break;
+        }
+        case "compact": {
+          const res = await session.compact(params.instructions as string | undefined);
+          result = res ?? { ok: false, reason: "nothing to compact" };
+          break;
+        }
+        case "close": {
+          session.dispose();
+          result = { ok: true };
+          break;
+        }
+        default: {
+          throw new Error(`Unknown method: ${method}`);
+        }
+      }
+
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+    } catch (error) {
+      const id = req?.id ?? ++requestId;
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+      }) + "\n");
+    }
+  });
+
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "ready", params: { sessionId: manager.sessionId } }) + "\n");
+
+  // Keep process alive
+  await new Promise(() => {});
+}
+      flags.safetyMode = next as CliFlags["safetyMode"];
+    } else if (arg === "--rpc") {
+      flags.rpc = true;
+    } else if (arg === "--validate-config") {
+      flags.validateConfig = true;
+    } else if (arg === "--config") {
+      const next = argv[++i];
+      if (!next) throw new Error("--config requires a file path");
+      flags.config = next;
     } else if (arg === "--cwd") {
       const next = argv[++i];
       if (!next) throw new Error("--cwd requires a directory");
@@ -98,7 +289,7 @@ function parseArgs(argv: string[]): CliFlags {
 
 function printHelp(): void {
   process.stdout.write(
-    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n\nFlags:\n  --read-only                 Only read/grep/find/ls-class tools (here: read only)\n  --max-turns N               Cap agent turns for this run\n  --max-wall-time-ms MS       Cap wall-clock runtime for the session (default: 600000)\n  --max-tool-calls-per-turn N Cap tool calls per turn (default: 30)\n  --max-total-tool-calls N    Cap total tool calls for the session (default: 200)\n  --cwd DIR                   Workspace root (default: cwd)\n  --no-resources              Skip AGENTS.md / skill discovery\n  --no-compaction             Disable automatic compaction\n  --resume                    Resume the most recent session\n  --session ID|PATH           Resume a specific session by ID or JSONL file path\n  --interactive, -i            Start interactive TUI\n  --print                     Force single-prompt print mode (no TUI)\n  --list-models               List available models (configured + live) and exit\n  --provider NAME             Provider from models.json (or KERN_PROVIDER)\n  --model ID                  Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL              Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY               Override API key (or KERN_API_KEY)\n  --help, -h                  This message\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
+    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n\nFlags:\n  --read-only                 Only read/grep/find/ls-class tools (here: read only)\n  --max-turns N               Cap agent turns for this run\n  --max-wall-time-ms MS       Cap wall-clock runtime for the session (default: 600000)\n  --max-tool-calls-per-turn N Cap tool calls per turn (default: 30)\n  --max-total-tool-calls N    Cap total tool calls for the session (default: 200)\n  --cwd DIR                   Workspace root (default: cwd)\n  --no-resources              Skip AGENTS.md / skill discovery\n  --no-compaction             Disable automatic compaction\n  --resume                    Resume the most recent session\n  --session ID|PATH           Resume a specific session by ID or JSONL file path\n  --interactive, -i            Start interactive TUI\n  --print                     Force single-prompt print mode (no TUI)\n  --list-models               List available models (configured + live) and exit\n  --provider NAME             Provider from models.json (or KERN_PROVIDER)\n  --model ID                  Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL              Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY               Override API key (or KERN_API_KEY)\n  --safety MODE               Safety mode: strict, balanced, restricted, autonomous (default: balanced)\n  --rpc                       JSON-RPC mode (stdin/stdout)\n  --validate-config           Validate config files and exit\n  --config PATH               Config file path (default: ~/.kern/models.json)\n  --help, -h                  This message\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
   );
 }
 
@@ -132,6 +323,178 @@ async function loadMcpExtraTools(cwd: string, logger: ReturnType<typeof createLo
   }
 }
 
+/** Validate configuration files. */
+async function validateConfig(configPath: string, logger: ReturnType<typeof createLogger>): Promise<void> {
+  const { resolve } = await import("node:path");
+  const { readFile, stat } = await import("node:fs/promises");
+  const { loadModelsFile } = await import("@kern/model");
+
+  let modelsPath = configPath;
+  if (!modelsPath.endsWith(".json")) {
+    modelsPath = resolve(configPath, "models.json");
+  }
+
+  try {
+    await stat(modelsPath);
+  } catch {
+    throw new Error(`Config file not found: ${modelsPath}`);
+  }
+
+  try {
+    const raw = await readFile(modelsPath, "utf8");
+    JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Invalid JSON in ${modelsPath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const file = await loadModelsFile(configPath);
+  const errors: string[] = [];
+
+  // Validate provider configs
+  for (const [name, cfg] of Object.entries(file.providers ?? {})) {
+    if (!cfg.baseUrl) errors.push(`Provider "${name}" missing baseUrl`);
+    if (cfg.apiKey && cfg.apiKey.startsWith("$")) {
+      const envVar = cfg.apiKey.slice(1);
+      if (!process.env[envVar] && !cfg.apiKeyEnv) {
+        errors.push(`Provider "${name}" references unset env var $${envVar}`);
+      }
+    }
+    if (!cfg.models || cfg.models.length === 0) {
+      errors.push(`Provider "${name}" has no models configured`);
+    }
+  }
+
+  if (!file.defaultProvider && Object.keys(file.providers ?? {}).length > 0) {
+    errors.push("No defaultProvider set");
+  }
+
+  if (errors.length > 0) {
+    for (const e of errors) process.stderr.write(`[error] ${e}\n`);
+    throw new Error("Configuration validation failed");
+  }
+
+  process.stdout.write(`Configuration valid: ${modelsPath}\n`);
+  process.stdout.write(`  Providers: ${Object.keys(file.providers ?? {}).join(", ") || "none"}\n`);
+  process.stdout.write(`  Default provider: ${file.defaultProvider ?? "none"}\n`);
+  process.stdout.write(`  Default model: ${file.defaultModel ?? "none"}\n`);
+}
+
+/** JSON-RPC mode for programmatic use. */
+async function runRpcMode(
+  flags: Awaited<ReturnType<typeof parseArgs>>,
+  file: Awaited<ReturnType<typeof loadModelsFile>>,
+  logger: ReturnType<typeof createLogger>,
+): Promise<void> {
+  const { createAgentSession } = await import("@kern/coding-agent");
+  const { createAdapterFor } = await import("@kern/model");
+  const { createInterface } = await import("node:readline");
+
+  // `--model provider/id` splits; `--provider` + `--model id` also works.
+  const provider = flags.provider ?? process.env["KERN_PROVIDER"];
+  let model = flags.model ?? process.env["KERN_MODEL"];
+  const baseUrl = flags.baseUrl ?? process.env["KERN_BASE_URL"];
+  const apiKey = flags.apiKey ?? process.env["KERN_API_KEY"];
+
+  let providerName = provider ?? file.defaultProvider;
+  if (model && model.includes("/")) {
+    const [p, ...rest] = model.split("/");
+    providerName = p;
+    model = rest.join("/");
+  }
+  model ??= file.defaultModel;
+
+  let adapter = undefined;
+  if (providerName && model) {
+    adapter = await createModelRuntime(file, { provider: providerName, model, baseUrl, apiKey }, logger);
+  } else if (baseUrl && model) {
+    adapter = await createModelRuntime(file, { model, baseUrl, apiKey }, logger);
+  }
+
+  const budgets = {
+    ...(flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : {}),
+    ...(flags.maxWallTimeMs !== undefined ? { maxWallTimeMs: flags.maxWallTimeMs } : {}),
+    ...(flags.maxToolCallsPerTurn !== undefined ? { maxToolCallsPerTurn: flags.maxToolCallsPerTurn } : {}),
+    ...(flags.maxTotalToolCalls !== undefined ? { maxTotalToolCalls: flags.maxTotalToolCalls } : {}),
+  };
+
+  const sessionOptions = {
+    cwd: flags.cwd,
+    logger,
+    loadResources: !flags.noResources,
+    enableCompaction: !flags.noCompaction,
+    resume: flags.resume,
+    ...(flags.resumeSession ? { resumeSession: flags.resumeSession } : {}),
+    policy: flags.readOnly ? { allowlistTools: ["read"] } : undefined,
+    ...(Object.keys(budgets).length > 0 ? { budgets } : {}),
+    ...(flags.safetyMode ? { safetyMode: flags.safetyMode } : {}),
+    ...(adapter ? { model: adapter } : {}),
+  };
+
+  const { session, manager } = await createAgentSession(sessionOptions);
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+  let requestId = 0;
+
+  rl.on("line", async (line) => {
+    if (!line.trim()) return;
+    let req: { id?: number; method?: string; params?: unknown } = {};
+    try {
+      req = JSON.parse(line);
+      const id = req.id ?? ++requestId;
+      const method = req.method;
+      const params = (req.params ?? {}) as Record<string, unknown>;
+
+      let result: unknown;
+      switch (method) {
+        case "prompt": {
+          await session.prompt((params.text as string) ?? "");
+          result = { ok: true };
+          break;
+        }
+        case "tools": {
+          result = { tools: session.toolNames() };
+          break;
+        }
+        case "session": {
+          result = { id: manager.sessionId, name: session.sessionName() };
+          break;
+        }
+        case "budget": {
+          result = { usage: session.budgetUsage(), limits: session.budgetLimits?.() };
+          break;
+        }
+        case "compact": {
+          const res = await session.compact(params.instructions as string | undefined);
+          result = res ?? { ok: false, reason: "nothing to compact" };
+          break;
+        }
+        case "close": {
+          session.dispose();
+          result = { ok: true };
+          break;
+        }
+        default: {
+          throw new Error(`Unknown method: ${method}`);
+        }
+      }
+
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+    } catch (error) {
+      const id = req?.id ?? ++requestId;
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+      }) + "\n");
+    }
+  });
+
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "ready", params: { sessionId: manager.sessionId } }) + "\n");
+
+  // Keep process alive
+  await new Promise(() => {});
+}
+
 async function main() {
   const logger = createLogger(process.env["KERN_LOG"] === "debug" ? "debug" : "warn");
   const flags = parseArgs(process.argv.slice(2));
@@ -148,6 +511,16 @@ async function main() {
       const mark = m.authenticated ? "" : " (no credentials)";
       process.stdout.write(`${m.provider}/${m.id}${mark} [${m.source}]\n`);
     }
+    return;
+  }
+
+  if (flags.validateConfig) {
+    await validateConfig(flags.config ?? flags.cwd, logger);
+    return;
+  }
+
+  if (flags.rpc) {
+    await runRpcMode(flags, file, logger);
     return;
   }
 
@@ -182,6 +555,7 @@ async function main() {
     ...(flags.resumeSession ? { resumeSession: flags.resumeSession } : {}),
     policy: flags.readOnly ? { allowlistTools: ["read"] } : undefined,
     ...(Object.keys(budgets).length > 0 ? { budgets } : {}),
+    ...(flags.safetyMode ? { safetyMode: flags.safetyMode } : {}),
     requestApproval: (prompt: string, meta?: { toolName: string }) => (approvalHook.current ? approvalHook.current(prompt, meta) : askApproval(prompt)),
     ...(adapter ? { model: adapter } : {}),
     ...await loadMcpExtraTools(flags.cwd, logger),

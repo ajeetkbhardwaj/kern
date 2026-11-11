@@ -58,7 +58,7 @@ export interface InteractiveOptions {
   cwd: string;
   logger?: Logger;
   /** Called by the kernel approval sink. Set by the CLI wiring. */
-  approvalHook: { current: ((prompt: string, meta?: { toolName: string }) => Promise<boolean | "session">) | null };
+  approvalHook: { current: ((prompt: string, meta?: { toolName: string }) => Promise<boolean | "session" | string>) | null };
   /** Optional prompt to submit automatically when the TUI starts. */
   initialPrompt?: string;
 }
@@ -67,6 +67,8 @@ const COMMANDS = [
   { name: "help", description: "show the command list" },
   { name: "session", description: "manage sessions (list/switch/rename/new/info/export)" },
   { name: "model", description: "pick provider/model" },
+  { name: "safety", description: "pick safety mode (strict/balanced/restricted/autonomous)" },
+  { name: "budget", description: "configure session limits (turns, time, tool calls)" },
   { name: "connect", description: "connect or re-auth a provider" },
   { name: "undo", description: "undo file changes from the last turn" },
   { name: "redo", description: "redo previously undone file changes" },
@@ -84,8 +86,8 @@ const ADVANCED_COMMANDS = {
   branch: "record a branch summary",
 };
 
-const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · click headers to expand/collapse details · Ctrl+C abort";
-const QUICK_HELP = "Quick actions: /model · /session · /connect · /undo · /redo · /help";
+const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · click headers to expand/collapse details · Ctrl+C abort · Shift+B tighter safety · Shift+A looser safety";
+const QUICK_HELP = "Quick actions: /model · /safety · /budget · /session · /connect · /undo · /redo · /help";
 const MAX_QUEUE = 5;
 // Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
 const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
@@ -825,9 +827,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         : "ctx —";
     const sessionName = session.sessionName() ? ` · ${session.sessionName()}` : "";
     const wallSecs = Number.isFinite(u.wallTimeMs) ? (u.wallTimeMs / 1000).toFixed(1) : "0.0";
+    const safetyMode = session.safetyMode?.() ?? "balanced";
     statusBar.setSegments([
       `${m.provider}/${m.modelId}${sessionName}`,
       modeLabel(),
+      `safety: ${safetyMode}`,
       ctx,
       `${u.turns} turns · ${u.totalToolCalls} calls · ${wallSecs}s`,
     ]);
@@ -861,6 +865,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let lastTranscriptBlock: "none" | "user" | "assistant" | "reasoning" | "tool" | "other" = "none";
   /** Cumulative API token usage (best-effort from usage events). */
   let apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+  const formatReasoningSteps = (text: string): string => {
+    const normalized = text.replace(/\r\n/g, "\n").trim();
+    if (!normalized) return "";
+    const blocks = normalized.split(/\n{2,}/).map((b) => b.trim()).filter(Boolean);
+    if (blocks.length <= 1) return normalized;
+
+    const hasExplicitMarkers = blocks.some((b) => /^(?:step\s*\d+[:.)-]?|\d+[.)]|[-*•]|#{1,6}\s)/i.test(b));
+    if (hasExplicitMarkers) {
+      return blocks.join("\n\n");
+    }
+
+    return blocks.map((b, i) => `Step ${i + 1}: ${b}`).join("\n\n");
+  };
   /** Pending approval finish callbacks — resolved fail-closed (deny) on abort/exit. */
   const pendingApprovals = new Set<(value: string | null) => void>();
   const denyPendingApprovals = () => {
@@ -946,7 +964,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             setActivity("model: thinking");
             renderReasoningBlock();
             reasoningBuffer += event.delta;
-            reasoningView?.setText(reasoningBuffer);
+            reasoningView?.setText(formatReasoningSteps(reasoningBuffer));
             requestRenderBatched();
             break;
           case "message_end":
@@ -955,7 +973,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             settleCards(false);
             setActivity("ready");
             if (mdText) addTranscriptLine(`assistant: ${mdText}`);
-            if (reasoningBuffer) addTranscriptLine(`reasoning: ${reasoningBuffer}`);
+            if (reasoningBuffer) addTranscriptLine(`reasoning: ${formatReasoningSteps(reasoningBuffer)}`);
             noteModelUsage();
             updateSidebar();
             requestRender();
@@ -1062,20 +1080,35 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
   subscribe();
 
-  // Small local list of destructive shell patterns. Matched against the
-  // approval prompt text; hits render the dialog in a danger style.
-  const DESTRUCTIVE_PATTERNS: RegExp[] = [
-    /\brm\s+.*-[a-z]*r[a-z]*f\b/i,
-    /\brm\s+-rf?\b/,
-    /\bgit\s+reset\s+--hard\b/,
-    /\bgit\s+clean\s+-[a-z]*f\b/,
-    /:\(\)\s*\{[^}]*\}\s*;/,
-    /\bmkfs\b/,
-    /\bdd\b.*\bof=\/dev\//,
-    />\s*\/dev\/[a-z]/,
-    /\b(shutdown|reboot|halt|poweroff)\b/i,
-    /\bDROP\s+(TABLE|DATABASE)\b/i,
-  ];
+// Small local list of destructive shell patterns. Matched against the
+// approval prompt text; hits render the dialog in a danger style.
+const DESTRUCTIVE_PATTERNS: RegExp[] = [
+  /\brm\s+.*-[a-z]*r[a-z]*f\b/i,
+  /\brm\s+-rf?\b/,
+  /\bgit\s+reset\s+--hard\b/,
+  /\bgit\s+clean\s+-[a-z]*f\b/,
+  /:\(\)\s*\{[^}]*\}\s*;/,
+  /\bmkfs\b/,
+  /\bdd\b.*\bof=\/dev\//,
+  />\s*\/dev\/[a-z]/,
+  /\b(shutdown|reboot|halt|poweroff)\b/i,
+  /\bDROP\s+(TABLE|DATABASE)\b/i,
+];
+
+/** Extract a command-like pattern from an approval prompt for use as a default in the pattern prompt. */
+const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
+  // The prompt often contains the command text. Try to extract a trailing command-like substring.
+  if (argsFull) {
+    try {
+      const parsed = JSON.parse(argsFull);
+      if (typeof parsed.command === "string") return parsed.command;
+      if (typeof parsed.path === "string") return parsed.path;
+    } catch { /* ignore */ }
+  }
+  // Fallback: return the last word-like token from the prompt
+  const m = prompt.match(/([^\s]+)$/);
+  return m ? m[1]! : prompt;
+};
 
   /** Wrap content + interactive child in a centered overlay; keys forward to the child. */
   const showDialog = (content: Component, target: Component, framed = true): OverlayHandle => {
@@ -1126,7 +1159,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   options.approvalHook.current = async (
     prompt: string,
     meta?: { toolName: string },
-  ): Promise<boolean | "session"> => {
+  ): Promise<boolean | "session" | string> => {
     const tool = meta?.toolName ?? "tool";
     // The kernel contract carries only (prompt, { toolName }), so the full
     // arguments arrive inside the prompt text — except when a caller passes
@@ -1163,6 +1196,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         [
           { value: "once", label: "Yes, run once", description: "allow just this call" },
           { value: "session", label: `Yes, always allow ${tool}`, description: "no more prompts for this tool in this session" },
+          { value: "pattern", label: "Yes, always allow this pattern", description: "enter a glob pattern to match similar commands" },
           { value: "no", label: "No, deny", description: "block this call (Esc)" },
         ],
         5,
@@ -1190,6 +1224,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     if (picked === "session") {
       ok(`Approved for session: ${tool} (future calls to this tool won't prompt).`);
       return "session";
+    }
+    if (picked === "pattern") {
+      const pat = await promptText("pattern to always allow", cmdPatternFromPrompt(prompt, argsFull));
+      if (pat === null) {
+        toast("Pattern approval cancelled.");
+        return false;
+      }
+      ok(`Approved pattern for session: ${pat}`);
+      return pat;
     }
     const approved = picked === "once";
     say(approved ? theme.success(`approved once: ${tool}`) : theme.muted(`denied: ${tool}`));
@@ -1376,7 +1419,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       buildSelectTheme(),
     );
     if (initialFilter) list.setFilter(initialFilter);
-    await withOverlay("model", list, async (value) => {
+await withOverlay("model", list, async (value) => {
       const slash = value.indexOf("/");
       const provider = value.slice(0, slash);
       const id = value.slice(slash + 1);
@@ -1390,12 +1433,87 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         );
         await session.setModel(adapter);
         await recordLastUsed(provider, id).catch(() => undefined);
-        ok(`Model: ${provider}/${id}`);
-        printStatus();
       } catch (error) {
         err(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     });
+  };
+
+  const pickSafetyMode = async (initialFilter?: string) => {
+    if (busy) {
+      toast("Wait for the current turn to settle before switching safety mode.");
+      return;
+    }
+    const current = session.safetyMode();
+    const modes = [
+      { value: "strict", label: "Strict", description: "Ask for all operations (max oversight)" },
+      { value: "balanced", label: "Balanced", description: "Allow safe, ask for destructive/unknown (default)" },
+      { value: "restricted", label: "Restricted", description: "Allow safe, deny destructive/unknown (CI/headless)" },
+      { value: "autonomous", label: "Autonomous", description: "Allow everything (legacy --yolo)" },
+    ].map((m) => ({
+      value: m.value,
+      label: `${m.label}${m.value === current ? "  (current)" : ""}`,
+      description: m.description,
+    }));
+    const list = new SelectList(modes, 4, buildSelectTheme());
+    if (initialFilter) list.setFilter(initialFilter);
+    await withOverlay("safety", list, async (value) => {
+      const ok = session.setSafetyMode(value as "strict" | "balanced" | "restricted" | "autonomous");
+      if (ok) {
+        toast(`Safety mode: ${value}`);
+        printStatus();
+      } else {
+        err("Failed to set safety mode");
+      }
+    });
+  };
+
+  const pickBudget = async (arg?: string) => {
+    if (busy) {
+      toast("Wait for the current turn to settle before adjusting budget.");
+      return;
+    }
+    const current = session.budgetLimits?.();
+    const currentValues: Record<string, number> = {
+      maxTurns: current?.maxTurns ?? 0,
+      maxWallTimeMs: current?.maxWallTimeMs ?? 0,
+      maxToolCallsPerTurn: current?.maxToolCallsPerTurn ?? 0,
+      maxTotalToolCalls: current?.maxTotalToolCalls ?? 0,
+    };
+
+    if (arg && arg.trim()) {
+      const budgets: Record<string, number> = {};
+      const pairs = arg.trim().split(/\s+/);
+      for (const pair of pairs) {
+        const [key, valStr] = pair.split("=");
+        if (!key || !valStr) {
+          err(`Invalid format: "${pair}". Use field=value (e.g. maxTurns=50)`);
+          return;
+        }
+        const val = Number(valStr);
+        if (!Number.isInteger(val) || val < 0) {
+          err(`Invalid value for ${key}: must be non-negative integer`);
+          return;
+        }
+        if (val > 0) budgets[key] = val;
+      }
+      if (Object.keys(budgets).length > 0) {
+        toast("Budget limits set. Restart session (/new) to apply.");
+        printBudgetDetails();
+      } else {
+        toast("No budgets set (all unlimited).");
+      }
+      return;
+    }
+
+    // Display current values directly (no overlay needed for read-only)
+    printStatus();
+    say(theme.bold("budget limits (0 = unlimited)"));
+    say(`  maxTurns: ${currentValues.maxTurns || "unlimited"}`);
+    say(`  maxWallTimeMs: ${currentValues.maxWallTimeMs || "unlimited"}`);
+    say(`  maxToolCallsPerTurn: ${currentValues.maxToolCallsPerTurn || "unlimited"}`);
+    say(`  maxTotalToolCalls: ${currentValues.maxTotalToolCalls || "unlimited"}`);
+    info("  (use /budget <field>=<value> to set, e.g. /budget maxTurns=50)");
   };
 
   /** `/connect` wizard: preset → key → test → model → save. Esc at any step cancels with nothing written. */
@@ -1662,6 +1780,39 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       printStatus();
     } else {
       toast("Approval mode is fixed by the active policy.");
+    }
+  };
+
+  const SAFETY_MODES: Array<"strict" | "balanced" | "restricted" | "autonomous"> = [
+    "strict",
+    "balanced",
+    "restricted",
+    "autonomous",
+  ];
+  const SAFETY_MODE_LABELS: Record<"strict" | "balanced" | "restricted" | "autonomous", string> = {
+    strict: "strict",
+    balanced: "balanced",
+    restricted: "restricted",
+    autonomous: "autonomous",
+  };
+  const cycleSafetyMode = (direction: "tighter" | "looser") => {
+    if (busy) {
+      toast("Mode changes apply when idle.");
+      return;
+    }
+    const current = (session.safetyMode?.() ?? "balanced") as "strict" | "balanced" | "restricted" | "autonomous";
+    const idx = SAFETY_MODES.indexOf(current);
+    if (idx === -1) return;
+    const next = direction === "tighter" ? SAFETY_MODES[Math.max(0, idx - 1)] : SAFETY_MODES[Math.min(SAFETY_MODES.length - 1, idx + 1)];
+    if (!next || next === current) {
+      toast(`Safety mode already at ${next === "strict" ? "most restrictive" : "most permissive"}: ${next}`);
+      return;
+    }
+    if (session.setSafetyMode(next)) {
+      toast(`Safety mode: ${next}`);
+      printStatus();
+    } else {
+      toast("Failed to set safety mode");
     }
   };
 
@@ -1977,7 +2128,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         printStatus();
         return true;
       case "/budget":
-        printBudgetDetails();
+        await pickBudget(arg);
+        return true;
+      case "/safety":
+        await pickSafetyMode(arg || undefined);
         return true;
       case "/model":
       case "/models":
@@ -2468,6 +2622,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     }
     if (matchesKey(key, "shift+tab")) {
       if (!busy) cycleMode();
+      return { consume: true };
+    }
+    // B = tighter safety mode, A = looser safety mode (shift+key to avoid
+    // colliding with normal typing while the editor is focused).
+    if (matchesKey(key, "shift+b")) {
+      if (!busy) cycleSafetyMode("tighter");
+      return { consume: true };
+    }
+    if (matchesKey(key, "shift+a")) {
+      if (!busy) cycleSafetyMode("looser");
       return { consume: true };
     }
     return undefined;

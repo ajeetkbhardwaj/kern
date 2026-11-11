@@ -16,8 +16,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { DefaultPolicy } from "./policy.js";
 import { safeResolveSync } from "./path-safety.js";
 import { validateArgs } from "./validate-args.js";
-import { spawnSandboxed, type SandboxOptions, DEFAULT_SANDBOX_OPTIONS } from "./bash-sandbox.js";
+import { spawnSandboxed, type SandboxOptions, DEFAULT_SANDBOX_OPTIONS, NO_SANDBOX_OPTIONS } from "./bash-sandbox.js";
 import { createAuditLogger, type AuditLogger, type ToolAuditEntry } from "./audit-logger.js";
+import { HookExecutor } from "./hooks/executor.js";
+import type { HookContext, ToolInputTransformParams, ToolResponseTransformParams, PostToolUseParams, PreToolUseParams, ToolGuardParams } from "./hooks/events/contracts.js";
 
 export { AllowAllPolicy } from "./policy.js";
 
@@ -39,6 +41,8 @@ export interface ToolRegistryOptions {
   sessionId?: string;
   /** User ID for audit context. */
   userId?: string;
+  /** Optional hook executor for lifecycle interception. */
+  hookExecutor?: HookExecutor;
 }
 
 export interface ApprovalMeta {
@@ -60,6 +64,7 @@ export class ToolRegistry {
   private auditLogger?: AuditLogger;
   private sessionId?: string;
   private userId?: string;
+  private hookExecutor?: HookExecutor;
 
   constructor(options: ToolRegistryOptions) {
     this.policy = options.policy ?? new DefaultPolicy();
@@ -69,6 +74,7 @@ export class ToolRegistry {
     if (options.auditLogger !== undefined) this.auditLogger = options.auditLogger;
     if (options.sessionId !== undefined) this.sessionId = options.sessionId;
     if (options.userId !== undefined) this.userId = options.userId;
+    if (options.hookExecutor !== undefined) this.hookExecutor = options.hookExecutor;
   }
 
   register(tool: ToolDefinition): void {
@@ -118,40 +124,80 @@ export class ToolRegistry {
     const startedAt = Date.now();
     const origin = opts.origin ?? "model";
 
+    // Hook context for this execution
+    const hookCtx: HookContext = {
+      sessionId: this.sessionId,
+      toolName: name,
+      origin,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Helper to run tool_input_transform hook
+    let currentArgs = args;
+    if (this.hookExecutor) {
+      const transformResult = await this.hookExecutor.runTransform("tool_input_transform", [hookCtx, { toolName: name, args: currentArgs, origin }]);
+      if (transformResult.transformed && transformResult.params && transformResult.params[1]) {
+        currentArgs = (transformResult.params[1] as ToolInputTransformParams).args;
+      }
+    }
+
     // 1. Validate arguments before policy or execution.
-    const argErrors = validateArgs(tool.inputSchema, args);
+    const argErrors = validateArgs(tool.inputSchema, currentArgs);
     if (argErrors.length > 0) {
       const result = textResult(`Invalid arguments for tool ${name}: ${argErrors.join("; ")}`, true, {
         code: "E_TOOL_INVALID_ARGS",
         errors: argErrors,
       });
-      await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: { decision: "deny", reason: "Invalid arguments" }, result, startedAt });
+      await this.logAudit({ toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect, policyDecision: { decision: "deny", reason: "Invalid arguments" }, result, startedAt });
       return result;
+    }
+
+    // pre_tool_use hook - can block
+    if (this.hookExecutor) {
+      const preResult = await this.hookExecutor.runToolEvent("pre_tool_use", name, hookCtx, { toolName: name, args: currentArgs, origin });
+      if (!preResult.proceed) {
+        const result = textResult(`Blocked by pre_tool_use hook for tool ${name}`, true, { code: "E_TOOL_DENIED" });
+        await this.logAudit({ toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect, policyDecision: { decision: "deny", reason: "Blocked by pre_tool_use hook" }, result, startedAt });
+        return result;
+      }
     }
 
     // 2. Policy decision.
     const policyInput = {
       toolName: name,
-      arguments: args,
+      arguments: currentArgs,
       cwd: this.workspaceRoot,
       origin,
       sideEffect: tool.sideEffect,
     };
-    const policy = await this.policy.evaluate(policyInput);
+    let policy = await this.policy.evaluate(policyInput);
+
+    // tool_guard hook - can modify policy decision
+    if (this.hookExecutor) {
+      const guardResult = await this.hookExecutor.runGuard("tool_guard", hookCtx, { toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect });
+      if (guardResult.decision !== "allow") {
+        policy = guardResult;
+      }
+    }
 
     if (policy.decision === "deny") {
       const result = textResult(policy.reason, true, { code: "E_TOOL_DENIED" });
-      await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+      await this.logAudit({ toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
       return result;
     }
     if (policy.decision === "require_approval") {
+      // permission_request hook - observes the approval round-trip
+      if (this.hookExecutor) {
+        await this.hookExecutor.runNotify("permission_request", hookCtx, { toolName: name, args: currentArgs, origin, policyDecision: policy });
+      }
+
       const handler = opts.requestApproval ?? this.requestApproval;
       if (!handler) {
         const result = textResult(`Approval required for tool ${name}: ${policy.prompt}`, true, {
           code: "E_TOOL_DENIED",
           details: { reason: "no_approval_handler", toolName: name, origin },
         });
-        await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+        await this.logAudit({ toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
         return result;
       }
       let approved: boolean | "session" = false;
@@ -163,11 +209,27 @@ export class ToolRegistry {
           true,
           { code: "E_TOOL_DENIED", details: { reason: "approval_handler_error", toolName: name, origin } },
         );
-        await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+        await this.logAudit({ toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
         return result;
       }
+
+      // on_tool_approval_decision hook - records user's verdict
+      if (this.hookExecutor) {
+        await this.hookExecutor.runNotify("on_tool_approval_decision", hookCtx, {
+          toolName: name,
+          args: currentArgs,
+          origin,
+          approved: approved !== false,
+          reason: typeof approved === "string" ? approved : undefined,
+        });
+      }
+
       if (approved === "session") {
         this.configurePolicy((p) => p.allowForSession(name));
+        approved = true;
+      }
+      if (typeof approved === "string" && approved !== "session") {
+        this.configurePolicy((p) => p.allowPattern(approved as string));
         approved = true;
       }
       if (!approved) {
@@ -175,7 +237,7 @@ export class ToolRegistry {
           code: "E_TOOL_DENIED",
           details: { reason: "approval_denied", toolName: name, origin },
         });
-        await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+        await this.logAudit({ toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
         return result;
       }
     }
@@ -212,7 +274,7 @@ export class ToolRegistry {
 
     const runPromise = (async (): Promise<ToolResult> => {
       try {
-        return await tool.execute(args as never, ctx);
+        return await tool.execute(currentArgs as never, ctx);
       } catch (error) {
         return textResult(String(error), true, { code: "E_TOOL_FAILED" });
       }
@@ -223,8 +285,31 @@ export class ToolRegistry {
       signal.removeEventListener("abort", onParentAbort);
     });
 
-    const result = await Promise.race([runPromise, timeoutPromise]);
-    await this.logAudit({ toolName: name, args, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
+    let result = await Promise.race([runPromise, timeoutPromise]);
+
+    // post_tool_use hook - after execution
+    if (this.hookExecutor) {
+      const postResult = await this.hookExecutor.runToolEvent("post_tool_use", name, hookCtx, {
+        toolName: name,
+        args: currentArgs,
+        origin,
+        result,
+        durationMs: Date.now() - startedAt,
+      });
+      if (!postResult.proceed) {
+        result = textResult(`Blocked by post_tool_use hook for tool ${name}`, true, { code: "E_TOOL_DENIED" });
+      }
+    }
+
+    // tool_response_transform hook - transform result before returning
+    if (this.hookExecutor) {
+      const transformResult = await this.hookExecutor.runTransform("tool_response_transform", [hookCtx, { toolName: name, args: currentArgs, origin, result }]);
+      if (transformResult.transformed && transformResult.params && transformResult.params[1]) {
+        result = (transformResult.params[1] as ToolResponseTransformParams).result;
+      }
+    }
+
+    await this.logAudit({ toolName: name, args: currentArgs, origin, sideEffect: tool.sideEffect, policyDecision: policy, result, startedAt });
     return result;
   }
 
@@ -541,14 +626,28 @@ export function createBashTool(
         let stderrCapped = false;
 
         const run = async () => {
-          try {
-            if (sandboxOpts) {
+          if (sandboxOpts) {
+            try {
               sandboxResult = await spawnSandboxed("bash", ["-c", cmd], {
                 ...sandboxOpts,
                 cwd: ctx.workspaceRoot,
                 stdio: "pipe",
               });
-            } else {
+            } catch {
+              // Namespace isolation unavailable (e.g. no unshare support);
+              // fall back to plain spawn without sandboxing.
+              sandboxResult = {
+                process: spawn("bash", ["-c", cmd], {
+                  cwd: ctx.workspaceRoot,
+                  stdio: "pipe",
+                  detached: process.platform !== "win32",
+                  windowsHide: true,
+                }),
+                cleanup: async () => {},
+                active: false,
+              };
+            }
+          } else {
               sandboxResult = {
                 process: spawn("bash", ["-c", cmd], {
                   cwd: ctx.workspaceRoot,
@@ -618,17 +717,14 @@ export function createBashTool(
                   stdoutTruncated: out.truncated || stdoutCapped,
                   stderrTruncated: err.truncated || stderrCapped,
                   timeoutMs: t,
-                  sandboxed: sandboxResult?.active ?? false,
-                },
-              });
-            });
-            proc.on("error", (e) => {
-              finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
-            });
-          } catch (e) {
-            finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
-          }
-        };
+sandboxed: sandboxResult?.active ?? false,
+            },
+          });
+        });
+        proc.on("error", (e) => {
+          finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
+        });
+    };
 
         run();
       });
