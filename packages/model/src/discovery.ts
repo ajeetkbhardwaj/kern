@@ -26,6 +26,8 @@ export interface ModelEntry {
   id: string;
   contextWindow?: number;
   maxOutputTokens?: number;
+  inputCostPer1M?: number;
+  outputCostPer1M?: number;
 }
 
 export interface ProviderConfig {
@@ -63,6 +65,8 @@ export const DEFAULT_MAX_OUTPUT = 4_000;
 
 export const PROVIDER_PRESETS: Array<{ name: string; baseUrl: string; apiKeyEnv: string; hint: string }> = [
   { name: "openai", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", hint: "cloud · key required" },
+  { name: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", apiKeyEnv: "GEMINI_API_KEY", hint: "cloud · key required" },
+  { name: "groq", baseUrl: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", hint: "cloud · key required" },
   { name: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", hint: "cloud · key required" },
   { name: "ollama", baseUrl: "http://localhost:11434/v1", apiKeyEnv: "", hint: "local · no key" },
   { name: "lmstudio", baseUrl: "http://localhost:1234/v1", apiKeyEnv: "", hint: "local · no key" },
@@ -290,9 +294,12 @@ export async function saveProviderToUserFile(
 
 const WELL_KNOWN: Record<string, { baseUrl: string; apiKeyEnv: string }> = {
   openai: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" },
+  gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", apiKeyEnv: "GEMINI_API_KEY" },
+  groq: { baseUrl: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY" },
   openrouter: { baseUrl: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY" },
   ollama: { baseUrl: "http://localhost:11434/v1", apiKeyEnv: "" },
   lmstudio: { baseUrl: "http://localhost:1234/v1", apiKeyEnv: "" },
+  llamacpp: { baseUrl: "http://localhost:8080/v1", apiKeyEnv: "" },
   nvidia: { baseUrl: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY" },
 };
 
@@ -530,6 +537,8 @@ export async function createAdapterFor(
     apiKey: key,
     contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxOutputTokens: entry?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT,
+    ...(entry?.inputCostPer1M !== undefined ? { inputCostPer1M: entry.inputCostPer1M } : {}),
+    ...(entry?.outputCostPer1M !== undefined ? { outputCostPer1M: entry.outputCostPer1M } : {}),
     logger,
   });
 }

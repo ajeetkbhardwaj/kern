@@ -1,13 +1,10 @@
-import { ToolDefinition, ToolResult } from "@kern/protocol";
-import { stat } from "node:fs/promises";
-import { resolve, join, dirname } from "node:path";
+import { ToolDefinition, ToolResult, boundText, textResult } from "@kern/protocol";
 import { safeResolveSync } from "../../path-safety.js";
-import { boundText, textResult } from "@kern/protocol";
 import { spawnProcess } from "./spawn.js";
 
 const MAX_CAPTURE_BYTES = 1_000_000;
 
-export function createGitStatusTool(root: string): ToolDefinition<{ path?: string }> {
+export function createGitStatusTool(_root: string): ToolDefinition<{ path?: string }> {
   return {
     name: "git-status",
     description: "Show git status of working tree",
@@ -18,15 +15,20 @@ export function createGitStatusTool(root: string): ToolDefinition<{ path?: strin
     sideEffect: "read",
     annotations: { readOnlyHint: true },
     async execute(args, ctx): Promise<ToolResult> {
-      const target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
-      const { stdout, code } = await spawnProcess("git", ["status", "--short"], { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
-      const out = boundText(stdout);
+      let target: string;
+      try {
+        target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
+      } catch (error) {
+        return textResult(String(error), true, { code: "E_TOOL_DENIED" });
+      }
+      const { stdout, stderr, code } = await spawnProcess("git", ["status", "--short"], { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
+      const out = boundText(code !== 0 && !stdout ? stderr : stdout);
       return { content: [{ type: "text", text: out.text || "(clean)" }], isError: code !== 0, details: out.truncated ? { truncated: true } : undefined };
     },
   };
 }
 
-export function createGitDiffTool(root: string): ToolDefinition<{ path?: string; staged?: boolean }> {
+export function createGitDiffTool(_root: string): ToolDefinition<{ path?: string; staged?: boolean }> {
   return {
     name: "git-diff",
     description: "Show git diff of working tree or staged changes",
@@ -40,16 +42,21 @@ export function createGitDiffTool(root: string): ToolDefinition<{ path?: string;
     sideEffect: "read",
     annotations: { readOnlyHint: true },
     async execute(args, ctx): Promise<ToolResult> {
-      const target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
-      const cmd = args.staged ? ["git", "diff", "--cached"] : ["git", "diff"];
-      const { stdout, code } = await spawnProcess("git", cmd, { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
-      const out = boundText(stdout);
+      let target: string;
+      try {
+        target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
+      } catch (error) {
+        return textResult(String(error), true, { code: "E_TOOL_DENIED" });
+      }
+      const cmdArgs = args.staged ? ["diff", "--cached"] : ["diff"];
+      const { stdout, stderr, code } = await spawnProcess("git", cmdArgs, { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
+      const out = boundText(code !== 0 && !stdout ? stderr : stdout);
       return { content: [{ type: "text", text: out.text || "(no changes)" }], isError: code !== 0, details: out.truncated ? { truncated: true } : undefined };
     },
   };
 }
 
-export function createGitLogTool(root: string): ToolDefinition<{ path?: string; limit?: number }> {
+export function createGitLogTool(_root: string): ToolDefinition<{ path?: string; limit?: number }> {
   return {
     name: "git-log",
     description: "Show git commit history",
@@ -63,16 +70,21 @@ export function createGitLogTool(root: string): ToolDefinition<{ path?: string; 
     sideEffect: "read",
     annotations: { readOnlyHint: true },
     async execute(args, ctx): Promise<ToolResult> {
-      const target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
-      const limit = args.limit ?? 20;
-      const { stdout, code } = await spawnProcess("git", ["log", "--oneline", `-${limit}`], { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
-      const out = boundText(stdout);
+      let target: string;
+      try {
+        target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
+      } catch (error) {
+        return textResult(String(error), true, { code: "E_TOOL_DENIED" });
+      }
+      const limit = Math.max(1, Math.min(100, args.limit ?? 20));
+      const { stdout, stderr, code } = await spawnProcess("git", ["log", "--oneline", `-${limit}`], { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
+      const out = boundText(code !== 0 && !stdout ? stderr : stdout);
       return { content: [{ type: "text", text: out.text || "(no commits)" }], isError: code !== 0, details: out.truncated ? { truncated: true } : undefined };
     },
   };
 }
 
-export function createGitCheckoutTool(root: string): ToolDefinition<{ branch: string; create?: boolean; path?: string }> {
+export function createGitCheckoutTool(_root: string): ToolDefinition<{ branch: string; create?: boolean; path?: string }> {
   return {
     name: "git-checkout",
     description: "Switch branches or create new branch",
@@ -88,9 +100,14 @@ export function createGitCheckoutTool(root: string): ToolDefinition<{ branch: st
     sideEffect: "write",
     annotations: { destructiveHint: true },
     async execute(args, ctx): Promise<ToolResult> {
-      const target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
-      const cmd = args.create ? ["git", "checkout", "-b", args.branch] : ["git", "checkout", args.branch];
-      const { stdout, stderr, code } = await spawnProcess("git", cmd, { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
+      let target: string;
+      try {
+        target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
+      } catch (error) {
+        return textResult(String(error), true, { code: "E_TOOL_DENIED" });
+      }
+      const cmdArgs = args.create ? ["checkout", "-b", args.branch] : ["checkout", args.branch];
+      const { stdout, stderr, code } = await spawnProcess("git", cmdArgs, { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
       const out = boundText(stdout);
       const err = boundText(stderr);
       let text = `Exit code: ${code ?? -1}\n`;

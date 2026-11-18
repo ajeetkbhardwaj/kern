@@ -67,6 +67,9 @@ export interface ModelInfo {
   maxOutputTokens: number;
   supportsThinking?: boolean;
   supportsParallelToolCalls?: boolean;
+  /** Optional USD pricing per 1M tokens for cost attribution. */
+  inputCostPer1M?: number;
+  outputCostPer1M?: number;
 }
 
 export interface ModelAdapter {

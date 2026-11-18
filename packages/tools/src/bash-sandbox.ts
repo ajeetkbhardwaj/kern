@@ -6,7 +6,7 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { platform } from "node:os";
 
-/** Environment variables stripped before spawning sandboxed processes. */
+/** Environment variables stripped before spawning sandboxed/child processes. */
 const SANDBOX_ENV_DENYLIST = [
   "LD_PRELOAD",
   "LD_LIBRARY_PATH",
@@ -18,10 +18,17 @@ const SANDBOX_ENV_DENYLIST = [
   "DYLD_LIBRARY_PATH",
   "HISTFILE",
   "HISTFILESIZE",
+  "KERN_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "NVIDIA_API_KEY",
+  "GEMINI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GROQ_API_KEY",
 ];
 
-/** Remove dangerous environment variables from the environment. */
-function sanitizeEnv(env: Record<string, string | undefined>): Record<string, string> {
+/** Remove dangerous and credential environment variables from the environment. */
+export function sanitizeEnv(env: Record<string, string | undefined>): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (value !== undefined && !SANDBOX_ENV_DENYLIST.includes(key)) {

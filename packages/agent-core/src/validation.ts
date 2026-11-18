@@ -29,7 +29,7 @@ export function chooseValidationTargets(objective: string, files: string[] = [])
   if (testFiles.length > 0) {
     return testFiles.slice(0, 3).map((file) => ({
       kind: "vitest",
-      command: "pnpm",
+      command: "npx",
       args: ["vitest", "run", file],
       reason: `task-specific test coverage for ${objective}`,
       files: [file],
@@ -39,7 +39,7 @@ export function chooseValidationTargets(objective: string, files: string[] = [])
   if (sourceFiles.length > 0) {
     return [{
       kind: "tsc",
-      command: "pnpm",
+      command: "npx",
       args: ["tsc", "-p", "tsconfig.json", "--noEmit"],
       reason: `project type-check after ${objective}`,
       files: sourceFiles,
@@ -48,7 +48,7 @@ export function chooseValidationTargets(objective: string, files: string[] = [])
 
   return [{
     kind: "tsc",
-    command: "pnpm",
+    command: "npx",
     args: ["tsc", "-p", "tsconfig.json", "--noEmit"],
     reason: `default safety check for ${objective}`,
     files: [],

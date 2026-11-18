@@ -2,7 +2,7 @@
 
 Kern is a minimal, from-first-principles terminal coding agent kernel. It runs in an interactive TUI by default, can execute tools with explicit policy/approval checks, persists sessions locally, and works with OpenAI-compatible model endpoints (cloud or local).
 
-> **Status:** active development (`0.0.1`, private monorepo). APIs and internals may evolve.
+> **Status:** release `1.0.0` (Node.js / npm workspaces monorepo).
 
 ## Table of contents
 
@@ -34,7 +34,7 @@ Kern provides a small, inspectable coding-agent runtime with:
 
 - a **terminal-first UX** (fullscreen TUI with streaming output, collapsible thinking/tool details, status/activity, session panel)
 - a **kernel/runtime core** for turns, context assembly, budgets, retry/compaction, and event-driven execution
-- **tool execution with policy and approvals** (`read`, `write`, `edit`, `bash`) instead of implicit authority
+- **tool execution with policy and approvals** (`read`, `write`, `edit`, `bash`, `grep`, `find`, `git-*`, etc.) instead of implicit authority
 - **local session persistence** (JSONL session history, resume/switch/export)
 - **model-provider flexibility** through an OpenAI-compatible adapter and model discovery/config flow
 
@@ -194,7 +194,7 @@ sequenceDiagram
 ### Prerequisites
 
 - **Node.js** `>= 20` (recommended: Node 22+ for best compatibility with current tooling/dependencies)
-- **pnpm** (repo uses `pnpm` workspace tooling; `packageManager` is pinned in `package.json`)
+- **npm** `>= 10` (workspace scripts configured in `package.json`)
 - Access to an **OpenAI-compatible model endpoint** (cloud or local) and credentials if required
 
 ### Clone the repository
@@ -209,7 +209,7 @@ If you are already working in this workspace/repo, skip cloning and run commands
 ### Install dependencies
 
 ```bash
-pnpm install
+npm install
 ```
 
 ### Configure a model/provider
@@ -230,16 +230,17 @@ Kern can work with configured providers/models and OpenAI-compatible endpoints. 
 
 ### Run Kern
 
-Show help:
+Show version or help:
 
 ```bash
-pnpm kern -- --help
+npm run kern -- --version
+npm run kern -- --help
 ```
 
 List available models (configured/discovered):
 
 ```bash
-pnpm kern -- --list-models
+npm run kern -- --list-models
 ```
 
 Start the interactive TUI (default on TTY):

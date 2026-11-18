@@ -10,10 +10,14 @@ import type {
   SessionNameEntry,
   ExtensionEntry,
   ModelChangeEntry,
+  UsageEntry,
+  TokenCounts,
+  CostSnapshot,
   ChatMessage,
 } from "@kern/protocol";
-import { isMessageEntry, isCompactionEntry } from "@kern/protocol";
+import { isMessageEntry, isCompactionEntry, isUsageEntry } from "@kern/protocol";
 import type { SessionStore, SessionFile } from "./jsonl-store.js";
+import { migrateSessionEntries } from "./migration.js";
 
 export interface SessionState {
   entries: Map<string, SessionEntry>;
@@ -82,7 +86,26 @@ export class SessionManager {
     const children = new Map<string, string[]>();
     let header: SessionEntry | null = null;
     let lastId: string | null = null;
+    const rawEntries: SessionEntry[] = [];
     for await (const entry of this.store.readAll(filePath)) {
+      rawEntries.push(entry);
+    }
+    const readStats = this.store.lastReadStats;
+    if (readStats && (readStats.malformed > 0 || readStats.invalid > 0)) {
+      await this.quarantineCorruptSession(filePath, readStats);
+      throw new Error(
+        `Session file corrupted (${readStats.malformed} malformed, ${readStats.invalid} invalid line(s)): ${filePath}`,
+      );
+    }
+    const migrated = migrateSessionEntries(rawEntries);
+    if (migrated.migratedCount > 0) {
+      this.logger.info("session_migrated", {
+        filePath,
+        fromVersion: migrated.fromVersion,
+        toVersion: migrated.toVersion,
+      });
+    }
+    for (const entry of migrated.entries) {
       entries.set(entry.id, entry);
       if (entry.parentId !== null) {
         const arr = children.get(entry.parentId) ?? [];
@@ -92,13 +115,6 @@ export class SessionManager {
         header = entry;
       }
       lastId = entry.id;
-    }
-    const readStats = this.store.lastReadStats;
-    if (readStats && (readStats.malformed > 0 || readStats.invalid > 0)) {
-      await this.quarantineCorruptSession(filePath, readStats);
-      throw new Error(
-        `Session file corrupted (${readStats.malformed} malformed, ${readStats.invalid} invalid line(s)): ${filePath}`,
-      );
     }
     if (!header || lastId === null) {
       const corruptInfo = readStats && (readStats.malformed > 0 || readStats.invalid > 0)
@@ -256,11 +272,25 @@ export class SessionManager {
     });
   }
 
-  async appendCompaction(summary: string, replacesThroughId: string): Promise<CompactionEntry> {
+  async appendCompaction(
+    summary: string,
+    replacesThroughId: string,
+    opts?: { tokensBefore?: TokenCounts; tokensAfter?: TokenCounts },
+  ): Promise<CompactionEntry> {
     return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
-    const entry: CompactionEntry = { id: newId("c"), parentId, timestamp: now(), type: "compaction", summary, replacesThroughId, seq: this.nextSeq() };
+    const entry: CompactionEntry = {
+      id: newId("c"),
+      parentId,
+      timestamp: now(),
+      type: "compaction",
+      summary,
+      replacesThroughId,
+      seq: this.nextSeq(),
+      ...(opts?.tokensBefore ? { tokensBefore: opts.tokensBefore } : {}),
+      ...(opts?.tokensAfter ? { tokensAfter: opts.tokensAfter } : {}),
+    };
     await this.store.append(this.filePath, entry);
     this.state.entries.set(entry.id, entry);
     const arr = this.state.children.get(parentId) ?? [];
@@ -269,6 +299,62 @@ export class SessionManager {
     this.state.activeLeafId = entry.id;
     return entry;
     });
+  }
+
+  async appendUsage(data: {
+    provider: string;
+    model: string;
+    usage: TokenCounts;
+    cost?: number;
+    source?: "turn" | "compaction";
+  }): Promise<UsageEntry> {
+    return this.serialized(async () => {
+      if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
+      const parentId = this.state.activeLeafId;
+      const entry: UsageEntry = {
+        id: newId("u"),
+        parentId,
+        timestamp: now(),
+        type: "usage",
+        provider: data.provider,
+        model: data.model,
+        usage: data.usage,
+        ...(data.cost !== undefined ? { cost: data.cost } : {}),
+        ...(data.source !== undefined ? { source: data.source } : {}),
+        seq: this.nextSeq(),
+      };
+      await this.store.append(this.filePath, entry);
+      this.state.entries.set(entry.id, entry);
+      const arr = this.state.children.get(parentId) ?? [];
+      arr.push(entry.id);
+      this.state.children.set(parentId, arr);
+      this.state.activeLeafId = entry.id;
+      return entry;
+    });
+  }
+
+  getUsageTotals(): CostSnapshot {
+    if (!this.state) return { inputTokens: 0, outputTokens: 0, cost: 0, byModel: {} };
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cost = 0;
+    const byModel: Record<string, { input: number; output: number; cost: number }> = {};
+    for (const entry of this.getActivePath()) {
+      if (!isUsageEntry(entry)) continue;
+      const inp = entry.usage.input ?? 0;
+      const out = entry.usage.output ?? 0;
+      const c = entry.cost ?? 0;
+      inputTokens += inp;
+      outputTokens += out;
+      cost += c;
+      const key = entry.model;
+      const prev = byModel[key] ?? { input: 0, output: 0, cost: 0 };
+      prev.input += inp;
+      prev.output += out;
+      prev.cost += c;
+      byModel[key] = prev;
+    }
+    return { inputTokens, outputTokens, cost, byModel };
   }
 
   async appendBranch(note?: string): Promise<BranchEntry> {

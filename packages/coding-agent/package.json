@@ -1,6 +1,6 @@
 {
   "name": "@kern/coding-agent",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "AgentSession facade + modes (print / json / rpc / interactive).",
@@ -9,14 +9,14 @@
   },
   "types": "./src/index.ts",
   "dependencies": {
-    "@kern/protocol": "workspace:*",
-    "@kern/model": "workspace:*",
-    "@kern/session-store": "workspace:*",
-    "@kern/tools": "workspace:*",
-    "@kern/agent-core": "workspace:*",
-    "@kern/repo-index": "workspace:*",
-    "@kern/symbol-store": "workspace:*",
-    "@kern/semantic-search": "workspace:*",
-    "@kern/project-memory": "workspace:*"
+    "@kern/protocol": "*",
+    "@kern/model": "*",
+    "@kern/session-store": "*",
+    "@kern/tools": "*",
+    "@kern/agent-core": "*",
+    "@kern/repo-index": "*",
+    "@kern/symbol-store": "*",
+    "@kern/semantic-search": "*",
+    "@kern/project-memory": "*"
   }
 }

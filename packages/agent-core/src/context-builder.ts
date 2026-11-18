@@ -102,7 +102,7 @@ export class ContextBuilder {
 
   async build(sessions: SessionManager): Promise<ContextSnapshot> {
     const taskQuery = this.deriveTaskQuery(sessions);
-    if (this.repoResolver && taskQuery && !this.repoContext.query) {
+    if (this.repoResolver && taskQuery && this.repoContext.query !== taskQuery) {
       await this.enrichForQuery(taskQuery);
     }
     const systemPrompt = this.systemPrompt();
@@ -118,13 +118,16 @@ export class ContextBuilder {
     const active = sessions.getActivePath();
     const cutoff = compaction ? sessions.getEntry(compaction.replacesThroughId) : undefined;
     const cutoffSeq = cutoff?.seq;
-    for (const entry of active) {
+    const cutoffIndex = compaction ? active.findIndex((e) => e.id === compaction.replacesThroughId) : -1;
+    for (let i = 0; i < active.length; i++) {
+      const entry = active[i]!;
       if (entry.type !== "message") continue;
-      if (compaction && isCoveredByCompaction(entry.id, entry.seq, compaction.replacesThroughId, cutoffSeq)) continue;
+      if (compaction && isCoveredByCompaction(entry.id, entry.seq, i, compaction.replacesThroughId, cutoffSeq, cutoffIndex)) {
+        continue;
+      }
       messages.push(entry.message);
     }
     if (!this.repoContext.likelyFiles && !this.repoContext.projectNotes && !this.repoContext.relevantSymbols) {
-      const taskQuery = this.deriveTaskQuery(sessions);
       if (taskQuery) {
         this.repoContext = { ...this.repoContext, query: taskQuery };
       }
@@ -138,11 +141,16 @@ export class ContextBuilder {
 function isCoveredByCompaction(
   entryId: string,
   entrySeq: number | undefined,
+  activeIndex: number,
   replacesThroughId: string,
   cutoffSeq: number | undefined,
+  cutoffIndex: number,
 ): boolean {
   if (entrySeq !== undefined && cutoffSeq !== undefined) {
     return entrySeq <= cutoffSeq;
   }
-  return entryId <= replacesThroughId;
+  if (cutoffIndex >= 0) {
+    return activeIndex <= cutoffIndex;
+  }
+  return entryId === replacesThroughId;
 }

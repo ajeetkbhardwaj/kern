@@ -109,6 +109,7 @@ export const CompactionEntrySchema = BaseEntrySchema.extend({
   type: z.literal("compaction"),
   summary: z.string(),
   replacesThroughId: z.string(),
+  tokensBefore: TokenCountsSchema.optional(),
   tokensAfter: TokenCountsSchema.optional(),
 });
 
@@ -190,6 +191,16 @@ export const DiagnosticEntrySchema = BaseEntrySchema.extend({
   details: z.record(z.unknown()).optional(),
 });
 
+/** Usage entry */
+export const UsageEntrySchema = BaseEntrySchema.extend({
+  type: z.literal("usage"),
+  provider: z.string(),
+  model: z.string(),
+  usage: TokenCountsSchema,
+  cost: z.number().nonnegative().optional(),
+  source: z.enum(["turn", "compaction"]).optional(),
+});
+
 /** Session entry union */
 export const SessionEntrySchema = z.discriminatedUnion("type", [
   SessionHeaderEntrySchema,
@@ -202,6 +213,7 @@ export const SessionEntrySchema = z.discriminatedUnion("type", [
   SessionNameEntrySchema,
   ExtensionEntrySchema,
   DiagnosticEntrySchema,
+  UsageEntrySchema,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -236,7 +248,7 @@ export const ModelStreamEventSchema: z.ZodType<ModelStreamEvent> = z.discriminat
 // Budget events & cost snapshot schemas
 // ---------------------------------------------------------------------------
 
-export const BudgetLimitKindSchema = z.enum(["max_cost", "max_tokens"]);
+export const BudgetLimitKindSchema = z.enum(["max_cost", "max_tokens", "max_turns", "max_tool_calls", "max_wall_time"]);
 
 export const BudgetWarningEventSchema = z.object({
   type: z.literal("budget_warning"),

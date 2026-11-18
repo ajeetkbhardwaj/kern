@@ -1,8 +1,0 @@
-packages:
-  - "packages/*"
-
-allowBuilds:
-  esbuild: true
-
-minimumReleaseAgeExclude:
-  - '@earendil-works/pi-tui@1.0.4'

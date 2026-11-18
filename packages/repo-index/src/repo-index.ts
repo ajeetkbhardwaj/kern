@@ -2,6 +2,9 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, extname, relative, resolve } from "node:path";
 import { FileGraph } from "./file-graph.js";
 
+const MAX_PARSE_FILE_BYTES = 512_000;
+const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".py", ".go", ".rs"]);
+
 export interface RepoFileRecord {
   path: string;
   relativePath: string;
@@ -135,8 +138,9 @@ export class RepoIndex {
 
       const rel = relative(this.root, fullPath).split("\\").join("/");
       const ext = extname(fullPath) || undefined;
-      const imports = await this.collectImports(fullPath);
-      const exports = await this.collectExports(fullPath);
+      const shouldParseCode = ext !== undefined && CODE_EXTENSIONS.has(ext.toLowerCase()) && stats.size <= MAX_PARSE_FILE_BYTES;
+      const imports = shouldParseCode ? await this.collectImports(fullPath) : [];
+      const exports = shouldParseCode ? await this.collectExports(fullPath) : [];
       const record: RepoFileRecord = {
         path: fullPath,
         relativePath: rel,

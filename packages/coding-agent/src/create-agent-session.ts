@@ -15,6 +15,8 @@ import {
   createCatTool,
   createHeadTool,
   createTailTool,
+  createGrepTool,
+  createFindTool,
   createWhichTool,
   createCalculateTool,
   createTimeTool,
@@ -33,7 +35,7 @@ import {
   DEFAULT_SAFETY_POLICY_CONFIG,
   type PolicyConfig,
 } from "@kern/tools";
-import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition } from "@kern/protocol";
+import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition, type CostSnapshot } from "@kern/protocol";
 import type { BudgetLimits, BudgetUsage, ContextUsage } from "@kern/agent-core";
 import { RepoIndex } from "@kern/repo-index";
 import { SymbolStore } from "@kern/symbol-store";
@@ -108,6 +110,8 @@ export interface AgentSession {
   importFromJsonl?(filePath: string): Promise<{ session: AgentSession; manager: SessionManager }>;
   branchSummary?(fromId: string, summary: string): Promise<string | null>;
   listSessions?(): Promise<string[]>;
+  usageSummary?(): CostSnapshot;
+  exportMarkdown?(): string;
 }
 
 export interface AgentSessionRuntime {
@@ -180,6 +184,8 @@ async function buildSessionWithRuntime(
   tools.register(createCatTool(options.cwd));
   tools.register(createHeadTool(options.cwd));
   tools.register(createTailTool(options.cwd));
+  tools.register(createGrepTool(options.cwd));
+  tools.register(createFindTool(options.cwd));
   tools.register(createWhichTool(options.cwd));
   tools.register(createCalculateTool(options.cwd));
   tools.register(createTimeTool(options.cwd));
@@ -328,6 +334,28 @@ async function buildSessionWithRuntime(
       return entry.summary;
     },
     listSessions: async () => manager.listSessions(20),
+    usageSummary: () => runtime.budgetUsage(),
+    exportMarkdown: () => {
+      const lines: string[] = [`# Kern Session ${manager.sessionId ?? ""}`.trim()];
+      if (manager.sessionName) lines.push(`Name: ${manager.sessionName}`);
+      lines.push("");
+      for (const entry of manager.getActivePath()) {
+        if (entry.type === "compaction") {
+          lines.push(`## Compaction (${entry.timestamp})`, "", entry.summary, "");
+        } else if (entry.type === "message") {
+          lines.push(`## ${entry.message.role.toUpperCase()} (${entry.timestamp})`, "");
+          for (const block of entry.message.content) {
+            if (block.type === "text") lines.push(block.text, "");
+            else if (block.type === "tool_call") lines.push(`- tool_call: \`${block.name}\``, "");
+            else if (block.type === "tool_result") {
+              const txt = block.content.map((c) => c.text).join("\n");
+              lines.push(`- tool_result${block.isError ? " (error)" : ""}:`, "```", txt, "```", "");
+            }
+          }
+        }
+      }
+      return lines.join("\n");
+    },
   };
   return { session, manager };
 }

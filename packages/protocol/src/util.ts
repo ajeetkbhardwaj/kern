@@ -93,10 +93,12 @@ interface RedactionRule {
 
 const REDACTION_RULES: RedactionRule[] = [
   { pattern: /\b(sk-[A-Za-z0-9_-]{16,})\b/g, replacement: "[REDACTED:api-key]" },
+  { pattern: /\b(AIza[0-9A-Za-z_-]{30,})\b/g, replacement: "[REDACTED:api-key]" },
   { pattern: /\b(gh[pousr]_[A-Za-z0-9]{20,})\b/g, replacement: "[REDACTED:github-token]" },
   { pattern: /\b(AKIA[0-9A-Z]{16})\b/g, replacement: "[REDACTED:aws-key]" },
   { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED:private-key]" },
   { pattern: /\b(xox[baprs]-[A-Za-z0-9-]{10,})\b/g, replacement: "[REDACTED:slack-token]" },
+  { pattern: /\bBearer\s+[A-Za-z0-9._-]{16,}\b/gi, replacement: "Bearer [REDACTED]" },
   { pattern: /((?:api[_-]?key|secret|password|passwd|token)["']?\s*[:=]\s*)["'][^"']{6,}["']/gi, replacement: "$1[REDACTED]" },
   { pattern: /(\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b)/g, replacement: "[REDACTED:email]" },
 ];

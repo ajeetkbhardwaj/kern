@@ -1,6 +1,6 @@
 {
   "name": "@kern/model",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Provider-neutral model adapter + fake model for tests.",
@@ -9,6 +9,6 @@
   },
   "types": "./src/index.ts",
   "dependencies": {
-    "@kern/protocol": "workspace:*"
+    "@kern/protocol": "*"
   }
 }

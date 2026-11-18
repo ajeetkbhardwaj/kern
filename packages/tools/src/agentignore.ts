@@ -8,7 +8,8 @@
  */
 
 import { readFile, stat } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 export interface AgentIgnoreConfig {
   root: string;
@@ -54,7 +55,7 @@ function patternToRegex(pattern: string): RegExp {
   if (dirOnly) pattern = pattern.slice(0, -1);
 
   // Leading slash anchors to root
-  let anchored = pattern.startsWith("/");
+  const anchored = pattern.startsWith("/");
   if (anchored) pattern = pattern.slice(1);
 
   // Contains a slash (not trailing) => match from root
@@ -68,8 +69,8 @@ function patternToRegex(pattern: string): RegExp {
     regex += "(?:^|/)";
   }
 
-    for (; i < pattern.length; i++) {
-      const c = pattern[i]!;
+  for (; i < pattern.length; i++) {
+    const c = pattern[i]!;
     if (c === "*") {
       if (pattern[i + 1] === "*") {
         // ** pattern
@@ -124,6 +125,36 @@ export async function loadAgentIgnore(root: string): Promise<AgentIgnoreConfig> 
       patterns.push(...parsed.patterns);
       negativePatterns.push(...parsed.negativePatterns);
       break; // Use the nearest .agentignore only
+    } catch {
+      // No .agentignore here, continue up
+    }
+    if (dir === stopAt || dir === "/") break;
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  return { root, patterns, negativePatterns };
+}
+
+/** Synchronous variant of loadAgentIgnore for sync path guards. */
+export function loadAgentIgnoreSync(root: string): AgentIgnoreConfig {
+  const patterns: string[] = [...DEFAULT_IGNORE_PATTERNS];
+  const negativePatterns: string[] = [];
+
+  let dir = resolve(root);
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+  const stopAt = home ? resolve(home) : "/";
+
+  while (true) {
+    const ignoreFile = join(dir, ".agentignore");
+    try {
+      statSync(ignoreFile);
+      const content = readFileSync(ignoreFile, "utf8");
+      const parsed = parseAgentIgnore(content);
+      patterns.push(...parsed.patterns);
+      negativePatterns.push(...parsed.negativePatterns);
+      break;
     } catch {
       // No .agentignore here, continue up
     }

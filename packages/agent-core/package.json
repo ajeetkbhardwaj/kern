@@ -1,6 +1,6 @@
 {
   "name": "@kern/agent-core",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "The agent loop: context assembly, turns, retries, compaction.",
@@ -9,9 +9,9 @@
   },
   "types": "./src/index.ts",
   "dependencies": {
-    "@kern/protocol": "workspace:*",
-    "@kern/model": "workspace:*",
-    "@kern/session-store": "workspace:*",
-    "@kern/tools": "workspace:*"
+    "@kern/protocol": "*",
+    "@kern/model": "*",
+    "@kern/session-store": "*",
+    "@kern/tools": "*"
   }
 }

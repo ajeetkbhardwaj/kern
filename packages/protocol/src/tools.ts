@@ -32,16 +32,20 @@ export interface ToolResult {
   details?: Record<string, unknown>;
 }
 
+export interface ToolAnnotations {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
 export interface ToolDefinition<TArgs = unknown> {
   name: string;
   description: string;
   inputSchema: JsonSchema;
   sideEffect: SideEffect;
   /** MCP-style hints that feed directly into permission/safety classification. */
-  annotations?: {
-    readOnlyHint?: boolean;
-    destructiveHint?: boolean;
-  };
+  annotations?: ToolAnnotations;
   /** Rendered into the system prompt so the model knows what it may do. */
   instructions?: string;
   execute(args: TArgs, ctx: ToolContext): Promise<ToolResult>;
@@ -65,6 +69,8 @@ export interface PolicyInput {
   origin: "model" | "user" | "extension";
   /** Tool's declared side-effect class, when known. Drives the default ask-table. */
   sideEffect?: SideEffect;
+  /** MCP-style tool annotations, when known. */
+  annotations?: ToolAnnotations;
 }
 
 export interface ToolPolicyEngine {

@@ -68,7 +68,7 @@ export interface ToolResultDetails {
 // Session entries — the durable event log
 // ---------------------------------------------------------------------------
 
-export const SESSION_ENTRY_VERSION = 1;
+export const SESSION_ENTRY_VERSION = 2;
 
 export interface BaseEntry {
   /** Unique, monotonic-ish, sortable: <prefix>_<counter>. */
@@ -102,6 +102,8 @@ export interface CompactionEntry extends BaseEntry {
   summary: string;
   /** The last entry id covered by `summary`. */
   replacesThroughId: string;
+  /** Token counts as measured before compaction, if known. */
+  tokensBefore?: TokenCounts;
   /** Token counts as measured after compaction, if known. */
   tokensAfter?: TokenCounts;
 }
@@ -154,6 +156,15 @@ export interface DiagnosticEntry extends BaseEntry {
   details?: Record<string, unknown>;
 }
 
+export interface UsageEntry extends BaseEntry {
+  type: "usage";
+  provider: string;
+  model: string;
+  usage: TokenCounts;
+  cost?: number;
+  source?: "turn" | "compaction";
+}
+
 export type SessionEntry =
   | SessionHeaderEntry
   | MessageEntry
@@ -164,7 +175,8 @@ export type SessionEntry =
   | BranchSummaryEntry
   | SessionNameEntry
   | ExtensionEntry
-  | DiagnosticEntry;
+  | DiagnosticEntry
+  | UsageEntry;
 
 export type SessionEntryType = SessionEntry["type"];
 
@@ -206,6 +218,10 @@ export function isBranchSummaryEntry(entry: SessionEntry): entry is BranchSummar
 
 export function isSessionNameEntry(entry: SessionEntry): entry is SessionNameEntry {
   return entry.type === "session_name";
+}
+
+export function isUsageEntry(entry: SessionEntry): entry is UsageEntry {
+  return entry.type === "usage";
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +278,7 @@ export type CompactionPhase = "before_prompt" | "after_agent_end";
 export type AgentEventType = AgentEvent["type"];
 
 /** Kinds of consumable resource limits that can trip a budget. */
-export type BudgetLimitKind = "max_cost" | "max_tokens";
+export type BudgetLimitKind = "max_cost" | "max_tokens" | "max_turns" | "max_tool_calls" | "max_wall_time";
 
 /** Snapshot of cumulative token and cost usage, optionally broken down per model. */
 export interface CostSnapshot {

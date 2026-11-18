@@ -33,6 +33,8 @@ export interface OpenAIAdapterOptions {
   maxOutputTokens: number;
   temperature?: number;
   supportsThinking?: boolean;
+  inputCostPer1M?: number;
+  outputCostPer1M?: number;
   logger?: Logger;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
@@ -56,6 +58,7 @@ interface SSEChunk {
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
+    total_tokens?: number;
     prompt_cache_hit_tokens?: number;
     prompt_cache_miss_tokens?: number;
   };
@@ -75,6 +78,8 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions): ModelAdapter
     supportsParallelToolCalls: true,
   };
   if (options.supportsThinking !== undefined) info.supportsThinking = options.supportsThinking;
+  if (options.inputCostPer1M !== undefined) info.inputCostPer1M = options.inputCostPer1M;
+  if (options.outputCostPer1M !== undefined) info.outputCostPer1M = options.outputCostPer1M;
 
   return {
     info,
@@ -171,7 +176,7 @@ function toOpenAIBody(request: ModelRequest, options: OpenAIAdapterOptions): Rec
   const maxOutput = request.maxOutputTokens ?? options.maxOutputTokens;
   const body: Record<string, unknown> = {
     model: options.modelId,
-    messages: [{ role: "system", content: request.systemPrompt }, ...request.messages.map(toOpenAIMessage)],
+    messages: [{ role: "system", content: request.systemPrompt }, ...request.messages.flatMap(toOpenAIMessages)],
     stream: true,
     stream_options: { include_usage: true },
     max_tokens: maxOutput,
@@ -190,17 +195,17 @@ function toOpenAIBody(request: ModelRequest, options: OpenAIAdapterOptions): Rec
   return body;
 }
 
-function toOpenAIMessage(message: ChatMessage): Record<string, unknown> {
+function toOpenAIMessages(message: ChatMessage): Array<Record<string, unknown>> {
   if (message.role === "tool") {
-    const block = message.content.find((b) => b.type === "tool_result");
-    return {
+    const blocks = message.content.filter((b) => b.type === "tool_result");
+    if (blocks.length === 0) {
+      return [{ role: "tool", tool_call_id: "", content: "" }];
+    }
+    return blocks.map((block) => ({
       role: "tool",
-      tool_call_id: block && block.type === "tool_result" ? block.toolCallId : "",
-      content:
-        block && block.type === "tool_result"
-          ? block.content.map((c) => c.text).join("\n")
-          : "",
-    };
+      tool_call_id: block.toolCallId,
+      content: block.content.map((c) => c.text).join("\n"),
+    }));
   }
   const texts: string[] = [];
   const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
@@ -219,7 +224,7 @@ function toOpenAIMessage(message: ChatMessage): Record<string, unknown> {
   }
   const out: Record<string, unknown> = { role: message.role, content: texts.join("\n") };
   if (toolCalls.length > 0) out["tool_calls"] = toolCalls;
-  return out;
+  return [out];
 }
 
 function toOpenAITool(tool: ModelToolSchema): Record<string, unknown> {
@@ -239,10 +244,9 @@ function parseArgs(raw: string): unknown {
 }
 
 function toTokenCounts(usage: NonNullable<SSEChunk["usage"]>): TokenCounts {
-  const counts: TokenCounts = {
-    input: usage.prompt_tokens ?? 0,
-    output: usage.completion_tokens ?? 0,
-  };
+  const input = usage.prompt_tokens ?? (usage.total_tokens !== undefined && usage.completion_tokens === undefined ? usage.total_tokens : 0);
+  const output = usage.completion_tokens ?? 0;
+  const counts: TokenCounts = { input, output };
   if (usage.prompt_cache_hit_tokens !== undefined) counts.cacheRead = usage.prompt_cache_hit_tokens;
   if (usage.prompt_cache_miss_tokens !== undefined) counts.cacheWrite = usage.prompt_cache_miss_tokens;
   return counts;

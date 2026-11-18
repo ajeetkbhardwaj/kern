@@ -13,6 +13,7 @@ import type {
   ModelErrorKind,
   CompactionPhase,
   ThinkingLevel,
+  TokenCounts,
 } from "@kern/protocol";
 import type { ContextUsage } from "./tokens.js";
 import {
@@ -45,7 +46,7 @@ export interface AgentRuntimeOptions {
 
 export interface RunTurnOptions {
   signal?: AbortSignal;
-  /** Queue this prompt after the current turn+tools complete. */
+  /** Queue this prompt after the current turn+tools complete (injects mid-run before the next model call). */
   steer?: boolean;
   /** Queue this prompt after the entire current run completes. */
   followUp?: boolean;
@@ -67,7 +68,8 @@ export class AgentRuntime {
   private lastUsage: ContextUsage | null = null;
   private disposed = false;
   private activeAbortController: AbortController | null = null;
-  private queuedTurns: Array<{ text: string; opts: RunTurnOptions }> = [];
+  private steerQueue: string[] = [];
+  private followUpQueue: Array<{ text: string; opts: RunTurnOptions }> = [];
   private thinkingLevel: ThinkingLevel;
 
   constructor(options: AgentRuntimeOptions) {
@@ -78,6 +80,7 @@ export class AgentRuntime {
     this.events = options.events;
     this.logger = options.logger ?? nullLogger;
     this.budgets = new BudgetTracker(options.budgets ?? {}, (event) => this.events.emit(event));
+    this.budgets.restoreUsage(this.sessions.getUsageTotals());
     this.compactor = options.compactor === undefined ? new Compactor({ logger: this.logger }) : options.compactor;
     this.retry = options.retry ?? DEFAULT_RETRY_CONFIG;
     this.thinkingLevel = options.defaultThinkingLevel ?? "medium";
@@ -154,7 +157,8 @@ export class AgentRuntime {
 
   dispose(): void {
     this.disposed = true;
-    this.queuedTurns = [];
+    this.steerQueue = [];
+    this.followUpQueue = [];
     this.activeAbortController?.abort();
     this.activeAbortController = null;
     this.events.clear();
@@ -163,8 +167,12 @@ export class AgentRuntime {
   async runUserTurn(userText: string, opts: RunTurnOptions = {}): Promise<void> {
     if (this.disposed) throw new Error("Session runtime has been disposed");
     if (this.busy) {
-      if (opts.steer || opts.followUp) {
-        this.queuedTurns.push({ text: userText, opts });
+      if (opts.steer) {
+        this.steerQueue.push(userText);
+        return;
+      }
+      if (opts.followUp) {
+        this.followUpQueue.push({ text: userText, opts });
         return;
       }
       throw new Error("A turn is already running; pass { steer: true } or { followUp: true } to queue it.");
@@ -172,6 +180,7 @@ export class AgentRuntime {
     this.busy = true;
     this.events.emit({ type: "agent_start" });
     this.turn = 0;
+    this.budgets.startRun();
     this.activeAbortController = opts.signal ? null : new AbortController();
     const signal = opts.signal ?? this.activeAbortController?.signal;
     let pendingQueuedFlush = false;
@@ -182,6 +191,13 @@ export class AgentRuntime {
 
       while (true) {
         this.throwIfAborted(signal);
+        if (this.steerQueue.length > 0) {
+          const steered = this.steerQueue.splice(0, this.steerQueue.length);
+          for (const text of steered) {
+            await this.sessions.appendUserMessage(text);
+          }
+        }
+        this.budgets.beginTurn();
         this.turn += 1;
         this.events.emit({ type: "turn_start", turn: this.turn });
 
@@ -195,23 +211,54 @@ export class AgentRuntime {
           thinkingLevel: this.thinkingLevel,
           signal,
         };
-        const assistant = await this.streamModel(request, signal);
+        const { message: assistant, usage: turnUsage, cost: turnCost } = await this.streamModel(request, signal);
         this.throwIfAborted(signal);
         await this.sessions.appendAssistantMessage(assistant);
+        if (turnUsage.input > 0 || turnUsage.output > 0 || turnCost > 0) {
+          await this.sessions.appendUsage({
+            provider: this.model.info.provider,
+            model: this.model.info.modelId,
+            usage: turnUsage,
+            cost: turnCost,
+            source: "turn",
+          });
+        }
 
         const toolCalls = getToolCalls(assistant);
         if (toolCalls.length === 0) {
+          if (this.steerQueue.length > 0) {
+            continue;
+          }
           this.events.emit({ type: "agent_end", reason: "final_response" });
           await this.ensureCompactIfNeeded("after_agent_end", signal);
           this.events.emit({ type: "agent_settled" });
           pendingQueuedFlush = true;
           return;
         }
-        for (const call of toolCalls) {
+
+        const allReadOnly =
+          toolCalls.length > 1 && toolCalls.every((call) => this.tools.isReadOnlyTool(call.name));
+
+        if (allReadOnly) {
+          for (let i = 0; i < toolCalls.length; i++) {
+            this.throwIfAborted(signal);
+            this.budgets.recordToolCall();
+          }
+          const toolMessages = await Promise.all(
+            toolCalls.map((call) => this.executeTool(call, signal)),
+          );
           this.throwIfAborted(signal);
-          const toolMsg = await this.executeTool(call, signal);
-          this.throwIfAborted(signal);
-          await this.sessions.appendToolResult(toolMsg);
+          for (const toolMsg of toolMessages) {
+            await this.sessions.appendToolResult(toolMsg);
+          }
+        } else {
+          for (const call of toolCalls) {
+            this.throwIfAborted(signal);
+            this.budgets.recordToolCall();
+            const toolMsg = await this.executeTool(call, signal);
+            this.throwIfAborted(signal);
+            await this.sessions.appendToolResult(toolMsg);
+          }
         }
       }
     } catch (error) {
@@ -250,7 +297,12 @@ export class AgentRuntime {
   }
 
   private async flushQueuedTurn(): Promise<void> {
-    const next = this.queuedTurns.shift();
+    if (this.steerQueue.length > 0) {
+      const nextText = this.steerQueue.shift()!;
+      await this.runUserTurn(nextText, { steer: true });
+      return;
+    }
+    const next = this.followUpQueue.shift();
     if (!next) return;
     await this.runUserTurn(next.text, next.opts);
   }
@@ -266,8 +318,10 @@ export class AgentRuntime {
     if (!this.sessions.getActiveMessages().length) return null;
     this.events.emit({ type: "auto_compaction_start", phase: "before_prompt" });
     try {
+      const beforeSnapshot = await this.contextBuilder.build(this.sessions);
+      const tokensBefore: TokenCounts = { input: beforeSnapshot.usage.totalTokens, output: 0 };
       const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model, instructions);
-      await this.sessions.appendCompaction(summary, replacesThroughId);
+      await this.sessions.appendCompaction(summary, replacesThroughId, { tokensBefore });
       this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
       return { summary, replacesThroughId };
     } catch (error) {
@@ -291,9 +345,10 @@ export class AgentRuntime {
     if (!decision.shouldCompact) return;
     this.events.emit({ type: "auto_compaction_start", phase });
     try {
+      const tokensBefore: TokenCounts = { input: snapshot.usage.totalTokens, output: 0 };
       const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model);
       this.throwIfAborted(signal);
-      await this.sessions.appendCompaction(summary, replacesThroughId);
+      await this.sessions.appendCompaction(summary, replacesThroughId, { tokensBefore });
       this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
     } catch (error) {
       const serialized = serializeError(error);
@@ -308,10 +363,21 @@ export class AgentRuntime {
     }
   }
 
-  private async streamModel(request: Parameters<ModelAdapter["stream"]>[0], signal?: AbortSignal): Promise<ChatMessage> {
+  private estimateCost(usage: TokenCounts): number {
+    const inRate = this.model.info.inputCostPer1M ?? 0;
+    const outRate = this.model.info.outputCostPer1M ?? 0;
+    return (usage.input * inRate + usage.output * outRate) / 1_000_000;
+  }
+
+  private async streamModel(
+    request: Parameters<ModelAdapter["stream"]>[0],
+    signal?: AbortSignal,
+  ): Promise<{ message: ChatMessage; usage: TokenCounts; cost: number }> {
     return withRetry(
       async (attempt) => {
         const assembler = new AssistantMessageAssembler();
+        const turnUsage: TokenCounts = { input: 0, output: 0 };
+        let turnCost = 0;
         this.events.emit({ type: "message_start", message: { role: "assistant" } });
         try {
           for await (const event of this.model.stream(request)) {
@@ -323,9 +389,20 @@ export class AgentRuntime {
               case "reasoning_delta":
                 this.events.emit({ type: "reasoning_delta", delta: event.delta });
                 break;
-              case "usage":
-                this.budgets.recordUsage(event.usage.input, event.usage.output, 0, this.model.info.modelId);
+              case "usage": {
+                const cost = this.estimateCost(event.usage);
+                turnUsage.input += event.usage.input;
+                turnUsage.output += event.usage.output;
+                if (event.usage.cacheRead !== undefined) {
+                  turnUsage.cacheRead = (turnUsage.cacheRead ?? 0) + event.usage.cacheRead;
+                }
+                if (event.usage.cacheWrite !== undefined) {
+                  turnUsage.cacheWrite = (turnUsage.cacheWrite ?? 0) + event.usage.cacheWrite;
+                }
+                turnCost += cost;
+                this.budgets.recordUsage(event.usage.input, event.usage.output, cost, this.model.info.modelId);
                 break;
+              }
               case "tool_call_complete":
               case "tool_call_delta":
               case "finished":
@@ -335,14 +412,12 @@ export class AgentRuntime {
           }
           const message = assembler.finalize(now());
           message.model = this.model.info.modelId;
+          if (turnCost > 0) message.cost = turnCost;
           this.events.emit({ type: "message_end", message });
-          return message;
+          return { message, usage: turnUsage, cost: turnCost };
         } catch (error) {
-          // On retryable failures mid-stream, the next attempt will emit a fresh message_start.
-          // Avoid leaving consumers without a terminal signal for this attempt.
           if (attempt < this.retry.maxAttempts && classifyError(error) !== "cancelled") {
             const reason = classifyError(error);
-            // no synthetic message_end; listeners observe retry/error events and next message_start
             void reason;
           }
           throw error;
@@ -378,8 +453,6 @@ export class AgentRuntime {
       origin: "model",
       requestApproval: this.requestApproval,
     });
-    // Users paste and store secrets by accident — redact tool text before it
-    // persists to JSONL or returns to the model. Shape stays identical.
     const safeContent = result.content.map((c) => ({ type: "text" as const, text: redact(c.text) }));
     const block: ToolResultBlock = {
       type: "tool_result",

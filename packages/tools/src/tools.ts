@@ -16,7 +16,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { DefaultPolicy } from "./policy.js";
 import { safeResolveSync } from "./path-safety.js";
 import { validateArgs } from "./validate-args.js";
-import { spawnSandboxed, type SandboxOptions, DEFAULT_SANDBOX_OPTIONS, NO_SANDBOX_OPTIONS } from "./bash-sandbox.js";
+import { spawnSandboxed, sanitizeEnv, type SandboxOptions, DEFAULT_SANDBOX_OPTIONS, NO_SANDBOX_OPTIONS } from "./bash-sandbox.js";
 import { createAuditLogger, type AuditLogger, type ToolAuditEntry } from "./audit-logger.js";
 import { HookExecutor } from "./hooks/executor.js";
 import type { HookContext, ToolInputTransformParams, ToolResponseTransformParams, PostToolUseParams, PreToolUseParams, ToolGuardParams } from "./hooks/events/contracts.js";
@@ -93,6 +93,12 @@ export class ToolRegistry {
     return [...this.tools.keys()];
   }
 
+  isReadOnlyTool(name: string): boolean {
+    const tool = this.tools.get(name);
+    if (!tool) return false;
+    return (tool.sideEffect === "read" || tool.annotations?.readOnlyHint === true) && !tool.annotations?.destructiveHint;
+  }
+
   /** Direct tool invocation for TUI shell mode etc. Same pipeline as model calls. */
   async callTool(
     name: string,
@@ -163,12 +169,13 @@ export class ToolRegistry {
     }
 
     // 2. Policy decision.
-    const policyInput = {
+    const policyInput: PolicyInput = {
       toolName: name,
       arguments: currentArgs,
       cwd: this.workspaceRoot,
       origin,
       sideEffect: tool.sideEffect,
+      annotations: tool.annotations,
     };
     let policy = await this.policy.evaluate(policyInput);
 
@@ -357,6 +364,7 @@ export function createReadTool(root: string): ToolDefinition<{ path: string; off
       required: ["path"],
     },
     sideEffect: "read",
+    annotations: { readOnlyHint: true, idempotentHint: true },
     async execute(args, ctx) {
       let target: string;
       try {
@@ -416,6 +424,7 @@ export function createWriteTool(root: string): ToolDefinition<{ path: string; co
       required: ["path", "content"],
     },
     sideEffect: "write",
+    annotations: { destructiveHint: false, idempotentHint: true },
     async execute(args, ctx) {
       let target: string;
       try {
@@ -467,6 +476,7 @@ export function createEditTool(
       required: ["path", "oldText", "newText"],
     },
     sideEffect: "write",
+    annotations: { destructiveHint: false },
     async execute(args, ctx) {
       let target: string;
       try {
@@ -596,6 +606,7 @@ export function createBashTool(
       required: ["command"],
     },
     sideEffect: "execute",
+    annotations: { destructiveHint: true, openWorldHint: true },
     async execute(args, ctx) {
       const cmd = args.command;
       const t = Math.min(args.timeoutMs ?? defaultTimeoutMs, 600_000);
@@ -639,6 +650,7 @@ export function createBashTool(
               sandboxResult = {
                 process: spawn("bash", ["-c", cmd], {
                   cwd: ctx.workspaceRoot,
+                  env: sanitizeEnv(process.env),
                   stdio: "pipe",
                   detached: process.platform !== "win32",
                   windowsHide: true,
@@ -651,6 +663,7 @@ export function createBashTool(
               sandboxResult = {
                 process: spawn("bash", ["-c", cmd], {
                   cwd: ctx.workspaceRoot,
+                  env: sanitizeEnv(process.env),
                   stdio: "pipe",
                   detached: process.platform !== "win32",
                   windowsHide: true,

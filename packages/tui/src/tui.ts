@@ -755,7 +755,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const m = session.modelInfo();
     const name = session.sessionName() ? `  ·  ${session.sessionName()}` : "";
     transcript.addChild(new Spacer(1));
-    transcript.addChild(new Text(`${theme.bold("kern")}  ${theme.muted(`${m.provider}/${m.modelId}${name} · ${modeLabel()} · ${cwd}`)}`, 0, 0));
+    transcript.addChild(new Text(`${theme.bold("kern v1.0.0")}  ${theme.muted(`${m.provider}/${m.modelId}${name} · ${modeLabel()} · ${cwd}`)}`, 0, 0));
     info("Type a task, or /help for commands.");
     info(HINTS);
     info(theme.muted(QUICK_HELP));

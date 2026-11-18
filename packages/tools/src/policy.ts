@@ -78,33 +78,23 @@ export class DefaultPolicy implements ToolPolicyEngine {
     return this.safetyConfig.mode;
   }
 
-  /** Update permission rules. */
+  /** Update permission rules without clobbering sibling rule lists. */
   updatePermissionRules(rules: {
     denyRules?: string[];
     allowRules?: string[];
     askRules?: string[];
   }): void {
-    if (rules.denyRules) {
-      this.permissionChecker = new PermissionChecker({
-        denyRules: rules.denyRules,
-        allowRules: this.safetyConfig.allowRules,
-        askRules: this.safetyConfig.askRules,
-      });
-    }
-    if (rules.allowRules) {
-      this.permissionChecker = new PermissionChecker({
-        denyRules: this.safetyConfig.denyRules,
-        allowRules: rules.allowRules,
-        askRules: this.safetyConfig.askRules,
-      });
-    }
-    if (rules.askRules) {
-      this.permissionChecker = new PermissionChecker({
-        denyRules: this.safetyConfig.denyRules,
-        allowRules: this.safetyConfig.allowRules,
-        askRules: rules.askRules,
-      });
-    }
+    this.safetyConfig = {
+      ...this.safetyConfig,
+      ...(rules.denyRules !== undefined ? { denyRules: rules.denyRules } : {}),
+      ...(rules.allowRules !== undefined ? { allowRules: rules.allowRules } : {}),
+      ...(rules.askRules !== undefined ? { askRules: rules.askRules } : {}),
+    };
+    this.permissionChecker = new PermissionChecker({
+      denyRules: this.safetyConfig.denyRules,
+      allowRules: this.safetyConfig.allowRules,
+      askRules: this.safetyConfig.askRules,
+    });
   }
 
   async evaluate(input: PolicyInput): Promise<PolicyDecision> {
@@ -192,13 +182,18 @@ export class DefaultPolicy implements ToolPolicyEngine {
       }
     }
 
-    // 7. Write/edit tools in ask mode
+    // 7. Destructive annotation always requires approval in ask mode unless session-allowed
+    if (input.annotations?.destructiveHint && this.config.approvalMode === "ask" && !auto) {
+      return { decision: "require_approval", prompt: `Approve destructive ${name} operation?` };
+    }
+
+    // 8. Write/edit tools in ask mode
     if ((name === "write" || name === "edit") && this.config.approvalMode === "ask" && !auto) {
       return { decision: "require_approval", prompt: `Approve ${name} operation?` };
     }
 
-    // 8. Any non-read tool in ask mode
-    const effect = input.sideEffect ?? (name === "read" ? "read" : "execute");
+    // 9. Any non-read tool in ask mode
+    const effect = input.sideEffect ?? (input.annotations?.readOnlyHint ? "read" : name === "read" ? "read" : "execute");
     if (effect !== "read" && this.config.approvalMode === "ask" && !auto) {
       return { decision: "require_approval", prompt: `Approve ${name} operation?` };
     }
