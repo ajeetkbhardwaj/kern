@@ -1,5 +1,5 @@
 import type { Logger, ModelToolSchema, ChatMessage } from "@kern/protocol";
-import { nullLogger } from "@kern/protocol";
+import { nullLogger, isBranchSummaryEntry } from "@kern/protocol";
 import { SessionManager } from "@kern/session-store";
 import { ToolRegistry } from "@kern/tools";
 import { countContextTokens, type ContextUsage } from "./tokens.js";
@@ -121,11 +121,18 @@ export class ContextBuilder {
     const cutoffIndex = compaction ? active.findIndex((e) => e.id === compaction.replacesThroughId) : -1;
     for (let i = 0; i < active.length; i++) {
       const entry = active[i]!;
-      if (entry.type !== "message") continue;
       if (compaction && isCoveredByCompaction(entry.id, entry.seq, i, compaction.replacesThroughId, cutoffSeq, cutoffIndex)) {
         continue;
       }
-      messages.push(entry.message);
+      if (entry.type === "message") {
+        messages.push(entry.message);
+      } else if (isBranchSummaryEntry(entry)) {
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: `[BRANCH SUMMARY from ${entry.fromId}]\n${entry.summary}` }],
+          timestamp: entry.timestamp,
+        });
+      }
     }
     if (!this.repoContext.likelyFiles && !this.repoContext.projectNotes && !this.repoContext.relevantSymbols) {
       if (taskQuery) {

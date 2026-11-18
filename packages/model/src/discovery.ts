@@ -46,10 +46,13 @@ export interface ProviderConfig {
   whitelist?: string[];
 }
 
+export type FallbackModelRef = string | { provider: string; model: string };
+
 export interface ModelsFile {
   providers?: Record<string, ProviderConfig>;
   defaultProvider?: string;
   defaultModel?: string;
+  fallbackModels?: FallbackModelRef[];
 }
 
 export interface DiscoveredModel {
@@ -325,6 +328,7 @@ export async function loadModelsFile(cwd: string): Promise<ModelsFile> {
     }
     if (parsed.defaultProvider !== undefined) merged.defaultProvider = parsed.defaultProvider;
     if (parsed.defaultModel !== undefined) merged.defaultModel = parsed.defaultModel;
+    if (Array.isArray(parsed.fallbackModels)) merged.fallbackModels = parsed.fallbackModels;
     for (const [name, cfg] of Object.entries(parsed.providers ?? {})) {
       if (path !== modelsFilePaths(cwd)[0] && typeof cfg.apiKey === "string" && cfg.apiKey.trim().startsWith("!")) {
         // Fail-closed: a cloned repo must not execute shell for credentials.
@@ -570,4 +574,111 @@ export async function createModelRuntime(
   }
 
   throw new KernError("E_MODEL_REQUEST", "No model selected. Provide --provider/--model or a baseUrl + model.");
+}
+
+function parseFallbackRef(ref: FallbackModelRef, defaultProvider?: string): { provider: string; model: string } | null {
+  if (typeof ref === "string") {
+    const trimmed = ref.trim();
+    if (!trimmed) return null;
+    if (trimmed.includes("/")) {
+      const [p, ...rest] = trimmed.split("/");
+      const model = rest.join("/");
+      return p && model ? { provider: p, model } : null;
+    }
+    return defaultProvider ? { provider: defaultProvider, model: trimmed } : null;
+  }
+  if (ref && typeof ref.provider === "string" && typeof ref.model === "string" && ref.provider && ref.model) {
+    return { provider: ref.provider, model: ref.model };
+  }
+  return null;
+}
+
+/**
+ * Resolve configured fallback adapters from `models.json` (`fallbackModels`),
+ * skipping the active primary model and ignoring unresolvable entries safely.
+ */
+export async function resolveFallbackAdapters(
+  file: ModelsFile,
+  primary: { provider?: string; model?: string; fallbacks?: FallbackModelRef[] },
+  logger: Logger = nullLogger,
+): Promise<ModelAdapter[]> {
+  const refs = primary.fallbacks ?? file.fallbackModels ?? [];
+  if (refs.length === 0) return [];
+  const adapters: ModelAdapter[] = [];
+  const seen = new Set<string>();
+  if (primary.provider && primary.model) {
+    seen.add(`${primary.provider}/${primary.model}`);
+  }
+  for (const ref of refs) {
+    const parsed = parseFallbackRef(ref, primary.provider ?? file.defaultProvider);
+    if (!parsed) continue;
+    const key = `${parsed.provider}/${parsed.model}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      adapters.push(await createAdapterFor(file, parsed.provider, parsed.model, {}, logger));
+    } catch (error) {
+      logger.warn("fallback_model_unavailable", {
+        provider: parsed.provider,
+        model: parsed.model,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return adapters;
+}
+
+/**
+ * Standalone adapter wrapper that fails over across an ordered list of adapters
+ * when a provider call fails before completing.
+ */
+export function createFallbackModelAdapter(
+  adapters: ModelAdapter[],
+  onFallback?: (info: {
+    fromProvider: string;
+    fromModel: string;
+    toProvider: string;
+    toModel: string;
+    reason: string;
+  }) => void,
+): ModelAdapter {
+  if (adapters.length === 0) {
+    throw new KernError("E_MODEL_REQUEST", "createFallbackModelAdapter requires at least one adapter");
+  }
+  const primary = adapters[0]!;
+  return {
+    info: primary.info,
+    async *stream(request) {
+      let lastError: unknown;
+      for (let i = 0; i < adapters.length; i++) {
+        const current = adapters[i]!;
+        let emittedDelta = false;
+        try {
+          for await (const ev of current.stream(request)) {
+            if (ev.type === "text_delta" || ev.type === "reasoning_delta" || ev.type === "tool_call_delta" || ev.type === "tool_call_complete") {
+              emittedDelta = true;
+            }
+            yield ev;
+          }
+          return;
+        } catch (error) {
+          lastError = error;
+          const isLast = i === adapters.length - 1;
+          const isCancelled = error instanceof KernError && error.kind === "cancelled";
+          if (isLast || isCancelled || emittedDelta) {
+            throw error;
+          }
+          const next = adapters[i + 1]!;
+          onFallback?.({
+            fromProvider: current.info.provider,
+            fromModel: current.info.modelId,
+            toProvider: next.info.provider,
+            toModel: next.info.modelId,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      throw lastError;
+    },
+  };
 }

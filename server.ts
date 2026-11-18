@@ -9,6 +9,7 @@ import {
   createOpenAIAdapter,
   discoverModels,
   loadModelsFile,
+  resolveFallbackAdapters,
   type ModelsFile,
 } from "./packages/model/src/index.js";
 
@@ -101,6 +102,7 @@ async function initSession(): Promise<void> {
   }
 
   let adapter = undefined;
+  let fallbackModels: Awaited<ReturnType<typeof resolveFallbackAdapters>> = [];
   try {
     if (providerName && model) {
       adapter = await createModelRuntime(
@@ -108,12 +110,14 @@ async function initSession(): Promise<void> {
         { provider: providerName, model, baseUrl, apiKey },
         logger,
       );
+      fallbackModels = await resolveFallbackAdapters(cachedModelsFile, { provider: providerName, model }, logger);
     } else if (baseUrl && model) {
       adapter = await createModelRuntime(
         cachedModelsFile,
         { model, baseUrl, apiKey },
         logger,
       );
+      fallbackModels = await resolveFallbackAdapters(cachedModelsFile, { provider: providerName, model }, logger);
     }
   } catch (err) {
     logger.warn("initial_model_runtime_skipped", {
@@ -126,6 +130,7 @@ async function initSession(): Promise<void> {
     logger,
     requestApproval: (prompt: string, meta?: { toolName?: string }) => requestWebApproval(prompt, meta),
     ...(adapter ? { model: adapter } : {}),
+    ...(fallbackModels.length > 0 ? { fallbackModels } : {}),
   });
   activeSession = created.session;
   activeManager = created.manager;
@@ -470,7 +475,7 @@ const INDEX_HTML = `<!doctype html>
         </div>
       </div>
       <form class="composer" id="prompt-form">
-        <textarea id="prompt-input" placeholder="Send a prompt, or run a command: /help, /tools, /tool git_status {}, /tool read {&quot;path&quot;:&quot;README.md&quot;}"></textarea>
+        <textarea id="prompt-input" placeholder="Send a prompt, or run a command: /help, /tools, /tool git-status {}, /tool read {&quot;path&quot;:&quot;README.md&quot;}"></textarea>
         <button class="primary" type="submit" id="btn-send">Send</button>
       </form>
     </section>
@@ -863,11 +868,24 @@ const INDEX_HTML = `<!doctype html>
         case "tool_execution_start":
           addEntry("tool", "tool start: " + ev.toolName, JSON.stringify(ev.arguments ?? {}, null, 2));
           break;
+        case "tool_input_repaired":
+          addEntry("system", "arg repair (" + ev.toolName + ")", ev.repairs.join(", "));
+          break;
         case "tool_execution_end": {
           const out = (ev.result?.content || []).map((c) => c.text).join("\\n");
           addEntry(ev.isError ? "error" : "tool", "tool end: " + ev.toolName, out || "(done)");
           break;
         }
+        case "model_fallback":
+          addEntry("system", "model fallback", ev.fromProvider + "/" + ev.fromModel + " -> " + ev.toProvider + "/" + ev.toModel + ": " + ev.reason);
+          refreshSession();
+          break;
+        case "budget_warning":
+          addEntry("system", "budget warning (" + ev.kind + ")", ev.message);
+          break;
+        case "budget_exceeded":
+          addEntry("error", "budget exceeded (" + ev.kind + ")", ev.message);
+          break;
         case "agent_error":
           addEntry("error", "agent_error (" + ev.error.code + ")", ev.error.message);
           streamingEl = null;

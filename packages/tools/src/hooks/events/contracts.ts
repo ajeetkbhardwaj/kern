@@ -17,12 +17,17 @@ export type HookHandler<Params extends unknown[] = unknown[]> = (
   ...params: Params
 ) => HookVerdict | Promise<HookVerdict>;
 
+/** Transform hook handler signature returning replacement `[ctx, params]` tuple (or void/unchanged). */
+export type TransformHookHandler<Params extends unknown[] = unknown[]> = (
+  ...params: Params
+) => Params | void | Promise<Params | void>;
+
 /** Hook registration. Scope by tool-name patterns via `matcher`. */
 export interface HookRegistration {
   /** Event name this hook listens to. */
   event: string;
   /** Handler function. */
-  handler: HookHandler;
+  handler: HookHandler | TransformHookHandler;
   /** Optional glob-like matcher for tool names (e.g. "shell*", "bash"). */
   matcher?: string;
   /** Priority (lower runs first). Defaults to 0. */
@@ -70,7 +75,7 @@ export interface ToolInputTransformParams {
 export type ToolInputTransformHandler = (
   ctx: HookContext,
   params: ToolInputTransformParams,
-) => HookVerdict | Promise<HookVerdict>;
+) => [HookContext, ToolInputTransformParams] | Promise<[HookContext, ToolInputTransformParams]>;
 
 /** pre_tool_use - Sequential; can block; rewrites tool input. */
 export interface PreToolUseParams {
@@ -143,7 +148,7 @@ export interface ToolResponseTransformParams {
 export type ToolResponseTransformHandler = (
   ctx: HookContext,
   params: ToolResponseTransformParams,
-) => ToolResult | Promise<ToolResult>;
+) => [HookContext, ToolResponseTransformParams] | Promise<[HookContext, ToolResponseTransformParams]>;
 
 // =============================================================================
 // Conversation/Session Events

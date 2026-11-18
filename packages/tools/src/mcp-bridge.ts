@@ -103,7 +103,7 @@ async function mcpStdioCall(command: string, tool: string, args: unknown, timeou
     await client.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "kern", version: "0.0.1" },
+      clientInfo: { name: "kern", version: "1.0.0" },
     }, Math.min(timeoutMs, 15_000));
     client.notify("notifications/initialized", {});
     return await client.request("tools/call", { name: tool, arguments: args ?? {} }, timeoutMs) as { content?: unknown; isError?: unknown };
@@ -119,7 +119,7 @@ export async function listMcpStdioTools(command: string, timeoutMs = 30_000): Pr
     await client.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "kern", version: "0.0.1" },
+      clientInfo: { name: "kern", version: "1.0.0" },
     }, timeoutMs);
     client.notify("notifications/initialized", {});
     const result = await client.request("tools/list", {}, timeoutMs) as { tools?: McpToolSchema[] };
@@ -363,6 +363,7 @@ export async function discoverMcpFileTools(cwd: string, opts: { timeoutMs?: numb
       required: [],
     },
     sideEffect: "read",
+    annotations: { readOnlyHint: true, openWorldHint: true },
     async execute(args) {
       const q = (args.query ?? "").toLowerCase();
       const kind = (args.kind ?? "all").toLowerCase();
@@ -413,6 +414,7 @@ export async function discoverMcpFileTools(cwd: string, opts: { timeoutMs?: numb
       required: ["server", "kind", "uri"],
     },
     sideEffect: "read",
+    annotations: { readOnlyHint: true, openWorldHint: true },
     async execute(args, ctx) {
       const def = findDef(args.server);
       if (!def) return textResult(`Unknown MCP server: ${args.server} (known: ${serverNames()})`, true, { code: "E_TOOL_UNKNOWN" });
@@ -443,6 +445,7 @@ export async function discoverMcpFileTools(cwd: string, opts: { timeoutMs?: numb
       required: ["server", "tool"],
     },
     sideEffect: "read",
+    annotations: { readOnlyHint: true, openWorldHint: true },
     async execute(args, ctx) {
       const def = findDef(args.server);
       if (!def) return textResult(`Unknown MCP server: ${args.server} (known: ${serverNames()})`, true, { code: "E_TOOL_UNKNOWN" });
@@ -475,6 +478,7 @@ export async function discoverMcpFileTools(cwd: string, opts: { timeoutMs?: numb
       required: ["server", "tool"],
     },
     sideEffect: "execute",
+    annotations: { openWorldHint: true },
     async execute(args, ctx) {
       const def = findDef(args.server);
       if (!def) return textResult(`Unknown MCP server: ${args.server} (known: ${serverNames()})`, true, { code: "E_TOOL_UNKNOWN" });

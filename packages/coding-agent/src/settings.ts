@@ -3,10 +3,18 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BudgetLimits } from "@kern/agent-core";
 import type { ThinkingLevel } from "@kern/protocol";
-import type { PolicyConfig } from "@kern/tools";
+import type { PolicyConfig, SafetyMode } from "@kern/tools";
+
+export interface PermissionRulesSettings {
+  denyRules?: string[];
+  allowRules?: string[];
+  askRules?: string[];
+}
 
 export interface SessionSettings {
   policy?: Partial<PolicyConfig>;
+  safetyMode?: SafetyMode;
+  permissionRules?: PermissionRulesSettings;
   budgets?: Partial<BudgetLimits>;
   thinkingLevel?: ThinkingLevel;
 }
@@ -24,7 +32,7 @@ export class SettingsManager {
       const text = await readFile(join(cwd, ".kern", "settings.json"), "utf8");
       const parsed = JSON.parse(text) as Partial<SessionSettings>;
       // Fail-closed: a cloned repo must not loosen safety. Project file may
-      // only set thinkingLevel and tighten budgets — never policy.
+      // only set thinkingLevel, tighten budgets, or add denyRules — never safetyMode/allowRules/policy.
       if (parsed.thinkingLevel) merged.thinkingLevel = parsed.thinkingLevel;
       if (parsed.budgets) {
         merged.budgets = { ...(merged.budgets ?? {}) };
@@ -33,6 +41,15 @@ export class SettingsManager {
           if (typeof v === "number" && Number.isFinite(v) && v > 0 && (typeof cur !== "number" || v < cur)) {
             (merged.budgets as Record<string, unknown>)[k] = v;
           }
+        }
+      }
+      if (parsed.permissionRules?.denyRules && Array.isArray(parsed.permissionRules.denyRules)) {
+        const extraDeny = parsed.permissionRules.denyRules.filter((r): r is string => typeof r === "string");
+        if (extraDeny.length > 0) {
+          merged.permissionRules = {
+            ...(merged.permissionRules ?? {}),
+            denyRules: [...new Set([...(merged.permissionRules?.denyRules ?? []), ...extraDeny])],
+          };
         }
       }
     } catch {

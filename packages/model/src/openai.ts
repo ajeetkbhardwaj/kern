@@ -44,8 +44,9 @@ interface SSEChoice {
   delta?: {
     content?: string | null;
     reasoning_content?: string | null;
+    reasoning?: string | null;
     tool_calls?: Array<{
-      index: number;
+      index?: number;
       id?: string;
       function?: { name?: string; arguments?: string };
     }>;
@@ -55,12 +56,16 @@ interface SSEChoice {
 
 interface SSEChunk {
   choices?: SSEChoice[];
+  error?: { message?: string; code?: number | string; type?: string };
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
     prompt_cache_hit_tokens?: number;
     prompt_cache_miss_tokens?: number;
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
   };
 }
 
@@ -131,6 +136,10 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions): ModelAdapter
           } catch {
             continue; // blank / keepalive / non-JSON frame
           }
+          if (chunk.error?.message) {
+            const errCode = typeof chunk.error.code === "number" ? chunk.error.code : undefined;
+            throw toKernError(new Error(chunk.error.message), errCode, options);
+          }
           if (chunk.usage) {
             yield { type: "usage", usage: toTokenCounts(chunk.usage) };
           }
@@ -140,19 +149,20 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions): ModelAdapter
           if (typeof delta?.content === "string" && delta.content.length > 0) {
             yield { type: "text_delta", delta: delta.content };
           }
-          const reasoning = delta?.reasoning_content;
+          const reasoning = delta?.reasoning_content ?? delta?.reasoning;
           if (typeof reasoning === "string" && reasoning.length > 0) {
             yield { type: "reasoning_delta", delta: reasoning };
           }
           for (const tc of delta?.tool_calls ?? []) {
-            const slot = pending.get(tc.index) ?? { id: "", name: "", args: "" };
+            const idx = typeof tc.index === "number" ? tc.index : 0;
+            const slot = pending.get(idx) ?? { id: "", name: "", args: "" };
             if (tc.id) slot.id = tc.id;
             if (tc.function?.name) slot.name = tc.function.name;
             if (typeof tc.function?.arguments === "string") {
               slot.args += tc.function.arguments;
-              yield { type: "tool_call_delta", callId: slot.id || `idx:${tc.index}`, delta: tc.function.arguments };
+              yield { type: "tool_call_delta", callId: slot.id || `idx:${idx}`, delta: tc.function.arguments };
             }
-            pending.set(tc.index, slot);
+            pending.set(idx, slot);
           }
           if (choice.finish_reason) finishReason = choice.finish_reason;
         }
@@ -222,7 +232,10 @@ function toOpenAIMessages(message: ChatMessage): Array<Record<string, unknown>> 
       });
     }
   }
-  const out: Record<string, unknown> = { role: message.role, content: texts.join("\n") };
+  const out: Record<string, unknown> = {
+    role: message.role,
+    content: texts.length > 0 ? texts.join("\n") : (message.role === "assistant" && toolCalls.length > 0 ? null : ""),
+  };
   if (toolCalls.length > 0) out["tool_calls"] = toolCalls;
   return [out];
 }
@@ -247,7 +260,8 @@ function toTokenCounts(usage: NonNullable<SSEChunk["usage"]>): TokenCounts {
   const input = usage.prompt_tokens ?? (usage.total_tokens !== undefined && usage.completion_tokens === undefined ? usage.total_tokens : 0);
   const output = usage.completion_tokens ?? 0;
   const counts: TokenCounts = { input, output };
-  if (usage.prompt_cache_hit_tokens !== undefined) counts.cacheRead = usage.prompt_cache_hit_tokens;
+  const cached = usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens;
+  if (cached !== undefined) counts.cacheRead = cached;
   if (usage.prompt_cache_miss_tokens !== undefined) counts.cacheWrite = usage.prompt_cache_miss_tokens;
   return counts;
 }
@@ -277,10 +291,10 @@ async function* sseEvents(body: ReadableStream<Uint8Array>): AsyncIterable<strin
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
+      const parts = buffer.split(/\r?\n\r?\n/);
       buffer = parts.pop() ?? "";
       for (const part of parts) {
-        for (const line of part.split("\n")) {
+        for (const line of part.split(/\r?\n/)) {
           const text = line.trim();
           if (text.startsWith("data:")) {
             const payload = text.slice(5).trim();

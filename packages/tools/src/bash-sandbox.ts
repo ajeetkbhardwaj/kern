@@ -104,33 +104,32 @@ function buildUnsharePrefix(options: SandboxOptions): string[] {
 }
 
 /**
- * Build resource limit commands using prlimit (Linux) or ulimit (fallback)
+ * Build resource limit flags for a single `prlimit` wrapper invocation (Linux).
  */
-function buildResourceLimits(options: SandboxOptions): string[] {
-  const limits: string[] = [];
-  if (platform() === "linux") {
-    if (options.maxCpuTimeMs !== undefined) {
-      const cpuSeconds = Math.ceil(options.maxCpuTimeMs / 1000);
-      limits.push(`prlimit --cpu=${cpuSeconds}:${cpuSeconds}`);
-    }
-    if (options.maxMemoryBytes !== undefined) {
-      limits.push(`prlimit --as=${options.maxMemoryBytes}:${options.maxMemoryBytes}`);
-    }
-    if (options.maxProcesses !== undefined) {
-      limits.push(`prlimit --nproc=${options.maxProcesses}:${options.maxProcesses}`);
-    }
-    if (options.maxFileSizeBytes !== undefined) {
-      limits.push(`prlimit --fsize=${options.maxFileSizeBytes}:${options.maxFileSizeBytes}`);
-    }
-    if (options.maxOpenFiles !== undefined) {
-      limits.push(`prlimit --nofile=${options.maxOpenFiles}:${options.maxOpenFiles}`);
-    }
+function buildPrlimitArgs(options: SandboxOptions): string[] {
+  if (platform() !== "linux") return [];
+  const args: string[] = [];
+  if (options.maxCpuTimeMs !== undefined) {
+    const cpuSeconds = Math.max(1, Math.ceil(options.maxCpuTimeMs / 1000));
+    args.push(`--cpu=${cpuSeconds}:${cpuSeconds}`);
   }
-  return limits;
+  if (options.maxMemoryBytes !== undefined) {
+    args.push(`--as=${options.maxMemoryBytes}:${options.maxMemoryBytes}`);
+  }
+  if (options.maxProcesses !== undefined) {
+    args.push(`--nproc=${options.maxProcesses}:${options.maxProcesses}`);
+  }
+  if (options.maxFileSizeBytes !== undefined) {
+    args.push(`--fsize=${options.maxFileSizeBytes}:${options.maxFileSizeBytes}`);
+  }
+  if (options.maxOpenFiles !== undefined) {
+    args.push(`--nofile=${options.maxOpenFiles}:${options.maxOpenFiles}`);
+  }
+  return args;
 }
 
 /**
- * Spawn a command with sandboxing applied.
+ * Spawn a command with sandboxing applied using explicit argv wrapping (no unescaped string joining).
  * Returns a ChildProcess with resource limits and optional namespace isolation.
  */
 export async function spawnSandboxed(
@@ -163,13 +162,23 @@ export async function spawnSandboxed(
   };
 
   const unsharePrefix = buildUnsharePrefix(sandboxOpts);
-  const resourceLimits = buildResourceLimits(sandboxOpts);
+  const prlimitFlags = buildPrlimitArgs(sandboxOpts);
 
-  // Build the full command
-  const fullCommand = [...unsharePrefix, ...resourceLimits, command, ...args].join(" ");
+  let execBin = command;
+  let execArgs = [...args];
 
-  // Spawn through bash for proper shell expansion
-  const child = spawn("bash", ["-c", fullCommand], {
+  if (prlimitFlags.length > 0) {
+    execArgs = [...prlimitFlags, "--", execBin, ...execArgs];
+    execBin = "prlimit";
+  }
+
+  if (unsharePrefix.length > 0) {
+    const [unshareBin, ...unshareFlags] = unsharePrefix;
+    execArgs = [...unshareFlags, execBin, ...execArgs];
+    execBin = unshareBin!;
+  }
+
+  const child = spawn(execBin, execArgs, {
     ...spawnOptions,
     cwd: workdir ?? spawnOptions.cwd ?? process.cwd(),
     env: sanitizeEnv({ ...process.env, ...env, ...(spawnOptions as SpawnOptionsWithEnv).env }),
@@ -199,7 +208,7 @@ export async function spawnSandboxed(
   return {
     process: child,
     cleanup,
-    active: unsharePrefix.length > 0 || resourceLimits.length > 0,
+    active: unsharePrefix.length > 0 || prlimitFlags.length > 0,
   };
 }
 

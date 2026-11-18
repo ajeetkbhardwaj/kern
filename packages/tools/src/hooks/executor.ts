@@ -7,6 +7,7 @@
 
 import type {
   HookHandler,
+  TransformHookHandler,
   HookPipelineResult,
   HookRegistration,
   TransformResult,
@@ -59,9 +60,9 @@ export class HookExecutor {
     let transformed = false;
 
     for (const hook of hooks) {
-      const handler = hook.handler as HookHandler;
+      const handler = hook.handler as TransformHookHandler;
       try {
-        const result = (await handler(...currentParams)) as unknown as unknown[];
+        const result = await handler(...currentParams);
         if (Array.isArray(result) && result.length > 0) {
           currentParams = result;
           transformed = true;

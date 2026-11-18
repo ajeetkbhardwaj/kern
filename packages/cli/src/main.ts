@@ -1,11 +1,11 @@
 import { createAgentSession } from "@kern/coding-agent";
 import { createLogger } from "@kern/protocol";
-import { discoverModels, loadModelsFile, createModelRuntime } from "@kern/model";
+import { discoverModels, loadModelsFile, createModelRuntime, resolveFallbackAdapters } from "@kern/model";
 import { createInterface } from "node:readline";
 
 export const KERN_VERSION = "1.0.0";
 
-const READ_ONLY_TOOLS = ["read", "grep", "find", "cat", "head", "tail", "git-status", "git-diff", "git-log", "which"];
+const READ_ONLY_TOOLS = ["read", "grep", "find", "git-status", "git-diff", "git-log"];
 
 export interface CliFlags {
   prompt: string;
@@ -178,7 +178,7 @@ function buildBudgets(flags: CliFlags) {
 
 function printHelp(): void {
   process.stdout.write(
-    `kern v${KERN_VERSION} — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n\nFlags:\n  --read-only                   Only allow read-only tools (read, grep, find, cat, head, tail, git-status/diff/log, which)\n  --max-cost N                  Cap session cost in USD\n  --max-input-tokens N          Cap input tokens for the session\n  --max-output-tokens N         Cap output tokens for the session\n  --max-total-tokens N          Cap total tokens for the session\n  --max-turns N                 Cap model turns per user run\n  --max-wall-time-ms N          Cap wall-clock duration (ms) per user run\n  --max-tool-calls-per-turn N   Cap tool calls in a single turn\n  --max-total-tool-calls N      Cap total tool calls in a user run\n  --cwd DIR                     Workspace root (default: cwd)\n  --no-resources                Skip AGENTS.md / skill discovery\n  --no-compaction               Disable automatic compaction\n  --resume                      Resume the most recent session\n  --session ID|PATH             Resume a specific session by ID or JSONL file path\n  --interactive, -i             Start interactive TUI\n  --print                       Force single-prompt print mode (no TUI)\n  --json                        Emit NDJSON agent events in non-interactive mode (implies --print)\n  --list-models                 List available models (configured + live) and exit\n  --provider NAME               Provider from models.json (or KERN_PROVIDER)\n  --model ID                    Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL                Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY                 Override API key (or KERN_API_KEY)\n  --safety MODE                 Safety mode: strict, balanced, restricted, autonomous (default: balanced)\n  --rpc                         JSON-RPC mode (stdin/stdout)\n  --validate-config             Validate config files and exit\n  --config PATH                 Config file path (default: ~/.kern/models.json)\n  --version, -v                 Show version and exit\n  --help, -h                    This message\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
+    `kern v${KERN_VERSION} — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n\nFlags:\n  --read-only                   Only allow read-only tools (read, grep, find, git-status/diff/log)\n  --max-cost N                  Cap session cost in USD\n  --max-input-tokens N          Cap input tokens for the session\n  --max-output-tokens N         Cap output tokens for the session\n  --max-total-tokens N          Cap total tokens for the session\n  --max-turns N                 Cap model turns per user run\n  --max-wall-time-ms N          Cap wall-clock duration (ms) per user run\n  --max-tool-calls-per-turn N   Cap tool calls in a single turn\n  --max-total-tool-calls N      Cap total tool calls in a user run\n  --cwd DIR                     Workspace root (default: cwd)\n  --no-resources                Skip AGENTS.md / skill discovery\n  --no-compaction               Disable automatic compaction\n  --resume                      Resume the most recent session\n  --session ID|PATH             Resume a specific session by ID or JSONL file path\n  --interactive, -i             Start interactive TUI\n  --print                       Force single-prompt print mode (no TUI)\n  --json                        Emit NDJSON agent events in non-interactive mode (implies --print)\n  --list-models                 List available models (configured + live) and exit\n  --provider NAME               Provider from models.json (or KERN_PROVIDER)\n  --model ID                    Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL                Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY                 Override API key (or KERN_API_KEY)\n  --safety MODE                 Safety mode: strict, balanced, restricted, autonomous (default: balanced)\n  --rpc                         JSON-RPC mode (stdin/stdout)\n  --validate-config             Validate config files and exit\n  --config PATH                 Config file path (default: ~/.kern/models.json)\n  --version, -v                 Show version and exit\n  --help, -h                    This message\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
   );
 }
 
@@ -286,10 +286,13 @@ async function runRpcMode(
   model ??= file.defaultModel;
 
   let adapter = undefined;
+  let fallbackModels: Awaited<ReturnType<typeof resolveFallbackAdapters>> = [];
   if (providerName && model) {
     adapter = await createModelRuntime(file, { provider: providerName, model, baseUrl, apiKey }, logger);
+    fallbackModels = await resolveFallbackAdapters(file, { provider: providerName, model }, logger);
   } else if (baseUrl && model) {
     adapter = await createModelRuntime(file, { model, baseUrl, apiKey }, logger);
+    fallbackModels = await resolveFallbackAdapters(file, { provider: providerName, model }, logger);
   }
 
   const budgets = buildBudgets(flags);
@@ -304,6 +307,7 @@ async function runRpcMode(
     ...(Object.keys(budgets).length > 0 ? { budgets } : {}),
     ...(flags.safetyMode ? { safetyMode: flags.safetyMode } : {}),
     ...(adapter ? { model: adapter } : {}),
+    ...(fallbackModels.length > 0 ? { fallbackModels } : {}),
     ...(await loadMcpExtraTools(flags.cwd, logger)),
   };
 
@@ -434,11 +438,14 @@ export async function main() {
   }
   model ??= file.defaultModel;
   let adapter = undefined;
+  let fallbackModels: Awaited<ReturnType<typeof resolveFallbackAdapters>> = [];
   if (providerName && model) {
     adapter = await createModelRuntime(file, { provider: providerName, model, baseUrl, apiKey }, logger);
+    fallbackModels = await resolveFallbackAdapters(file, { provider: providerName, model }, logger);
     process.stderr.write(`[model ${providerName}/${model}]\n`);
   } else if (baseUrl && model) {
     adapter = await createModelRuntime(file, { model, baseUrl, apiKey }, logger);
+    fallbackModels = await resolveFallbackAdapters(file, { provider: providerName, model }, logger);
     process.stderr.write(`[model ${providerName ?? "custom"}/${model} @ ${baseUrl}]\n`);
   }
   const budgets = buildBudgets(flags);
@@ -454,6 +461,7 @@ export async function main() {
     ...(flags.safetyMode ? { safetyMode: flags.safetyMode } : {}),
     requestApproval: (prompt: string, meta?: { toolName: string }) => (approvalHook.current ? approvalHook.current(prompt, meta) : askApproval(prompt)),
     ...(adapter ? { model: adapter } : {}),
+    ...(fallbackModels.length > 0 ? { fallbackModels } : {}),
     ...await loadMcpExtraTools(flags.cwd, logger),
   };
   const startSession = () => createAgentSession({ ...sessionOptions });
@@ -496,8 +504,20 @@ export async function main() {
       case "tool_execution_start":
         process.stderr.write(`[tool ${ev.toolName}]\n`);
         break;
+      case "tool_input_repaired":
+        process.stderr.write(`[tool ${ev.toolName} args repaired: ${ev.repairs.join(", ")}]\n`);
+        break;
       case "tool_execution_end":
         if (ev.isError) process.stderr.write(`[tool ${ev.toolName} failed]\n`);
+        break;
+      case "model_fallback":
+        process.stderr.write(`[fallback ${ev.fromProvider}/${ev.fromModel} -> ${ev.toProvider}/${ev.toModel}: ${ev.reason}]\n`);
+        break;
+      case "budget_warning":
+        process.stderr.write(`[budget warning (${ev.kind}): ${ev.message}]\n`);
+        break;
+      case "budget_exceeded":
+        process.stderr.write(`[budget exceeded (${ev.kind}): ${ev.message}]\n`);
         break;
       case "auto_compaction_start":
         process.stderr.write(`[compacting (${ev.phase})…]\n`);

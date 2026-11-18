@@ -9,30 +9,17 @@ import {
   createGitStatusTool,
   createGitDiffTool,
   createGitLogTool,
-  createGitCheckoutTool,
-  createMkdirTool,
-  createRmTool,
-  createCatTool,
-  createHeadTool,
-  createTailTool,
   createGrepTool,
   createFindTool,
-  createWhichTool,
-  createCalculateTool,
-  createTimeTool,
-  createTypeCheckTool,
-  createTestTool,
-  createServeTool,
-  createFormatTool,
-  createMemoryTool,
-  createModelPickerTool,
-  createPlanTool,
   createTodoTool,
-  createThinkTool,
-  createUserPromptTool,
   DefaultPolicy,
   DEFAULT_POLICY_CONFIG,
   DEFAULT_SAFETY_POLICY_CONFIG,
+  HookRegistry,
+  HookExecutor,
+  getDefaultSessionHooks,
+  registerDefaultBuiltinHandlers,
+  loadDefaultHookConfigs,
   type PolicyConfig,
 } from "@kern/tools";
 import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition, type CostSnapshot } from "@kern/protocol";
@@ -41,9 +28,7 @@ import { RepoIndex } from "@kern/repo-index";
 import { SymbolStore } from "@kern/symbol-store";
 import { SemanticSearch } from "@kern/semantic-search";
 import { ProjectMemory, ProjectMemoryStore } from "@kern/project-memory";
-import { readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { SettingsManager } from "./settings.js";
+import { SettingsManager, type PermissionRulesSettings } from "./settings.js";
 
 export interface CreateAgentSessionOptions {
   cwd: string;
@@ -53,6 +38,8 @@ export interface CreateAgentSessionOptions {
   policy?: Partial<PolicyConfig>;
   /** Safety mode: "strict" | "balanced" | "restricted" | "autonomous". Default "balanced". */
   safetyMode?: "strict" | "balanced" | "restricted" | "autonomous";
+  /** Declarative bash permission rules (deny → allow → ask). */
+  permissionRules?: PermissionRulesSettings;
   /** Resource budgets. Conservative defaults apply when omitted. */
   budgets?: Partial<BudgetLimits>;
   /** Approval callback for write/exec/destructive ops. Absent = deny. */
@@ -63,6 +50,8 @@ export interface CreateAgentSessionOptions {
   enableCompaction?: boolean;
   /** Inject a real model adapter. Defaults to a no-op fake (final response). */
   model?: ModelAdapter;
+  /** Ordered fallback adapters to use if the primary model fails on a turn. */
+  fallbackModels?: ModelAdapter[];
   /** Opt-in extra tools (e.g. MCP bridge). Registered after built-ins; name collisions are refused. */
   extraTools?: ToolDefinition[];
   /** Default reasoning mode for the active model. */
@@ -131,9 +120,19 @@ export async function createAgentSession(
 ): Promise<{ session: AgentSession; manager: SessionManager }> {
 
   const settings = await SettingsManager.load(options.cwd);
+  const effectivePermissionRules: PermissionRulesSettings | undefined =
+    settings.permissionRules || options.permissionRules
+      ? {
+          denyRules: [...new Set([...(settings.permissionRules?.denyRules ?? []), ...(options.permissionRules?.denyRules ?? [])])],
+          allowRules: [...new Set([...(settings.permissionRules?.allowRules ?? []), ...(options.permissionRules?.allowRules ?? [])])],
+          askRules: [...new Set([...(settings.permissionRules?.askRules ?? []), ...(options.permissionRules?.askRules ?? [])])],
+        }
+      : undefined;
   const effectiveProps: CreateAgentSessionOptions = {
     ...options,
     policy: { ...(settings.policy ?? {}), ...(options.policy ?? {}) },
+    safetyMode: options.safetyMode ?? settings.safetyMode,
+    permissionRules: effectivePermissionRules,
     budgets: { ...(settings.budgets ?? {}), ...(options.budgets ?? {}) },
     thinkingLevel: options.thinkingLevel ?? settings.thinkingLevel ?? "medium",
   };
@@ -165,11 +164,25 @@ async function buildSessionWithRuntime(
 ): Promise<{ session: AgentSession; manager: SessionManager }> {
   const policyConfig = { ...DEFAULT_POLICY_CONFIG, ...(options.policy ?? {}) };
   const policy = new DefaultPolicy(policyConfig, { ...DEFAULT_SAFETY_POLICY_CONFIG, mode: options.safetyMode ?? "balanced" });
+  if (options.permissionRules) {
+    policy.extendPermissionRules(options.permissionRules);
+  }
+  const hookRegistry = new HookRegistry();
+  registerDefaultBuiltinHandlers();
+  for (const reg of getDefaultSessionHooks()) {
+    hookRegistry.register(reg);
+  }
+  await loadDefaultHookConfigs(hookRegistry, options.cwd).catch((error) => {
+    logger.warn("hook_config_load_failed", { error: error instanceof Error ? error.message : String(error) });
+  });
+  const hookExecutor = new HookExecutor(hookRegistry);
   const tools = new ToolRegistry({
     workspaceRoot: options.cwd,
     policy,
     maxToolMs: 120_000,
     requestApproval: options.requestApproval,
+    sessionId: manager.sessionId ?? undefined,
+    hookExecutor,
   });
   tools.register(createReadTool(options.cwd));
   tools.register(createWriteTool(options.cwd));
@@ -178,27 +191,9 @@ async function buildSessionWithRuntime(
   tools.register(createGitStatusTool(options.cwd));
   tools.register(createGitDiffTool(options.cwd));
   tools.register(createGitLogTool(options.cwd));
-  tools.register(createGitCheckoutTool(options.cwd));
-  tools.register(createMkdirTool(options.cwd));
-  tools.register(createRmTool(options.cwd));
-  tools.register(createCatTool(options.cwd));
-  tools.register(createHeadTool(options.cwd));
-  tools.register(createTailTool(options.cwd));
   tools.register(createGrepTool(options.cwd));
   tools.register(createFindTool(options.cwd));
-  tools.register(createWhichTool(options.cwd));
-  tools.register(createCalculateTool(options.cwd));
-  tools.register(createTimeTool(options.cwd));
-  tools.register(createTypeCheckTool(options.cwd));
-  tools.register(createTestTool(options.cwd));
-  tools.register(createServeTool(options.cwd));
-  tools.register(createFormatTool(options.cwd));
-  tools.register(createMemoryTool(options.cwd));
-  tools.register(createModelPickerTool(options.cwd));
-  tools.register(createPlanTool(options.cwd));
   tools.register(createTodoTool(options.cwd));
-  tools.register(createThinkTool(options.cwd));
-  tools.register(createUserPromptTool(options.cwd));
   for (const extra of options.extraTools ?? []) {
     if (tools.has(extra.name)) {
       logger.warn("extra_tool_name_collision", { name: extra.name });
@@ -259,6 +254,7 @@ async function buildSessionWithRuntime(
   const model = options.model ?? createFakeModel();
   const runtime = new AgentRuntime({
     model,
+    fallbackModels: options.fallbackModels,
     tools,
     sessions: manager,
     contextBuilder,
@@ -267,6 +263,7 @@ async function buildSessionWithRuntime(
     budgets: options.budgets,
     compactor: options.enableCompaction === false ? null : new Compactor({ logger }),
     defaultThinkingLevel: options.thinkingLevel ?? "medium",
+    hookExecutor,
     requestApproval: options.requestApproval,
   });
 
@@ -314,14 +311,7 @@ async function buildSessionWithRuntime(
       return buildSessionWithRuntime(nextOptions, nextManager, logger);
     },
     fork: async (entryId?: string) => {
-      const sourcePath = manager.sessionFile;
-      if (!sourcePath) throw new Error("No session file to fork");
-      const nextPath = join(dirname(sourcePath), `fork-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jsonl`);
-      const text = await readFile(sourcePath, "utf8");
-      await writeFile(nextPath, text, "utf8");
-      const nextStore = new SessionStore({ storageRoot: options.storageRoot, logger });
-      const nextManager = await SessionManager.resume(nextStore, options.cwd, nextPath);
-      if (entryId) nextManager.branchTo(entryId);
+      const nextManager = await manager.forkToNewSession(entryId);
       return buildSessionWithRuntime({ ...options, resume: false }, nextManager, logger);
     },
     importFromJsonl: async (filePath: string) => {
@@ -342,6 +332,8 @@ async function buildSessionWithRuntime(
       for (const entry of manager.getActivePath()) {
         if (entry.type === "compaction") {
           lines.push(`## Compaction (${entry.timestamp})`, "", entry.summary, "");
+        } else if (entry.type === "branch_summary") {
+          lines.push(`## Branch Summary (${entry.timestamp})`, "", entry.summary, "");
         } else if (entry.type === "message") {
           lines.push(`## ${entry.message.role.toUpperCase()} (${entry.timestamp})`, "");
           for (const block of entry.message.content) {

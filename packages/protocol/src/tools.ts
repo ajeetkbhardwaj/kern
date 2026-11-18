@@ -48,6 +48,10 @@ export interface ToolDefinition<TArgs = unknown> {
   annotations?: ToolAnnotations;
   /** Rendered into the system prompt so the model knows what it may do. */
   instructions?: string;
+  /** When true, schema is withheld from default prompt turns until activated via tool_search. */
+  deferred?: boolean;
+  /** Opt out of the runtime repeat-call loop guard for polling/idempotent tools. */
+  allowRepeatedCalls?: boolean;
   execute(args: TArgs, ctx: ToolContext): Promise<ToolResult>;
   /** Convert to the provider-facing schema. Override for dialect differences. */
   toModelSchema?(): ModelToolSchema;

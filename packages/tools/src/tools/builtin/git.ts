@@ -83,37 +83,3 @@ export function createGitLogTool(_root: string): ToolDefinition<{ path?: string;
     },
   };
 }
-
-export function createGitCheckoutTool(_root: string): ToolDefinition<{ branch: string; create?: boolean; path?: string }> {
-  return {
-    name: "git-checkout",
-    description: "Switch branches or create new branch",
-    inputSchema: {
-      type: "object",
-      properties: {
-        branch: { type: "string", description: "Branch name to checkout" },
-        create: { type: "boolean", description: "Create new branch (-b)" },
-        path: { type: "string", description: "Repository path" },
-      },
-      required: ["branch"],
-    },
-    sideEffect: "write",
-    annotations: { destructiveHint: true },
-    async execute(args, ctx): Promise<ToolResult> {
-      let target: string;
-      try {
-        target = args.path ? safeResolveSync(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
-      } catch (error) {
-        return textResult(String(error), true, { code: "E_TOOL_DENIED" });
-      }
-      const cmdArgs = args.create ? ["checkout", "-b", args.branch] : ["checkout", args.branch];
-      const { stdout, stderr, code } = await spawnProcess("git", cmdArgs, { cwd: target, maxBytes: MAX_CAPTURE_BYTES });
-      const out = boundText(stdout);
-      const err = boundText(stderr);
-      let text = `Exit code: ${code ?? -1}\n`;
-      if (out.text) text += `stdout:\n${out.text}\n`;
-      if (err.text) text += `stderr:\n${err.text}\n`;
-      return { content: [{ type: "text", text }], isError: code !== 0 };
-    },
-  };
-}

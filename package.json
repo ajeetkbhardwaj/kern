@@ -1,6 +1,7 @@
 {
   "name": "kern",
   "version": "1.0.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Kern — a minimal, from-first-principles terminal coding agent kernel",

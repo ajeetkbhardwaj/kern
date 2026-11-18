@@ -10,11 +10,10 @@ export { HookExecutor, createHookExecutor } from "./executor.js";
 export {
   redactSecretsHook,
   limitLargeToolResultsHook,
-  addContextHook,
-  addDateHook,
-  addEnvironmentInfoHook,
-  keepAwakeHook,
+  createLimitLargeToolResultsHook,
   getBuiltinHooks,
+  getDefaultSessionHooks,
+  registerDefaultBuiltinHandlers,
 } from "./builtins.js";
 export {
   registerBuiltinHandler,

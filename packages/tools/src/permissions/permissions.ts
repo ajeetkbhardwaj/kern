@@ -98,71 +98,73 @@ export class PermissionChecker {
   }
 }
 
+export const DEFAULT_PERMISSION_RULES = {
+  denyRules: [
+    // Dangerous filesystem operations
+    "rm -rf",
+    "rm .*--no-preserve-root",
+    "shred",
+    "mkfs",
+    "dd.*of=/dev/",
+    // Destructive git operations
+    "git reset --hard",
+    "git clean.*-f",
+    "git push.*--force",
+    // Shell injection / backdoor patterns
+    "curl.*\\|.*(sh|bash)",
+    "wget.*\\|.*(sh|bash)",
+    "python.*shutil.rmtree",
+    // Fork bombs
+    ":()*{:|:&};:",
+  ],
+  allowRules: [
+    // Read-only operations
+    "ls",
+    "cat",
+    "pwd",
+    "whoami",
+    "date",
+    "which",
+    "file",
+    "stat",
+    "du",
+    "df",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "find",
+    // Read-only git
+    "git status",
+    "git diff",
+    "git log",
+    "git branch",
+    "git show",
+    "git remote",
+    "git config",
+    // Read-only package queries
+    "npm ls",
+    "npm list",
+    "npm view",
+    "npm search",
+    "npm outdated",
+    "pip list",
+    "pip show",
+    "pip search",
+  ],
+  askRules: [
+    // Potentially destructive but common operations
+    "kubectl",
+    "sudo",
+    "docker",
+    "chmod -R",
+    "chown -R",
+  ],
+};
+
 /**
  * Create a default permission checker with common patterns.
  */
 export function createDefaultPermissionChecker(): PermissionChecker {
-  return new PermissionChecker({
-    denyRules: [
-      // Dangerous filesystem operations
-      "rm -rf",
-      "rm .*--no-preserve-root",
-      "shred",
-      "mkfs",
-      "dd.*of=/dev/",
-      // Destructive git operations
-      "git reset --hard",
-      "git clean.*-f",
-      "git push.*--force",
-      // Shell injection / backdoor patterns
-      "curl.*\\|.*(sh|bash)",
-      "wget.*\\|.*(sh|bash)",
-      "python.*shutil.rmtree",
-      // Fork bombs
-      ":()*{:|:&};:",
-    ],
-    allowRules: [
-      // Read-only operations
-      "ls",
-      "cat",
-      "pwd",
-      "whoami",
-      "date",
-      "which",
-      "file",
-      "stat",
-      "du",
-      "df",
-      "head",
-      "tail",
-      "wc",
-      "grep",
-      "find",
-      // Read-only git
-      "git status",
-      "git diff",
-      "git log",
-      "git branch",
-      "git show",
-      "git remote",
-      "git config",
-      // Read-only package queries
-      "npm ls",
-      "npm list",
-      "npm view",
-      "npm search",
-      "npm outdated",
-      "pip list",
-      "pip show",
-      "pip search",
-    ],
-    askRules: [
-      // Potentially destructive but common operations
-      "kubectl",
-      "sudo",
-      "docker",
-      "chmod -R",
-      "chown -R",
-    ],
-  });
+  return new PermissionChecker(DEFAULT_PERMISSION_RULES);
 }

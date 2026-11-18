@@ -47,7 +47,7 @@ export class SessionManager {
   }
 
   static async create(store: SessionStore, cwd: string, meta?: Record<string, unknown>): Promise<SessionManager> {
-    const mgr = new SessionManager(store, store["logger"] as Logger ?? createLogger("info"));
+    const mgr = new SessionManager(store, store["logger"] as Logger ?? createLogger("info"), cwd);
     const { filePath, header } = await store.createSession({ cwd, meta });
     mgr.state = {
       entries: new Map([[header.id, header]]),
@@ -432,6 +432,64 @@ export class SessionManager {
     const cwd = this.cwd || process.cwd();
     const files = await store.listSessions(cwd, { limit });
     return files.map((file) => file.filePath);
+  }
+
+  /**
+   * Fork the active session into a new JSONL file containing only the root-to-target
+   * lineage (with fresh sessionId + forkedFrom provenance) and non-decreasing seqs.
+   */
+  async forkToNewSession(targetEntryId?: string): Promise<SessionManager> {
+    if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
+    const targetId = targetEntryId ?? this.state.activeLeafId;
+    if (!this.state.entries.has(targetId)) {
+      throw new Error(`Unknown entry ${targetId}`);
+    }
+
+    const path: SessionEntry[] = [];
+    let currentId: string | null = targetId;
+    const seen = new Set<string>();
+    while (currentId !== null && !seen.has(currentId)) {
+      seen.add(currentId);
+      const entry = this.state.entries.get(currentId);
+      if (!entry) break;
+      path.push(entry);
+      currentId = entry.parentId;
+    }
+    path.reverse();
+
+    const sourceHeader = path[0];
+    const sourceMeta = sourceHeader?.type === "session_header" ? (sourceHeader.meta ?? {}) : {};
+    const { filePath: nextPath, header: nextHeader } = await this.store.createSession({
+      cwd: this.cwd,
+      meta: {
+        ...sourceMeta,
+        forkedFrom: {
+          sessionId: this.sessionId,
+          entryId: targetId,
+          filePath: this.filePath,
+        },
+      },
+    });
+
+    let seq = 0;
+    for (let i = 1; i < path.length; i++) {
+      const original = path[i]!;
+      seq += 1;
+      const cloned: SessionEntry = {
+        ...original,
+        parentId: i === 1 ? nextHeader.id : original.parentId,
+        seq,
+      };
+      await this.store.append(nextPath, cloned);
+    }
+
+    this.logger.info("session_forked", {
+      fromSessionId: this.sessionId,
+      targetEntryId: targetId,
+      toFilePath: nextPath,
+      entries: path.length,
+    });
+    return SessionManager.resume(this.store, this.cwd, nextPath);
   }
 
   private async quarantineCorruptSession(

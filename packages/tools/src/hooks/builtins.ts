@@ -1,189 +1,144 @@
 /**
  * @kern/tools/hooks/builtins — Built-in hooks for kern.
  *
- * Adapts docker-agents Chapter 12 built-in hooks for TypeScript/kern.
- * Provides default hook implementations for safety, redaction, and context injection.
+ * Provides working default hooks for secret scrubbing and tool output truncation.
  */
 
 import type { ToolResult } from "@kern/protocol";
 import type {
-  HookHandler,
+  HookRegistration,
+  TransformHookHandler,
   HookContext,
   ToolInputTransformParams,
   ToolResponseTransformParams,
-  PostToolUseParams,
-  PreToolUseParams,
 } from "./events/contracts.js";
+
+const SENSITIVE_KEYS = [
+  "password", "secret", "token", "apikey", "api_key", "accesstoken", "access_token",
+  "auth", "credential", "private", "sessionid", "session_id",
+];
+
+const SECRET_TEXT_REGEX =
+  /(password|secret|token|api[_-]?key|credential|private[_-]?key)\s*[:=]\s*[\S]+/gi;
+
+const TOKEN_VALUE_REGEX = /\b(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,})\b/g;
+
+function scrubText(text: string): string {
+  return text
+    .replace(SECRET_TEXT_REGEX, "$1: [REDACTED]")
+    .replace(TOKEN_VALUE_REGEX, "[REDACTED]");
+}
+
+function redactObject(obj: unknown, mode: "auto" | "always" | "never"): unknown {
+  if (mode === "never" || obj === null || obj === undefined) return obj;
+  if (typeof obj === "string") {
+    if (mode === "always") return "[REDACTED]";
+    return scrubText(obj);
+  }
+  if (Array.isArray(obj)) return obj.map((item) => redactObject(item, mode));
+  if (typeof obj !== "object") return obj;
+
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    const lowerKey = key.toLowerCase();
+    if (SENSITIVE_KEYS.some((s) => lowerKey.includes(s))) {
+      result[key] = typeof value === "string" ? "[REDACTED]" : value;
+    } else {
+      result[key] = redactObject(value, mode);
+    }
+  }
+  return result;
+}
 
 /**
  * Redact secrets hook - tri-state: auto / always / never.
- * Scrubs sensitive values from tool args before execution and from results after.
+ * Follows the HookExecutor.runTransform `[ctx, params]` return contract.
  */
 export const redactSecretsHook: {
-  inputTransform: (mode: "auto" | "always" | "never") => HookHandler;
-  responseTransform: (mode: "auto" | "always" | "never") => (...params: unknown[]) => Promise<ToolResult>;
+  inputTransform: (mode: "auto" | "always" | "never") => TransformHookHandler;
+  responseTransform: (mode: "auto" | "always" | "never") => TransformHookHandler;
 } = {
   inputTransform: (mode) => {
-    const sensitiveKeys = [
-      "password", "secret", "token", "apikey", "api_key", "accesstoken", "access_token",
-      "auth", "credential", "private", "key", "sessionid", "session_id",
-    ];
-
-    const shouldRedact = (value: unknown): boolean => {
-      if (mode === "never") return false;
-      if (mode === "always") return true;
-      if (typeof value === "string") {
-        return /(password|secret|token|api.?key|credential|private.?key)/i.test(value);
-      }
-      return false;
-    };
-
-    const redactValue = (value: unknown): unknown => {
-      if (typeof value === "string") return "[REDACTED]";
-      if (typeof value === "object" && value !== null) return { [Symbol.toStringTag]: "REDACTED" };
-      return "[REDACTED]";
-    };
-
-    const redactObject = (obj: unknown): unknown => {
-      if (typeof obj !== "object" || obj === null) return obj;
-      if (Array.isArray(obj)) return obj.map(redactObject);
-      const result: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-        const lowerKey = key.toLowerCase();
-        if (sensitiveKeys.some((s) => lowerKey.includes(s)) || shouldRedact(value)) {
-          result[key] = redactValue(value);
-        } else {
-          result[key] = redactObject(value);
-        }
-      }
-      return result;
-    };
-
-    return async (...params: unknown[]): Promise<boolean> => {
-      if (mode === "never") return true;
-      const [ctx, p] = params as unknown as [HookContext, ToolInputTransformParams];
-      p.args = redactObject(p.args);
-      return true;
+    return async (...params: unknown[]): Promise<unknown[] | void> => {
+      if (mode === "never") return params;
+      const [ctx, p] = params as [HookContext, ToolInputTransformParams];
+      if (!p || typeof p !== "object") return params;
+      const nextArgs = redactObject(p.args, mode);
+      return [ctx, { ...p, args: nextArgs }];
     };
   },
 
   responseTransform: (mode) => {
-    const sensitiveKeys = [
-      "password", "secret", "token", "apikey", "api_key", "accesstoken", "access_token",
-      "auth", "credential", "private", "key", "sessionid", "session_id",
-    ];
-
-    const redactValue = (value: unknown): unknown => {
-      if (typeof value === "string") return "[REDACTED]";
-      if (typeof value === "object" && value !== null) return { [Symbol.toStringTag]: "REDACTED" };
-      return "[REDACTED]";
-    };
-
-    const redactObject = (obj: unknown): unknown => {
-      if (typeof obj !== "object" || obj === null) return obj;
-      if (Array.isArray(obj)) return obj.map(redactObject);
-      const result: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-        const lowerKey = key.toLowerCase();
-        if (sensitiveKeys.some((s) => lowerKey.includes(s))) {
-          result[key] = redactValue(value);
-        } else {
-          result[key] = redactObject(value);
-        }
-      }
-      return result;
-    };
-
-    const redactText = (text: string): string => {
-      return text.replace(
-        /(password|secret|token|api[_-]?key|credential|private[_-]?key)\s*[:=]\s*[\S]+/gi,
-        "$1: [REDACTED]",
-      );
-    };
-
-    return async (...params: unknown[]): Promise<ToolResult> => {
-      if (mode === "never") {
-        const [, p] = params as unknown as [HookContext, ToolResponseTransformParams];
-        return p.result;
-      }
-      const [ctx, p] = params as unknown as [HookContext, ToolResponseTransformParams];
+    return async (...params: unknown[]): Promise<unknown[] | void> => {
+      if (mode === "never") return params;
+      const [ctx, p] = params as [HookContext, ToolResponseTransformParams];
+      if (!p || typeof p !== "object" || !p.result) return params;
+      let changed = false;
       const redactedContent = p.result.content.map((block) => {
-        if (block.type === "text") {
-          return { ...block, text: redactText(block.text) };
-        }
-        return block;
+        if (block.type !== "text") return block;
+        const scrubbed = scrubText(block.text);
+        if (scrubbed !== block.text) changed = true;
+        return scrubbed === block.text ? block : { ...block, text: scrubbed };
       });
-      return { ...p.result, content: redactedContent };
+      if (!changed) return params;
+      const nextResult: ToolResult = { ...p.result, content: redactedContent };
+      return [ctx, { ...p, result: nextResult }];
     };
   },
 };
 
 /**
- * Limit large tool results hook - truncates overly large outputs.
+ * Limit large tool results hook - middle-out truncates oversized outputs via `tool_response_transform`.
  */
-export const limitLargeToolResultsHook: HookHandler = async (...params: unknown[]): Promise<boolean> => {
-  const maxBytes = 10_000;
-  const [ctx, p] = params as unknown as [HookContext, PostToolUseParams];
-  const result = p.result;
-  const redactedContent = result.content.map((block) => {
-    if (block.type === "text" && block.text.length > maxBytes) {
-      const head = block.text.slice(0, Math.floor(maxBytes * 0.6));
-      const tail = block.text.slice(-Math.floor(maxBytes * 0.4));
-      return {
-        ...block,
-        text: `${head}\n\n[... ${block.text.length - maxBytes} characters truncated ...]\n\n${tail}`,
-      };
-    }
-    return block;
-  });
-  return true;
-};
+export function createLimitLargeToolResultsHook(maxChars = 30_000): TransformHookHandler {
+  const limit = Math.max(0, Math.floor(maxChars));
+  return async (...params: unknown[]): Promise<unknown[] | void> => {
+    const [ctx, p] = params as [HookContext, ToolResponseTransformParams];
+    if (!p || typeof p !== "object" || !p.result) return params;
+    let changed = false;
+    const truncatedContent = p.result.content.map((block) => {
+      if (block.type === "text" && block.text.length > limit) {
+        changed = true;
+        const headLen = Math.floor(limit * 0.6);
+        const tailLen = limit - headLen;
+        const head = headLen > 0 ? block.text.slice(0, headLen) : "";
+        const tail = tailLen > 0 ? block.text.slice(-tailLen) : "";
+        return {
+          ...block,
+          text: `${head}\n\n[... ${block.text.length - limit} characters truncated ...]\n\n${tail}`,
+        };
+      }
+      return block;
+    });
+    if (!changed) return params;
+    return [
+      ctx,
+      {
+        ...p,
+        result: {
+          ...p.result,
+          content: truncatedContent,
+          details: { ...(p.result.details ?? {}), truncated: true },
+        },
+      },
+    ];
+  };
+}
 
-/**
- * Add context hook - injects contextual information into tool execution.
- */
-export const addContextHook: HookHandler = async (...params: unknown[]): Promise<boolean> => {
-  const [ctx, p] = params as unknown as [HookContext, PreToolUseParams];
-  return true;
-};
+export const limitLargeToolResultsHook: TransformHookHandler = createLimitLargeToolResultsHook(30_000);
 
-/**
- * Add date hook - injects current date/time into tool context.
- */
-export const addDateHook: HookHandler = async (...params: unknown[]): Promise<boolean> => {
-  const [ctx, p] = params as unknown as [HookContext, PreToolUseParams];
-  return true;
-};
-
-/**
- * Add environment info hook - injects environment variables into tool context.
- */
-export const addEnvironmentInfoHook: HookHandler = async (...params: unknown[]): Promise<boolean> => {
-  const [ctx, p] = params as unknown as [HookContext, PreToolUseParams];
-  return true;
-};
-
-/**
- * Keep alive hook - prevents idle timeouts during long operations.
- */
-export const keepAwakeHook: HookHandler = async (): Promise<boolean> => {
-  return true;
-};
+import { registerBuiltinHandler } from "./config-loader.js";
 
 /**
  * Get all built-in hooks as registrations.
  */
 export function getBuiltinHooks({
   redactMode = "auto",
-}: { redactMode?: "auto" | "always" | "never" } = {}): Array<{
-  event: string;
-  handler: HookHandler;
-  matcher?: string;
-  priority: number;
-  canBlock?: boolean;
-}> {
+  maxResultChars = 30_000,
+}: { redactMode?: "auto" | "always" | "never"; maxResultChars?: number } = {}): HookRegistration[] {
   const inputTransform = redactSecretsHook.inputTransform(redactMode);
   const responseTransform = redactSecretsHook.responseTransform(redactMode);
+  const limitHook = createLimitLargeToolResultsHook(maxResultChars);
 
   return [
     {
@@ -194,39 +149,48 @@ export function getBuiltinHooks({
     },
     {
       event: "tool_response_transform",
-      handler: responseTransform as unknown as HookHandler,
+      handler: responseTransform,
       priority: 100,
       canBlock: false,
     },
     {
-      event: "pre_tool_use",
-      handler: addContextHook,
+      event: "tool_response_transform",
+      handler: limitHook,
       priority: 200,
       canBlock: false,
     },
+  ];
+}
+
+/**
+ * Safe default session hooks: scrubs secrets from tool responses and caps oversized outputs.
+ * Keeps `tool_input_transform` opt-in so code writes/edits containing variable names like `token=` are untouched.
+ */
+export function getDefaultSessionHooks({
+  redactMode = "auto",
+  maxResultChars = 30_000,
+}: { redactMode?: "auto" | "always" | "never"; maxResultChars?: number } = {}): HookRegistration[] {
+  return [
     {
-      event: "pre_tool_use",
-      handler: addDateHook,
-      priority: 210,
+      event: "tool_response_transform",
+      handler: redactSecretsHook.responseTransform(redactMode),
+      priority: 100,
       canBlock: false,
     },
     {
-      event: "pre_tool_use",
-      handler: addEnvironmentInfoHook,
-      priority: 220,
-      canBlock: false,
-    },
-    {
-      event: "post_tool_use",
-      handler: limitLargeToolResultsHook,
-      priority: 300,
-      canBlock: false,
-    },
-    {
-      event: "post_tool_use",
-      handler: keepAwakeHook,
-      priority: 400,
+      event: "tool_response_transform",
+      handler: createLimitLargeToolResultsHook(maxResultChars),
+      priority: 200,
       canBlock: false,
     },
   ];
+}
+
+/**
+ * Register built-in handler names so `.kern/hooks.yaml` / `hooks.d/*.yaml` can reference them.
+ */
+export function registerDefaultBuiltinHandlers(): void {
+  registerBuiltinHandler("redact_secrets_input", (params) => redactSecretsHook.inputTransform("auto")(...params));
+  registerBuiltinHandler("redact_secrets_response", (params) => redactSecretsHook.responseTransform("auto")(...params));
+  registerBuiltinHandler("limit_large_tool_results", (params) => limitLargeToolResultsHook(...params));
 }

@@ -15,7 +15,7 @@ import { resolve, dirname } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { DefaultPolicy } from "./policy.js";
 import { safeResolveSync } from "./path-safety.js";
-import { validateArgs } from "./validate-args.js";
+import { validateArgs, repairToolArgs } from "./validate-args.js";
 import { spawnSandboxed, sanitizeEnv, type SandboxOptions, DEFAULT_SANDBOX_OPTIONS, NO_SANDBOX_OPTIONS } from "./bash-sandbox.js";
 import { createAuditLogger, type AuditLogger, type ToolAuditEntry } from "./audit-logger.js";
 import { HookExecutor } from "./hooks/executor.js";
@@ -53,10 +53,13 @@ export interface ApprovalMeta {
 export interface ExecuteOptions {
   origin?: PolicyInput["origin"];
   requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
+  onArgRepair?: (repairs: string[]) => void;
 }
 
 export class ToolRegistry {
   private tools = new Map<string, ToolDefinition>();
+  private activatedTools = new Set<string>();
+  private activeSet: Set<string> | null = null;
   private policy: ToolPolicyEngine;
   private workspaceRoot: string;
   private maxToolMs: number;
@@ -99,6 +102,35 @@ export class ToolRegistry {
     return (tool.sideEffect === "read" || tool.annotations?.readOnlyHint === true) && !tool.annotations?.destructiveHint;
   }
 
+  allowsRepeatedCalls(name: string): boolean {
+    return this.tools.get(name)?.allowRepeatedCalls === true;
+  }
+
+  activateTool(name: string): boolean {
+    if (!this.tools.has(name)) return false;
+    this.activatedTools.add(name);
+    if (this.activeSet !== null) this.activeSet.add(name);
+    return true;
+  }
+
+  deactivateTool(name: string): boolean {
+    if (!this.tools.has(name)) return false;
+    this.activatedTools.delete(name);
+    if (this.activeSet !== null) this.activeSet.delete(name);
+    return true;
+  }
+
+  setActiveTools(names: string[] | null): void {
+    this.activeSet = names === null ? null : new Set(names.filter((n) => this.tools.has(n)));
+  }
+
+  isToolActive(name: string): boolean {
+    const tool = this.tools.get(name);
+    if (!tool) return false;
+    if (this.activeSet !== null) return this.activeSet.has(name);
+    return !tool.deferred || this.activatedTools.has(name);
+  }
+
   /** Direct tool invocation for TUI shell mode etc. Same pipeline as model calls. */
   async callTool(
     name: string,
@@ -118,7 +150,9 @@ export class ToolRegistry {
   }
 
   listModelSchemas(): ModelToolSchema[] {
-    return Array.from(this.tools.values()).map((t) => (t.toModelSchema ? t.toModelSchema() : defaultModelSchema(t)));
+    return Array.from(this.tools.values())
+      .filter((t) => this.isToolActive(t.name))
+      .map((t) => (t.toModelSchema ? t.toModelSchema() : defaultModelSchema(t)));
   }
 
   async execute(name: string, args: unknown, signal: AbortSignal, opts: ExecuteOptions = {}): Promise<ToolResult> {
@@ -147,7 +181,12 @@ export class ToolRegistry {
       }
     }
 
-    // 1. Validate arguments before policy or execution.
+    // 1. Deterministic repair of weak-LLM argument quirks + schema validation.
+    const repaired = repairToolArgs(tool.inputSchema, currentArgs);
+    if (repaired.repaired) {
+      currentArgs = repaired.args;
+      opts.onArgRepair?.(repaired.repairs);
+    }
     const argErrors = validateArgs(tool.inputSchema, currentArgs);
     if (argErrors.length > 0) {
       const result = textResult(`Invalid arguments for tool ${name}: ${argErrors.join("; ")}`, true, {

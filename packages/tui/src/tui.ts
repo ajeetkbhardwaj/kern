@@ -200,10 +200,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const killRing = new KillRing();
 
   // State saved to ~/.kern/tui-state.json alongside the kernel session.
-  const STATE_FILE = join(homedir(), ".tui-state.json");
+  const STATE_FILE = join(homedir(), ".kern", "tui-state.json");
 
   const saveState = async (): Promise<void> => {
     try {
+      await mkdir(dirname(STATE_FILE), { recursive: true });
       await writeFile(STATE_FILE, JSON.stringify({
         draftText,
         recentPrompts,
@@ -1042,12 +1043,24 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             printStatus();
             break;
           }
+          case "tool_input_repaired":
+            toast(`repaired ${event.toolName} args (${event.repairs.length})`);
+            break;
+          case "model_fallback":
+            toast(`fallback → ${event.toProvider}/${event.toModel} (${event.reason})`);
+            noteModelUsage();
+            printStatus();
+            break;
           case "budget_warning": {
             const u = session.budgetUsage();
             toast(`⚠️ Budget warning: ${event.message} ($${u.cost.toFixed(4)} cost, ${(u.inputTokens + u.outputTokens).toLocaleString()} tok)`);
             printStatus();
             break;
           }
+          case "budget_exceeded":
+            err(`Budget exceeded (${event.kind}): ${event.message}`);
+            printStatus();
+            break;
           case "agent_error":
             closeAssistant();
             closeReasoning();

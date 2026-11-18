@@ -16,6 +16,8 @@ import {
   saveProviderToUserFile,
   testProvider,
   userModelsFile,
+  resolveFallbackAdapters,
+  createFallbackModelAdapter,
 } from "../src/discovery.js";
 import { createOpenAIAdapter } from "../src/openai.js";
 
@@ -311,5 +313,126 @@ describe("openai adapter", () => {
     const body = JSON.parse(calls[0]!.body);
     expect(body.tools).toBeUndefined();
     expect(body.tool_choice).toBeUndefined();
+  });
+
+  it("normalizes CRLF SSE streams, delta.reasoning, missing tool index, cached_tokens, and SSE error frames", async () => {
+    const adapter = createOpenAIAdapter({
+      provider: "test",
+      modelId: "openrouter-compat",
+      baseUrl: "https://example.com/v1",
+      apiKey: "k",
+      contextWindow: 128000,
+      maxOutputTokens: 4000,
+      fetchImpl: (async (_url, init) => {
+        const sent = JSON.parse(String((init as any)?.body ?? "{}"));
+        // Verify assistant history with tool_calls sets content: null when text is empty
+        const assistantHist = sent.messages.find((m: any) => m.role === "assistant");
+        expect(assistantHist.content).toBeNull();
+
+        const payload =
+          `data: {"choices":[{"delta":{"reasoning":"thinking step"},"finish_reason":null}]}\r\n\r\n` +
+          `data: {"choices":[{"delta":{"tool_calls":[{"id":"call_x","function":{"name":"read","arguments":"{\\"path\\":\\"a.ts\\"}"}}]},"finish_reason":null}]}\r\n\r\n` +
+          `data: {"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":60}}}\r\n\r\n` +
+          `data: [DONE]\r\n\r\n`;
+        return {
+          ok: true,
+          status: 200,
+          body: new ReadableStream({
+            start(c) {
+              c.enqueue(new TextEncoder().encode(payload));
+              c.close();
+            },
+          }),
+        } as any;
+      }) as typeof fetch,
+    });
+
+    const events: any[] = [];
+    for await (const ev of adapter.stream({
+      systemPrompt: "sys",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "go" }], timestamp: new Date().toISOString() },
+        { role: "assistant", content: [{ type: "tool_call", id: "c0", name: "read", arguments: { path: "x" } }], timestamp: new Date().toISOString() },
+        { role: "tool", content: [{ type: "tool_result", toolCallId: "c0", content: [{ type: "text", text: "ok" }], isError: false }], timestamp: new Date().toISOString() },
+      ],
+      tools: [],
+    })) {
+      events.push(ev);
+    }
+
+    expect(events).toContainEqual({ type: "reasoning_delta", delta: "thinking step" });
+    expect(events).toContainEqual({
+      type: "tool_call_complete",
+      call: { type: "tool_call", id: "call_x", name: "read", arguments: { path: "a.ts" } },
+    });
+    expect(events).toContainEqual({ type: "usage", usage: { input: 100, output: 20, cacheRead: 60 } });
+
+    const errorStreamAdapter = createOpenAIAdapter({
+      provider: "test",
+      modelId: "err-model",
+      baseUrl: "https://example.com/v1",
+      apiKey: "k",
+      contextWindow: 128000,
+      maxOutputTokens: 4000,
+      fetchImpl: (async () => ({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(`data: {"error":{"message":"rate limit exceeded","code":429}}\n\n`));
+            c.close();
+          },
+        }),
+      })) as unknown as typeof fetch,
+    });
+
+    await expect(
+      (async () => {
+        for await (const _ of errorStreamAdapter.stream({ systemPrompt: "s", messages: [], tools: [] })) {
+          // drain
+        }
+      })(),
+    ).rejects.toMatchObject({ kind: "rate_limit" });
+  });
+});
+
+describe("fallback models", () => {
+  it("resolves configured fallbackModels excluding primary and fails over cleanly", async () => {
+    const file = {
+      defaultProvider: "p1",
+      defaultModel: "m1",
+      fallbackModels: ["p1/m1", "p2/m2", "missing/nope"],
+      providers: {
+        p1: { baseUrl: "http://localhost:11434/v1", models: [{ id: "m1" }] },
+        p2: { baseUrl: "http://localhost:1234/v1", models: [{ id: "m2" }] },
+      },
+    };
+    const fallbacks = await resolveFallbackAdapters(file, { provider: "p1", model: "m1" });
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0]!.info).toMatchObject({ provider: "p2", modelId: "m2" });
+
+    const notices: string[] = [];
+    const primary = {
+      info: { provider: "p1", modelId: "m1", contextWindow: 8000, maxOutputTokens: 1000 },
+      async *stream() {
+        throw new Error("503 overloaded");
+      },
+    };
+    const backup = {
+      info: { provider: "p2", modelId: "m2", contextWindow: 8000, maxOutputTokens: 1000 },
+      async *stream() {
+        yield { type: "text_delta" as const, delta: "backup-ok" };
+        yield { type: "finished" as const, reason: "stop" as const };
+      },
+    };
+    const wrapped = createFallbackModelAdapter([primary, backup], (info) => {
+      notices.push(`${info.fromProvider}/${info.fromModel}->${info.toProvider}/${info.toModel}`);
+    });
+    const out: any[] = [];
+    for await (const ev of wrapped.stream({ systemPrompt: "s", messages: [], tools: [] })) {
+      out.push(ev);
+    }
+    expect(notices).toEqual(["p1/m1->p2/m2"]);
+    expect(out.some((e) => e.type === "text_delta" && e.delta === "backup-ok")).toBe(true);
   });
 });

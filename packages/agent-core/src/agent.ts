@@ -27,10 +27,11 @@ import {
   classifyModelError,
 } from "@kern/protocol";
 import { SessionManager } from "@kern/session-store";
-import { ToolRegistry } from "@kern/tools";
+import { ToolRegistry, type HookExecutor } from "@kern/tools";
 
 export interface AgentRuntimeOptions {
   model: ModelAdapter;
+  fallbackModels?: ModelAdapter[];
   tools: ToolRegistry;
   sessions: SessionManager;
   contextBuilder: ContextBuilder;
@@ -40,6 +41,7 @@ export interface AgentRuntimeOptions {
   compactor?: Compactor | null;
   retry?: RetryConfig;
   defaultThinkingLevel?: ThinkingLevel;
+  hookExecutor?: HookExecutor;
   /** Called when policy demands approval. Absent = deny. */
   requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
 }
@@ -54,6 +56,7 @@ export interface RunTurnOptions {
 
 export class AgentRuntime {
   private model: ModelAdapter;
+  private readonly fallbackModels: ModelAdapter[];
   private readonly tools: ToolRegistry;
   private readonly sessions: SessionManager;
   private readonly contextBuilder: ContextBuilder;
@@ -62,6 +65,7 @@ export class AgentRuntime {
   private readonly budgets: BudgetTracker;
   private readonly compactor: Compactor | null;
   private readonly retry: RetryConfig;
+  private readonly hookExecutor?: HookExecutor;
   private readonly requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
   private busy = false;
   private turn = 0;
@@ -74,6 +78,7 @@ export class AgentRuntime {
 
   constructor(options: AgentRuntimeOptions) {
     this.model = options.model;
+    this.fallbackModels = options.fallbackModels ?? [];
     this.tools = options.tools;
     this.sessions = options.sessions;
     this.contextBuilder = options.contextBuilder;
@@ -83,6 +88,7 @@ export class AgentRuntime {
     this.budgets.restoreUsage(this.sessions.getUsageTotals());
     this.compactor = options.compactor === undefined ? new Compactor({ logger: this.logger }) : options.compactor;
     this.retry = options.retry ?? DEFAULT_RETRY_CONFIG;
+    this.hookExecutor = options.hookExecutor;
     this.thinkingLevel = options.defaultThinkingLevel ?? "medium";
     if (options.requestApproval !== undefined) this.requestApproval = options.requestApproval;
   }
@@ -183,9 +189,22 @@ export class AgentRuntime {
     this.budgets.startRun();
     this.activeAbortController = opts.signal ? null : new AbortController();
     const signal = opts.signal ?? this.activeAbortController?.signal;
+    const callCounts = new Map<string, number>();
     let pendingQueuedFlush = false;
     let caughtError: unknown;
+    const sessionId = this.sessions.sessionId ?? "unknown";
     try {
+      if (this.hookExecutor) {
+        const ctx = this.hookContext();
+        const beforeRun = await this.hookExecutor.run("before_agent_run", ctx, { agentId: "kern", sessionId });
+        if (!beforeRun.proceed) {
+          throw new KernError("E_TOOL_DENIED", "Agent run blocked by before_agent_run hook");
+        }
+        const promptCheck = await this.hookExecutor.run("user_prompt_submit", ctx, { prompt: userText, sessionId });
+        if (!promptCheck.proceed) {
+          throw new KernError("E_TOOL_DENIED", "Prompt blocked by user_prompt_submit hook");
+        }
+      }
       await this.sessions.appendUserMessage(userText);
       await this.ensureCompactIfNeeded("before_prompt", signal);
 
@@ -200,19 +219,67 @@ export class AgentRuntime {
         this.budgets.beginTurn();
         this.turn += 1;
         this.events.emit({ type: "turn_start", turn: this.turn });
+        if (this.hookExecutor) {
+          await this.hookExecutor.runNotify("turn_start", this.hookContext(), { turn: this.turn, sessionId });
+        }
 
-        const ctx = await this.contextBuilder.build(this.sessions);
+        let ctx = await this.contextBuilder.build(this.sessions);
         this.lastUsage = ctx.usage;
-        const request = {
-          systemPrompt: ctx.systemPrompt,
-          messages: ctx.messages,
-          tools: ctx.tools,
+        if (this.hookExecutor) {
+          const llmGuard = await this.hookExecutor.run("before_llm_call", this.hookContext(), {
+            messages: ctx.messages.map((m) => ({
+              role: m.role,
+              content: m.content.filter((b) => b.type === "text").map((b) => (b.type === "text" ? b.text : "")).join("\n"),
+            })),
+            model: this.model.info.modelId,
+          });
+          if (!llmGuard.proceed) {
+            throw new KernError("E_TOOL_DENIED", "LLM call blocked by before_llm_call hook");
+          }
+        }
+
+        const buildRequest = (snap: typeof ctx) => ({
+          systemPrompt: snap.systemPrompt,
+          messages: snap.messages,
+          tools: snap.tools,
           maxOutputTokens: this.model.info.maxOutputTokens,
           thinkingLevel: this.thinkingLevel,
           signal,
-        };
-        const { message: assistant, usage: turnUsage, cost: turnCost } = await this.streamModel(request, signal);
+        });
+
+        let streamed: { message: ChatMessage; usage: TokenCounts; cost: number };
+        try {
+          streamed = await this.streamWithRecoveryAndFallback(ctx, buildRequest, signal);
+        } catch (err) {
+          if (
+            classifyError(err) === "context_length" &&
+            this.compactor &&
+            this.sessions.getActiveMessages().length > 0
+          ) {
+            this.logger.warn("context_length_overflow_compacting", { turn: this.turn, model: this.model.info.modelId });
+            const compacted = await this.forceCompactForOverflow(ctx.usage.totalTokens, signal);
+            if (!compacted) throw err;
+            ctx = await this.contextBuilder.build(this.sessions);
+            this.lastUsage = ctx.usage;
+            streamed = await this.streamWithRecoveryAndFallback(ctx, buildRequest, signal);
+          } else {
+            throw err;
+          }
+        }
+
+        const { message: assistant, usage: turnUsage, cost: turnCost } = streamed;
         this.throwIfAborted(signal);
+        if (this.hookExecutor) {
+          const responseText = assistant.content
+            .filter((b) => b.type === "text")
+            .map((b) => (b.type === "text" ? b.text : ""))
+            .join("");
+          await this.hookExecutor.runNotify("after_llm_call", this.hookContext(), {
+            response: responseText,
+            model: this.model.info.modelId,
+            tokens: { input: turnUsage.input, output: turnUsage.output },
+          });
+        }
         await this.sessions.appendAssistantMessage(assistant);
         if (turnUsage.input > 0 || turnUsage.output > 0 || turnCost > 0) {
           await this.sessions.appendUsage({
@@ -226,11 +293,21 @@ export class AgentRuntime {
 
         const toolCalls = getToolCalls(assistant);
         if (toolCalls.length === 0) {
+          if (this.hookExecutor) {
+            await this.hookExecutor.runNotify("turn_end", this.hookContext(), { turn: this.turn, sessionId });
+          }
           if (this.steerQueue.length > 0) {
             continue;
           }
           this.events.emit({ type: "agent_end", reason: "final_response" });
           await this.ensureCompactIfNeeded("after_agent_end", signal);
+          if (this.hookExecutor) {
+            await this.hookExecutor.runNotify("after_agent_complete", this.hookContext(), {
+              agentId: "kern",
+              sessionId,
+              success: true,
+            });
+          }
           this.events.emit({ type: "agent_settled" });
           pendingQueuedFlush = true;
           return;
@@ -245,7 +322,7 @@ export class AgentRuntime {
             this.budgets.recordToolCall();
           }
           const toolMessages = await Promise.all(
-            toolCalls.map((call) => this.executeTool(call, signal)),
+            toolCalls.map((call) => this.executeTool(call, signal, callCounts)),
           );
           this.throwIfAborted(signal);
           for (const toolMsg of toolMessages) {
@@ -255,10 +332,13 @@ export class AgentRuntime {
           for (const call of toolCalls) {
             this.throwIfAborted(signal);
             this.budgets.recordToolCall();
-            const toolMsg = await this.executeTool(call, signal);
+            const toolMsg = await this.executeTool(call, signal, callCounts);
             this.throwIfAborted(signal);
             await this.sessions.appendToolResult(toolMsg);
           }
+        }
+        if (this.hookExecutor) {
+          await this.hookExecutor.runNotify("turn_end", this.hookContext(), { turn: this.turn, sessionId });
         }
       }
     } catch (error) {
@@ -269,11 +349,29 @@ export class AgentRuntime {
           message: "Turn aborted by user",
         });
         this.events.emit({ type: "agent_end", reason: "aborted" });
+        if (this.hookExecutor) {
+          await this.hookExecutor.runNotify("after_agent_complete", this.hookContext(), {
+            agentId: "kern",
+            sessionId,
+            success: false,
+          });
+        }
         this.events.emit({ type: "agent_settled" });
         pendingQueuedFlush = true;
         return;
       }
       const serialized = serializeError(error);
+      if (this.hookExecutor) {
+        await this.hookExecutor.runNotify("on_error", this.hookContext(), {
+          error: error instanceof Error ? error : new Error(serialized.message),
+          context: "runUserTurn",
+        });
+        await this.hookExecutor.runNotify("after_agent_complete", this.hookContext(), {
+          agentId: "kern",
+          sessionId,
+          success: false,
+        });
+      }
       await this.sessions.appendDiagnostic({
         severity: "error",
         code: serialized.code,
@@ -316,6 +414,7 @@ export class AgentRuntime {
     if (this.busy) throw new Error("Cannot compact while a turn is running");
     if (!this.compactor) throw new Error("Compaction is disabled for this session");
     if (!this.sessions.getActiveMessages().length) return null;
+    const sessionId = this.sessions.sessionId ?? "unknown";
     this.events.emit({ type: "auto_compaction_start", phase: "before_prompt" });
     try {
       const beforeSnapshot = await this.contextBuilder.build(this.sessions);
@@ -323,6 +422,13 @@ export class AgentRuntime {
       const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model, instructions);
       await this.sessions.appendCompaction(summary, replacesThroughId, { tokensBefore });
       this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
+      if (this.hookExecutor) {
+        await this.hookExecutor.runNotify("after_compaction", this.hookContext(), {
+          sessionId,
+          summary,
+          replacedThroughId: replacesThroughId,
+        });
+      }
       return { summary, replacesThroughId };
     } catch (error) {
       const serialized = serializeError(error);
@@ -343,6 +449,18 @@ export class AgentRuntime {
     const snapshot = await this.contextBuilder.build(this.sessions);
     const decision = this.compactor.evaluate(snapshot, this.model.info.contextWindow);
     if (!decision.shouldCompact) return;
+    const sessionId = this.sessions.sessionId ?? "unknown";
+    if (this.hookExecutor) {
+      const pre = await this.hookExecutor.run("pre_compact", this.hookContext(), {
+        sessionId,
+        tokenCount: decision.totalTokens,
+        maxTokens: decision.budgetTokens,
+      });
+      if (!pre.proceed) {
+        this.logger.info("compaction_vetoed_by_hook", { phase });
+        return;
+      }
+    }
     this.events.emit({ type: "auto_compaction_start", phase });
     try {
       const tokensBefore: TokenCounts = { input: snapshot.usage.totalTokens, output: 0 };
@@ -350,6 +468,13 @@ export class AgentRuntime {
       this.throwIfAborted(signal);
       await this.sessions.appendCompaction(summary, replacesThroughId, { tokensBefore });
       this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
+      if (this.hookExecutor) {
+        await this.hookExecutor.runNotify("after_compaction", this.hookContext(), {
+          sessionId,
+          summary,
+          replacedThroughId: replacesThroughId,
+        });
+      }
     } catch (error) {
       const serialized = serializeError(error);
       await this.sessions.appendDiagnostic({
@@ -361,6 +486,86 @@ export class AgentRuntime {
       // Fail open here: keep existing context rather than aborting the turn.
       this.logger.warn("compaction_failed", { phase, error: serialized.message });
     }
+  }
+
+  private async forceCompactForOverflow(totalTokens: number, signal?: AbortSignal): Promise<boolean> {
+    if (!this.compactor) return false;
+    const sessionId = this.sessions.sessionId ?? "unknown";
+    this.events.emit({ type: "auto_compaction_start", phase: "before_prompt" });
+    try {
+      const tokensBefore: TokenCounts = { input: totalTokens, output: 0 };
+      const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model);
+      this.throwIfAborted(signal);
+      await this.sessions.appendCompaction(summary, replacesThroughId, { tokensBefore });
+      this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
+      if (this.hookExecutor) {
+        await this.hookExecutor.runNotify("after_compaction", this.hookContext(), {
+          sessionId,
+          summary,
+          replacedThroughId: replacesThroughId,
+        });
+      }
+      return true;
+    } catch (error) {
+      const serialized = serializeError(error);
+      this.logger.warn("overflow_compaction_failed", { error: serialized.message });
+      return false;
+    }
+  }
+
+  private hookContext() {
+    return {
+      sessionId: this.sessions.sessionId ?? undefined,
+      timestamp: now(),
+    };
+  }
+
+  private async streamWithRecoveryAndFallback(
+    ctx: Awaited<ReturnType<ContextBuilder["build"]>>,
+    buildRequest: (snap: typeof ctx) => Parameters<ModelAdapter["stream"]>[0],
+    signal?: AbortSignal,
+  ): Promise<{ message: ChatMessage; usage: TokenCounts; cost: number }> {
+    const candidates: ModelAdapter[] = [this.model];
+    for (const fb of this.fallbackModels) {
+      if (!candidates.some((c) => c.info.provider === fb.info.provider && c.info.modelId === fb.info.modelId)) {
+        candidates.push(fb);
+      }
+    }
+
+    let lastError: unknown;
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i]!;
+      if (candidate !== this.model) {
+        const prev = this.model;
+        this.model = candidate;
+        await this.sessions.appendModelChange(candidate.info.provider, candidate.info.modelId, this.thinkingLevel);
+        this.events.emit({
+          type: "model_fallback",
+          fromProvider: prev.info.provider,
+          fromModel: prev.info.modelId,
+          toProvider: candidate.info.provider,
+          toModel: candidate.info.modelId,
+          reason: lastError instanceof Error ? lastError.message : String(lastError),
+        });
+      }
+      try {
+        return await this.streamModel(buildRequest(ctx), signal);
+      } catch (err) {
+        lastError = err;
+        const kind = classifyError(err);
+        if (kind === "cancelled" || kind === "context_length" || i === candidates.length - 1) {
+          throw err;
+        }
+        this.logger.warn("model_fallback_triggered", {
+          fromProvider: candidate.info.provider,
+          fromModel: candidate.info.modelId,
+          toProvider: candidates[i + 1]!.info.provider,
+          toModel: candidates[i + 1]!.info.modelId,
+          reason: kind,
+        });
+      }
+    }
+    throw lastError;
   }
 
   private estimateCost(usage: TokenCounts): number {
@@ -441,17 +646,56 @@ export class AgentRuntime {
     );
   }
 
-  private async executeTool(call: ToolCallBlock, signal?: AbortSignal): Promise<ChatMessage> {
+  private async executeTool(
+    call: ToolCallBlock,
+    signal?: AbortSignal,
+    callCounts?: Map<string, number>,
+  ): Promise<ChatMessage> {
     this.events.emit({
       type: "tool_execution_start",
       toolCallId: call.id,
       toolName: call.name,
       arguments: call.arguments,
     });
+
+    if (callCounts && !this.tools.allowsRepeatedCalls(call.name)) {
+      const sig = `${call.name}:${stableSerialize(call.arguments)}`;
+      const seen = (callCounts.get(sig) ?? 0) + 1;
+      callCounts.set(sig, seen);
+      if (seen >= 3) {
+        const block: ToolResultBlock = {
+          type: "tool_result",
+          toolCallId: call.id,
+          content: [{
+            type: "text",
+            text: `Blocked repeated identical call to "${call.name}" (${seen} times) to prevent an infinite loop. Change arguments or use a different approach.`,
+          }],
+          isError: true,
+          details: { code: "E_TOOL_DENIED", repeatCount: seen },
+        };
+        this.events.emit({
+          type: "tool_execution_end",
+          toolCallId: call.id,
+          toolName: call.name,
+          isError: true,
+          result: block,
+        });
+        return { role: "tool", content: [block], timestamp: now() };
+      }
+    }
+
     const effectiveSignal = signal ?? new AbortController().signal;
     const result = await this.tools.execute(call.name, call.arguments, effectiveSignal, {
       origin: "model",
       requestApproval: this.requestApproval,
+      onArgRepair: (repairs) => {
+        this.events.emit({
+          type: "tool_input_repaired",
+          toolCallId: call.id,
+          toolName: call.name,
+          repairs,
+        });
+      },
     });
     const safeContent = result.content.map((c) => ({ type: "text" as const, text: redact(c.text) }));
     const block: ToolResultBlock = {
@@ -487,4 +731,12 @@ function isCancelled(error: unknown, signal?: AbortSignal): boolean {
   if (error instanceof KernError && error.code === "E_CANCELLED") return true;
   if (error instanceof Error && error.name === "AbortError") return true;
   return false;
+}
+
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(",")}]`;
+  const rec = value as Record<string, unknown>;
+  const keys = Object.keys(rec).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableSerialize(rec[k])}`).join(",")}}`;
 }

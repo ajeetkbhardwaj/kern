@@ -258,12 +258,14 @@ export type AgentEvent =
   | { type: "reasoning_delta"; delta: string }
   | { type: "message_end"; message: ChatMessage }
   | { type: "tool_execution_start"; toolCallId: string; toolName: string; arguments: unknown }
+  | { type: "tool_input_repaired"; toolCallId: string; toolName: string; repairs: string[] }
   | { type: "tool_execution_update"; toolCallId: string; toolName: string; delta: string }
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; isError: boolean; result?: ToolResultBlock }
   | { type: "auto_compaction_start"; phase: CompactionPhase }
   | { type: "auto_compaction_end"; summary: string; replacedThroughId: string }
   | { type: "auto_retry_start"; attempt: number; reason: string; delayMs: number }
   | { type: "auto_retry_end"; attempt: number; success: boolean; reason?: string }
+  | { type: "model_fallback"; fromProvider: string; fromModel: string; toProvider: string; toModel: string; reason: string }
   | { type: "agent_start" }
   | { type: "agent_end"; reason: "final_response" | "aborted" | "queued_work_remaining" }
   | { type: "agent_error"; error: SerializedError }

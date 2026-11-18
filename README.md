@@ -185,8 +185,8 @@ sequenceDiagram
 ├── .agents/                # Repo-local agent guides/skills/docs (development context)
 ├── USER_GUIDE.md           # TUI-focused user guide
 ├── README.md               # Project overview (this file)
-├── package.json            # Root scripts and dev dependencies
-└── pnpm-workspace.yaml
+├── package.json            # Root scripts, workspaces, and dev dependencies
+└── server.ts               # Web workbench HTTP server (port 3000)
 ```
 
 ## Getting started
@@ -246,29 +246,35 @@ npm run kern -- --list-models
 Start the interactive TUI (default on TTY):
 
 ```bash
-pnpm kern
+npm run kern
+```
+
+Start the local web workbench (port 3000):
+
+```bash
+npm run dev
 ```
 
 Start with a specific model/provider:
 
 ```bash
-pnpm kern -- --provider <provider> --model <model-id>
+npm run kern -- --provider <provider> --model <model-id>
 # or
-pnpm kern -- --model <provider>/<model-id>
+npm run kern -- --model <provider>/<model-id>
 ```
 
 Resume the most recent session:
 
 ```bash
-pnpm kern -- --resume
+npm run kern -- --resume
 ```
 
 Resume a specific session by ID or session file path:
 
 ```bash
-pnpm kern -- --session <session-id>
+npm run kern -- --session <session-id>
 # or
-pnpm kern -- --session /path/to/session.jsonl
+npm run kern -- --session /path/to/session.jsonl
 ```
 
 ## Usage
@@ -312,12 +318,13 @@ When you select a session, Kern loads it from its **saved session file path** an
   - Options typically include allow once / allow for session (tool-scoped) / deny
   - Review destructive operations carefully
 
-### Print mode (non-interactive)
+### Print mode, JSON, and RPC (non-interactive)
 
-Use `--print` for streamed, non-interactive output (scripting/CI/pipes):
+Use `--print` for streamed, non-interactive output (scripting/CI/pipes), `--json` for NDJSON event streams, or `--rpc` for bidirectional stdin/stdout JSON-RPC control:
 
 ```bash
-pnpm kern -- --print "Summarize this repository"
+npm run kern -- --print "Summarize this repository"
+npm run kern -- --json "List all TypeScript packages"
 ```
 
 Notes:
@@ -327,37 +334,40 @@ Notes:
 
 ### Common commands and flags
 
-> Run `pnpm kern -- --help` for the authoritative CLI help.
+> Run `npm run kern -- --help` for the authoritative CLI help.
 
-| Command / Flag                                                                                     | Purpose                                     |
-| -------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| `pnpm kern`                                                                                      | Start interactive TUI (default on TTY)      |
-| `pnpm kern -- --print "..."`                                                                     | Non-interactive streamed run                |
-| `pnpm kern -- --list-models`                                                                     | List configured/discovered models           |
-| `--resume`                                                                                       | Resume most recent session                  |
-| `--session <id                                                                                     | path>`                                      |
-| `--provider <name>` / `--model <id                                                               | provider/id>`                               |
-| `--base-url <url>` / `--api-key <key>`                                                         | Override endpoint/auth                      |
-| `--cwd <dir>`                                                                                    | Set workspace root                          |
-| `--read-only`                                                                                    | Restrict to read-only tool behavior         |
-| `--max-turns`, `--max-wall-time-ms`, `--max-tool-calls-per-turn`, `--max-total-tool-calls` | Runtime budgets/limits                      |
-| `--no-resources`, `--no-compaction`                                                            | Disable resource loading or auto-compaction |
+| Command / Flag | Purpose |
+| --- | --- |
+| `npm run kern` | Start interactive TUI (default on TTY) |
+| `npm run kern -- --print "..."` | Non-interactive streamed run |
+| `npm run kern -- --json "..."` | NDJSON event stream output |
+| `npm run kern -- --list-models` | List configured/discovered models |
+| `npm run dev` | Start web workbench server on port 3000 |
+| `--resume` | Resume most recent session |
+| `--session <id \| path>` | Resume specific session ID or JSONL file |
+| `--provider <name>` / `--model <id \| provider/id>` | Override provider or model |
+| `--base-url <url>` / `--api-key <key>` | Override endpoint/auth |
+| `--cwd <dir>` | Set workspace root |
+| `--read-only` | Restrict to read-only tool behavior |
+| `--max-turns`, `--max-wall-time-ms`, `--max-tool-calls-per-turn`, `--max-total-tool-calls` | Runtime budgets/limits |
+| `--no-resources`, `--no-compaction` | Disable resource loading or auto-compaction |
 
 ## Development
 
 ### Root scripts
 
 ```bash
-pnpm typecheck      # TypeScript typecheck (no emit)
-pnpm test           # Run tests (Vitest)
-pnpm test:watch     # Watch mode
-pnpm kern -- --help # Run CLI entry (tsx)
+npm run typecheck          # TypeScript typecheck (no emit)
+npm test                   # Run tests (Vitest)
+npm run test:watch         # Watch mode
+npm run dev                # Start web workbench server (port 3000)
+npm run kern -- --help     # Run CLI entry (tsx)
 ```
 
 ### Local development notes
 
-- This is a **pnpm monorepo** (`packages/*`)
-- Many packages currently export TypeScript source (`src/index.ts`) for in-repo development
+- This is an **npm workspaces monorepo** (`packages/*`)
+- Packages export TypeScript source (`src/index.ts`) for fast in-repo development
 - TUI behavior and command set evolve; prefer checking `packages/tui/src/tui.ts` and `USER_GUIDE.md` for current UX details
 
 ## Testing and type checking
@@ -365,24 +375,22 @@ pnpm kern -- --help # Run CLI entry (tsx)
 Run all tests:
 
 ```bash
-pnpm test
+npm test
 ```
 
 Run type checks:
 
 ```bash
-pnpm typecheck
+npm run typecheck
 ```
 
 Targeted package tests (examples):
 
 ```bash
-pnpm exec vitest run packages/tui
-pnpm exec vitest run packages/agent-core
-pnpm exec vitest run packages/session-store packages/coding-agent packages/tui
+npx vitest run packages/tui
+npx vitest run packages/agent-core
+npx vitest run packages/session-store packages/coding-agent packages/tui
 ```
-
-> Some environments may have pre-existing, unrelated typecheck issues outside the area you’re changing. Verify and report them separately.
 
 ## Documentation
 
@@ -397,12 +405,12 @@ Contributions are welcome. Please keep changes focused, reviewable, and consiste
 ### Contribution workflow
 
 1. **Fork/clone** the repository and create a branch for your change.
-2. **Install dependencies** with `pnpm install`.
+2. **Install dependencies** with `npm install`.
 3. **Make focused changes** (prefer package-local fixes over broad refactors).
 4. **Add/update tests** for behavior changes when applicable.
 5. **Run checks** before submitting:
-   - `pnpm test` (or targeted tests for affected packages)
-   - `pnpm typecheck`
+   - `npm test` (or targeted tests for affected packages)
+   - `npm run typecheck`
 6. **Update docs** (`README.md`, `USER_GUIDE.md`, package docs) if user-facing behavior or commands change.
 7. **Open a pull request** with:
    - a clear summary of the problem and solution

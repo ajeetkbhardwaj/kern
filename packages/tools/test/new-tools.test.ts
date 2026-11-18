@@ -8,18 +8,17 @@ import {
   AllowAllPolicy,
   DefaultPolicy,
   DEFAULT_POLICY_CONFIG,
+  HookRegistry,
+  HookExecutor,
+  getBuiltinHooks,
+  createLimitLargeToolResultsHook,
   createGrepTool,
   createFindTool,
   createGitDiffTool,
-  createRmTool,
-  createCatTool,
-  createMemoryTool,
-  createPlanTool,
   createTodoTool,
-  createServeTool,
 } from "../src/index.js";
 
-describe("v1.0 tools fixes & search tools", () => {
+describe("v1.0 tools, hooks, and search tools", () => {
   let root: string;
 
   beforeEach(() => {
@@ -77,59 +76,17 @@ describe("v1.0 tools fixes & search tools", () => {
     expect(res.content[0]?.text).toContain("+line2");
   });
 
-  it("rm refuses deleting workspace root and cat blocks escapes cleanly", async () => {
-    const registry = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy() });
-    registry.register(createRmTool(root));
-    registry.register(createCatTool(root));
-
-    const rmRes = await registry.callTool("rm", { path: ".", recursive: true });
-    expect(rmRes.isError).toBe(true);
-    expect(rmRes.content[0]?.text).toContain("workspace root");
-
-    const catRes = await registry.callTool("cat", { path: "../outside.txt" });
-    expect(catRes.isError).toBe(true);
-    expect(catRes.details?.code).toBe("E_TOOL_DENIED");
-  });
-
-  it("memory, plan, and todo persist across fresh tool instances in .kern/", async () => {
+  it("todo persists across fresh tool instances in .kern/", async () => {
     const r1 = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy() });
-    r1.register(createMemoryTool(root));
-    r1.register(createPlanTool(root));
     r1.register(createTodoTool(root));
 
-    await r1.callTool("memory", { action: "set", key: "branch", value: "main" });
-    await r1.callTool("plan", { action: "add", id: "p1", title: "Release" });
     await r1.callTool("todo", { action: "add", content: "Write docs" });
 
     const r2 = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy() });
-    r2.register(createMemoryTool(root));
-    r2.register(createPlanTool(root));
     r2.register(createTodoTool(root));
 
-    const mem = await r2.callTool("memory", { action: "get", key: "branch" });
-    expect(mem.content[0]?.text).toBe("main");
-    const plan = await r2.callTool("plan", { action: "list" });
-    expect(plan.content[0]?.text).toContain("p1: Release");
     const todo = await r2.callTool("todo", { action: "list" });
     expect(todo.content[0]?.text).toContain("Write docs");
-  });
-
-  it("serve starts and stops a real loopback static server", async () => {
-    writeFileSync(join(root, "hello.txt"), "hello-from-serve");
-    const registry = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy() });
-    registry.register(createServeTool(root));
-
-    const started = await registry.callTool("serve", { action: "start", port: 0, dir: "." });
-    expect(started.isError).toBe(false);
-    const port = started.details?.port as number;
-    expect(port).toBeGreaterThan(0);
-
-    const resp = await fetch(`http://127.0.0.1:${port}/hello.txt`);
-    expect(resp.status).toBe(200);
-    expect(await resp.text()).toBe("hello-from-serve");
-
-    const stopped = await registry.callTool("serve", { action: "stop" });
-    expect(stopped.isError).toBe(false);
   });
 
   it("DefaultPolicy preserves sibling rules in updatePermissionRules and respects annotations", async () => {
@@ -154,5 +111,88 @@ describe("v1.0 tools fixes & search tools", () => {
       annotations: { destructiveHint: true },
     });
     expect(destructiveAnnotated.decision).toBe("require_approval");
+  });
+
+  it("limitLargeToolResultsHook and redactSecretsHook compose via HookExecutor.runTransform", async () => {
+    const hookRegistry = new HookRegistry();
+    for (const reg of getBuiltinHooks({ redactMode: "auto", maxResultChars: 120 })) {
+      hookRegistry.register(reg);
+    }
+    const hookExecutor = new HookExecutor(hookRegistry);
+
+    const registry = new ToolRegistry({
+      workspaceRoot: root,
+      policy: new AllowAllPolicy(),
+      hookExecutor,
+    });
+    registry.register({
+      name: "echo-big",
+      description: "Emit secret and long text",
+      inputSchema: { type: "object", properties: {} },
+      sideEffect: "read",
+      async execute() {
+        return {
+          content: [{ type: "text", text: `token: sk-secret1234567890abcd\n${"x".repeat(300)}` }],
+          isError: false,
+        };
+      },
+    });
+
+    const res = await registry.callTool("echo-big", {});
+    expect(res.isError).toBe(false);
+    expect(res.content[0]?.text).not.toContain("sk-secret1234567890abcd");
+    expect(res.content[0]?.text).toContain("[REDACTED]");
+    expect(res.content[0]?.text).toContain("characters truncated");
+    expect(res.details?.truncated).toBe(true);
+  });
+
+  it("createLimitLargeToolResultsHook handles zero limit without slice(-0) bug", async () => {
+    const hook = createLimitLargeToolResultsHook(0);
+    const ctx = { timestamp: new Date().toISOString() };
+    const out = (await hook(ctx, {
+      toolName: "read",
+      args: {},
+      origin: "model",
+      result: { content: [{ type: "text", text: "abcdefghij" }], isError: false },
+    })) as [typeof ctx, { result: { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown> } }];
+
+    expect(out[1].result.content[0]?.text).toContain("10 characters truncated");
+    expect(out[1].result.content[0]?.text).not.toContain("abcdefghij");
+    expect(out[1].result.details?.truncated).toBe(true);
+  });
+
+  it("ToolRegistry withholds deferred tools until activated and repairs malformed JSON args", async () => {
+    const registry = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy() });
+    registry.register({
+      name: "always-on",
+      description: "Normal tool",
+      inputSchema: { type: "object", properties: { count: { type: "integer" } }, required: ["count"] },
+      sideEffect: "read",
+      async execute(args: { count: number }) {
+        return { content: [{ type: "text", text: `count=${args.count}` }], isError: false };
+      },
+    });
+    registry.register({
+      name: "lazy-tool",
+      description: "Deferred tool",
+      inputSchema: { type: "object", properties: {} },
+      sideEffect: "read",
+      deferred: true,
+      async execute() {
+        return { content: [{ type: "text", text: "lazy-ok" }], isError: false };
+      },
+    });
+
+    expect(registry.listModelSchemas().map((t) => t.name)).toEqual(["always-on"]);
+    expect(registry.activateTool("lazy-tool")).toBe(true);
+    expect(registry.listModelSchemas().map((t) => t.name)).toEqual(["always-on", "lazy-tool"]);
+
+    const repaired: string[] = [];
+    const res = await registry.callTool("always-on", { _raw: '{"count": "7",}' }, {
+      onArgRepair: (r: string[]) => repaired.push(...r),
+    });
+    expect(res.isError).toBe(false);
+    expect(res.content[0]?.text).toBe("count=7");
+    expect(repaired.length).toBeGreaterThan(0);
   });
 });

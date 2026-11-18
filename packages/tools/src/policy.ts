@@ -2,7 +2,7 @@ import type { PolicyDecision, PolicyInput, ToolPolicyEngine } from "@kern/protoc
 import { isSensitivePath } from "@kern/protocol";
 import type { PolicyConfig } from "./policy-config.js";
 import { DEFAULT_POLICY_CONFIG } from "./policy-config.js";
-import { PermissionChecker, createDefaultPermissionChecker } from "./permissions/permissions.js";
+import { PermissionChecker, DEFAULT_PERMISSION_RULES } from "./permissions/permissions.js";
 import {
   evaluateSafetyMode,
   DEFAULT_SAFETY_MODE,
@@ -37,8 +37,17 @@ export class DefaultPolicy implements ToolPolicyEngine {
     private config: PolicyConfig = DEFAULT_POLICY_CONFIG,
     safetyConfig: SafetyPolicyConfig = DEFAULT_SAFETY_POLICY_CONFIG,
   ) {
-    this.permissionChecker = createDefaultPermissionChecker();
-    this.safetyConfig = safetyConfig;
+    this.safetyConfig = {
+      ...safetyConfig,
+      denyRules: safetyConfig.denyRules.length > 0 ? [...safetyConfig.denyRules] : [...DEFAULT_PERMISSION_RULES.denyRules],
+      allowRules: safetyConfig.allowRules.length > 0 ? [...safetyConfig.allowRules] : [...DEFAULT_PERMISSION_RULES.allowRules],
+      askRules: safetyConfig.askRules.length > 0 ? [...safetyConfig.askRules] : [...DEFAULT_PERMISSION_RULES.askRules],
+    };
+    this.permissionChecker = new PermissionChecker({
+      denyRules: this.safetyConfig.denyRules,
+      allowRules: this.safetyConfig.allowRules,
+      askRules: this.safetyConfig.askRules,
+    });
   }
 
   /** Don't ask again for this tool for the rest of the session. */
@@ -86,14 +95,29 @@ export class DefaultPolicy implements ToolPolicyEngine {
   }): void {
     this.safetyConfig = {
       ...this.safetyConfig,
-      ...(rules.denyRules !== undefined ? { denyRules: rules.denyRules } : {}),
-      ...(rules.allowRules !== undefined ? { allowRules: rules.allowRules } : {}),
-      ...(rules.askRules !== undefined ? { askRules: rules.askRules } : {}),
+      ...(rules.denyRules !== undefined ? { denyRules: [...rules.denyRules] } : {}),
+      ...(rules.allowRules !== undefined ? { allowRules: [...rules.allowRules] } : {}),
+      ...(rules.askRules !== undefined ? { askRules: [...rules.askRules] } : {}),
     };
     this.permissionChecker = new PermissionChecker({
       denyRules: this.safetyConfig.denyRules,
       allowRules: this.safetyConfig.allowRules,
       askRules: this.safetyConfig.askRules,
+    });
+  }
+
+  /** Merge additional permission rules onto the active defaults/lists. */
+  extendPermissionRules(rules: {
+    denyRules?: string[];
+    allowRules?: string[];
+    askRules?: string[];
+  }): void {
+    const mergeUnique = (base: string[], extra?: string[]) =>
+      extra && extra.length > 0 ? [...new Set([...base, ...extra])] : base;
+    this.updatePermissionRules({
+      denyRules: mergeUnique(this.safetyConfig.denyRules, rules.denyRules),
+      allowRules: mergeUnique(this.safetyConfig.allowRules, rules.allowRules),
+      askRules: mergeUnique(this.safetyConfig.askRules, rules.askRules),
     });
   }
 
@@ -130,22 +154,21 @@ export class DefaultPolicy implements ToolPolicyEngine {
     }
 
     // 4. Permission rules (deny → allow → ask → fallthrough to safety mode)
+    let commandPermission: "deny" | "allow" | "ask" | "fallthrough" = "fallthrough";
     if (args && typeof args.command === "string") {
       const cmd = args.command;
       const commandClass = classifyCommand(cmd);
-      const permissionResult = this.permissionChecker.check(cmd, commandClass);
+      commandPermission = this.permissionChecker.check(cmd, commandClass);
 
-      if (permissionResult === "deny") {
+      if (commandPermission === "deny") {
         return { decision: "deny", reason: `Command blocked by permission rule: ${cmd}` };
       }
-      if (permissionResult === "ask") {
+      if (commandPermission === "ask") {
         return {
           decision: "require_approval",
           prompt: `Permission required for command. Approve? ${cmd}`,
         };
       }
-      // If "allow", continue to safety mode check below
-      // If "fallthrough", also continue to safety mode check
     }
 
     // 5. Sensitive command path check (credentials)
@@ -154,6 +177,18 @@ export class DefaultPolicy implements ToolPolicyEngine {
       if (SENSITIVE_CMD_PATTERNS.some((re) => re.test(cmd))) {
         return { decision: "deny", reason: "Bash command touches sensitive credentials path" };
       }
+    }
+
+    // Honor explicit allow rules (for non-destructive commands when not in strict mode)
+    if (
+      name === "bash" &&
+      commandPermission === "allow" &&
+      this.safetyConfig.mode !== "strict" &&
+      args &&
+      typeof args.command === "string" &&
+      classifyCommand(args.command) !== "destructive"
+    ) {
+      return { decision: "allow" };
     }
 
     // 6. Safety mode evaluation
