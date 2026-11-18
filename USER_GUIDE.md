@@ -66,9 +66,11 @@ Use `/help` in the TUI to see available commands.
 - **`/new`**: start a fresh session.
 
 ### Inspection and runtime
+- **`/safety`**: pick active safety mode (`strict`, `balanced`, `restricted`, `autonomous`).
 - **`/diff`**: show a quick working-tree review (status and diff stats).
-- **`/budget`**: show usage, limits, and timing for the current session.
+- **`/budget [field=value]`**: show usage, limits, and timing, or configure session cost/token limits.
 - **`/compact`**: manually compact/summarize history when available.
+- **`/branch`**: record a branch summary on the active branch.
 - **`/quit`** (or `/exit`): exit the TUI.
 
 ## Prompt shortcuts
@@ -104,6 +106,7 @@ Kern may ask for approval before running sensitive actions (for example writes o
 | Ctrl+W | Copy editor line to kill ring |
 | Ctrl+Y | Paste from kill ring |
 | Shift+Tab | Toggle approval mode (when available) |
+| Shift+B / Shift+A | Cycle safety mode tighter / looser |
 | Backspace (empty editor) | Remove last queued message |
 
 > Shortcuts and mouse behavior can vary slightly depending on terminal support.

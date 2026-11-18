@@ -12,6 +12,8 @@ import {
   HookExecutor,
   getBuiltinHooks,
   createLimitLargeToolResultsHook,
+  registerDefaultBuiltinHandlers,
+  loadDefaultHookConfigs,
   createGrepTool,
   createFindTool,
   createGitDiffTool,
@@ -194,5 +196,47 @@ describe("v1.0 tools, hooks, and search tools", () => {
     expect(res.isError).toBe(false);
     expect(res.content[0]?.text).toBe("count=7");
     expect(repaired.length).toBeGreaterThan(0);
+  });
+
+  it("executes YAML-configured builtin hooks loaded via loadDefaultHookConfigs without spread error", async () => {
+    mkdirSync(join(root, ".kern"), { recursive: true });
+    writeFileSync(
+      join(root, ".kern", "hooks.yaml"),
+      [
+        "hooks:",
+        "  - event: tool_response_transform",
+        "    handler: redact_secrets_response",
+        "    priority: 100",
+        "  - event: tool_response_transform",
+        "    handler: limit_large_tool_results",
+        "    priority: 200",
+        "",
+      ].join("\n"),
+    );
+
+    registerDefaultBuiltinHandlers();
+    const hookRegistry = new HookRegistry();
+    const loaded = await loadDefaultHookConfigs(hookRegistry, root);
+    expect(loaded.loaded).toBe(2);
+
+    const hookExecutor = new HookExecutor(hookRegistry);
+    const registry = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy(), hookExecutor });
+    registry.register({
+      name: "yaml-test-tool",
+      description: "Emit secret",
+      inputSchema: { type: "object", properties: {} },
+      sideEffect: "read",
+      async execute() {
+        return {
+          content: [{ type: "text", text: "token: ghp_1234567890abcdefghij123456" }],
+          isError: false,
+        };
+      },
+    });
+
+    const res = await registry.callTool("yaml-test-tool", {});
+    expect(res.isError).toBe(false);
+    expect(res.content[0]?.text).not.toContain("ghp_1234567890abcdefghij123456");
+    expect(res.content[0]?.text).toContain("[REDACTED]");
   });
 });

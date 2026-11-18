@@ -190,7 +190,7 @@ export function getDefaultSessionHooks({
  * Register built-in handler names so `.kern/hooks.yaml` / `hooks.d/*.yaml` can reference them.
  */
 export function registerDefaultBuiltinHandlers(): void {
-  registerBuiltinHandler("redact_secrets_input", (params) => redactSecretsHook.inputTransform("auto")(...params));
-  registerBuiltinHandler("redact_secrets_response", (params) => redactSecretsHook.responseTransform("auto")(...params));
-  registerBuiltinHandler("limit_large_tool_results", (params) => limitLargeToolResultsHook(...params));
+  registerBuiltinHandler("redact_secrets_input", (...params) => redactSecretsHook.inputTransform("auto")(...params));
+  registerBuiltinHandler("redact_secrets_response", (...params) => redactSecretsHook.responseTransform("auto")(...params));
+  registerBuiltinHandler("limit_large_tool_results", (...params) => limitLargeToolResultsHook(...params));
 }

@@ -213,13 +213,39 @@ async function loadMcpExtraTools(cwd: string, logger: ReturnType<typeof createLo
 }
 
 /** Validate configuration files. */
-async function validateConfig(configPath: string, _logger: ReturnType<typeof createLogger>): Promise<void> {
-  const { resolve } = await import("node:path");
+async function validateConfig(configPath: string | undefined, cwd: string, _logger: ReturnType<typeof createLogger>): Promise<void> {
+  const { resolve, join } = await import("node:path");
+  const { homedir } = await import("node:os");
   const { readFile, stat } = await import("node:fs/promises");
 
-  let modelsPath = configPath;
-  if (!modelsPath.endsWith(".json")) {
-    modelsPath = resolve(configPath, "models.json");
+  let modelsPath: string;
+  if (configPath) {
+    const candidate = resolve(cwd, configPath);
+    if (candidate.endsWith(".json")) {
+      modelsPath = candidate;
+    } else {
+      const kernModels = resolve(candidate, ".kern", "models.json");
+      const directModels = resolve(candidate, "models.json");
+      let chosen = directModels;
+      try {
+        await stat(kernModels);
+        chosen = kernModels;
+      } catch {
+        // fall back to directModels
+      }
+      modelsPath = chosen;
+    }
+  } else {
+    const projectModels = join(resolve(cwd), ".kern", "models.json");
+    const userModels = join(homedir(), ".kern", "models.json");
+    let chosen = userModels;
+    try {
+      await stat(projectModels);
+      chosen = projectModels;
+    } catch {
+      // fall back to ~/.kern/models.json (matches --help)
+    }
+    modelsPath = chosen;
   }
 
   try {
@@ -228,14 +254,18 @@ async function validateConfig(configPath: string, _logger: ReturnType<typeof cre
     throw new Error(`Config file not found: ${modelsPath}`);
   }
 
+  let file: Awaited<ReturnType<typeof loadModelsFile>>;
   try {
     const raw = await readFile(modelsPath, "utf8");
-    JSON.parse(raw);
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Top-level config must be a JSON object");
+    }
+    file = parsed as Awaited<ReturnType<typeof loadModelsFile>>;
   } catch (error) {
     throw new Error(`Invalid JSON in ${modelsPath}: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const file = await loadModelsFile(configPath);
   const errors: string[] = [];
 
   for (const [name, cfg] of Object.entries(file.providers ?? {})) {
@@ -251,8 +281,37 @@ async function validateConfig(configPath: string, _logger: ReturnType<typeof cre
     }
   }
 
-  if (!file.defaultProvider && Object.keys(file.providers ?? {}).length > 0) {
+  const providerNames = Object.keys(file.providers ?? {});
+  if (!file.defaultProvider && providerNames.length > 0) {
     errors.push("No defaultProvider set");
+  } else if (file.defaultProvider && providerNames.length > 0 && !file.providers?.[file.defaultProvider]) {
+    errors.push(`defaultProvider "${file.defaultProvider}" is not defined in providers`);
+  }
+
+  if (Array.isArray(file.fallbackModels)) {
+    for (const entry of file.fallbackModels) {
+      let fbProvider: string | undefined;
+      let fbModel: string | undefined;
+      if (typeof entry === "string") {
+        const trimmed = entry.trim();
+        if (trimmed.includes("/")) {
+          const [p, ...rest] = trimmed.split("/");
+          fbProvider = p;
+          fbModel = rest.join("/");
+        } else {
+          fbProvider = file.defaultProvider;
+          fbModel = trimmed;
+        }
+      } else if (entry && typeof entry === "object") {
+        fbProvider = typeof entry.provider === "string" ? entry.provider : undefined;
+        fbModel = typeof entry.model === "string" ? entry.model : undefined;
+      }
+      if (!fbProvider || !fbModel) {
+        errors.push(`Invalid fallbackModels entry: ${JSON.stringify(entry)}`);
+      } else if (providerNames.length > 0 && !file.providers?.[fbProvider]) {
+        errors.push(`fallbackModels references unknown provider "${fbProvider}"`);
+      }
+    }
   }
 
   if (errors.length > 0) {
@@ -261,7 +320,7 @@ async function validateConfig(configPath: string, _logger: ReturnType<typeof cre
   }
 
   process.stdout.write(`Configuration valid: ${modelsPath}\n`);
-  process.stdout.write(`  Providers: ${Object.keys(file.providers ?? {}).join(", ") || "none"}\n`);
+  process.stdout.write(`  Providers: ${providerNames.join(", ") || "none"}\n`);
   process.stdout.write(`  Default provider: ${file.defaultProvider ?? "none"}\n`);
   process.stdout.write(`  Default model: ${file.defaultModel ?? "none"}\n`);
 }
@@ -420,7 +479,7 @@ export async function main() {
   }
 
   if (flags.validateConfig) {
-    await validateConfig(flags.config ?? flags.cwd, logger);
+    await validateConfig(flags.config, flags.cwd, logger);
     return;
   }
 

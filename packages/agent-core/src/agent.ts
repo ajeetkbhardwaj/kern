@@ -157,7 +157,7 @@ export class AgentRuntime {
   async setModel(adapter: ModelAdapter): Promise<void> {
     if (this.busy) throw new Error("Cannot switch model while a turn is running");
     this.model = adapter;
-    await this.sessions.appendModelChange(adapter.info.provider, adapter.info.modelId);
+    await this.sessions.appendModelChange(adapter.info.provider, adapter.info.modelId, this.thinkingLevel);
     this.logger.info("model_changed", { provider: adapter.info.provider, model: adapter.info.modelId });
   }
 

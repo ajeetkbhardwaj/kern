@@ -769,9 +769,9 @@ export function createBashTool(
                   stdoutTruncated: out.truncated || stdoutCapped,
                   stderrTruncated: err.truncated || stderrCapped,
                   timeoutMs: t,
-sandboxed: sandboxResult?.active ?? false,
-            },
-          });
+                  sandboxed: sandboxResult?.active ?? false,
+                },
+              });
         });
         proc.on("error", (e) => {
           finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));

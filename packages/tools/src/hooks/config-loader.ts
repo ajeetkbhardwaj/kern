@@ -17,7 +17,7 @@ import type { HookRegistration } from "./events/contracts.js";
 import { HookRegistry } from "./registry.js";
 import { matchPattern } from "./registry.js";
 
-export type BuiltinHandler = (params: unknown[]) => unknown;
+export type BuiltinHandler = (...params: unknown[]) => unknown;
 
 export interface HookConfigEntry {
   event: string;

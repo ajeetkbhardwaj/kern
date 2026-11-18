@@ -111,4 +111,33 @@ describe("Phase 5 session runtime + settings", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("restores persisted thinkingLevel when resuming a session", async () => {
+    const root = mkdtempSync(join(tmpdir(), "kern-think-"));
+    const storageRoot = join(root, "sessions");
+    try {
+      const first = await createAgentSession({
+        cwd: root,
+        storageRoot,
+        loadResources: false,
+        enableCompaction: false,
+      });
+      expect(first.session.thinkingMode()).toBe("medium");
+      await first.session.setThinkingLevel("high");
+      const sessionId = first.manager.sessionId!;
+      first.session.dispose();
+
+      const resumed = await createAgentSession({
+        cwd: root,
+        storageRoot,
+        loadResources: false,
+        enableCompaction: false,
+        resumeSession: sessionId,
+      });
+      expect(resumed.session.thinkingMode()).toBe("high");
+      resumed.session.dispose();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

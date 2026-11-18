@@ -128,13 +128,15 @@ export async function createAgentSession(
           askRules: [...new Set([...(settings.permissionRules?.askRules ?? []), ...(options.permissionRules?.askRules ?? [])])],
         }
       : undefined;
-  const effectiveProps: CreateAgentSessionOptions = {
+  const effectiveProps: CreateAgentSessionOptions & { _explicitThinkingLevel?: ThinkingLevel; _settingsThinkingLevel?: ThinkingLevel } = {
     ...options,
     policy: { ...(settings.policy ?? {}), ...(options.policy ?? {}) },
     safetyMode: options.safetyMode ?? settings.safetyMode,
     permissionRules: effectivePermissionRules,
     budgets: { ...(settings.budgets ?? {}), ...(options.budgets ?? {}) },
     thinkingLevel: options.thinkingLevel ?? settings.thinkingLevel ?? "medium",
+    _explicitThinkingLevel: options.thinkingLevel,
+    _settingsThinkingLevel: settings.thinkingLevel,
   };
   return createSessionRuntime(effectiveProps);
 }
@@ -158,7 +160,7 @@ async function createSessionRuntime(options: CreateAgentSessionOptions): Promise
 }
 
 async function buildSessionWithRuntime(
-  options: CreateAgentSessionOptions,
+  options: CreateAgentSessionOptions & { _explicitThinkingLevel?: ThinkingLevel; _settingsThinkingLevel?: ThinkingLevel },
   manager: SessionManager,
   logger: Logger,
 ): Promise<{ session: AgentSession; manager: SessionManager }> {
@@ -251,6 +253,18 @@ async function buildSessionWithRuntime(
     if (section) contextBuilder.setSystemExtra(section);
   }
 
+  let persistedThinkingLevel: ThinkingLevel | undefined;
+  for (const entry of manager.getActivePath()) {
+    if (
+      entry.type === "model_change" &&
+      (entry.thinkingLevel === "off" || entry.thinkingLevel === "low" || entry.thinkingLevel === "medium" || entry.thinkingLevel === "high")
+    ) {
+      persistedThinkingLevel = entry.thinkingLevel;
+    }
+  }
+  const resolvedThinkingLevel: ThinkingLevel =
+    options._explicitThinkingLevel ?? persistedThinkingLevel ?? options._settingsThinkingLevel ?? options.thinkingLevel ?? "medium";
+
   const model = options.model ?? createFakeModel();
   const runtime = new AgentRuntime({
     model,
@@ -262,7 +276,7 @@ async function buildSessionWithRuntime(
     logger,
     budgets: options.budgets,
     compactor: options.enableCompaction === false ? null : new Compactor({ logger }),
-    defaultThinkingLevel: options.thinkingLevel ?? "medium",
+    defaultThinkingLevel: resolvedThinkingLevel,
     hookExecutor,
     requestApproval: options.requestApproval,
   });
