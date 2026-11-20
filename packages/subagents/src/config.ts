@@ -14,7 +14,7 @@ import type {
   SubagentOrigin,
 } from "./types.js";
 
-const VALID_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const VALID_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const DEFAULT_MAX_TURNS = 12;
 const DEFAULT_MAX_TOOL_CALLS = 30;
 const DEFAULT_WALL_TIME_MS = 120_000;
@@ -101,11 +101,11 @@ function subagentFingerprint(cwd: string, name: string, entry: SubagentConfigEnt
         type: entry.type ?? (entry.url ? "a2a" : "local"),
         mode: entry.mode ?? "readonly",
         isolation: entry.isolation ?? null,
-        tools: entry.tools ?? null,
+        tools: expandToolsList(entry.tools) ?? null,
         mcpServers: entry.mcpServers ?? null,
         url: entry.url ?? null,
         allowDelegation: entry.allowDelegation === true,
-        instruction: entry.instruction ?? "",
+        instruction: (entry.instruction ?? "").trim(),
       }),
     )
     .digest("hex")
@@ -183,7 +183,7 @@ function parseListValue(raw: string): string[] {
     .filter(Boolean);
 }
 
-function expandToolsList(rawTools: string[] | undefined): string[] | undefined {
+export function expandToolsList(rawTools: string[] | undefined): string[] | undefined {
   if (!rawTools || rawTools.length === 0) return undefined;
   const expanded: string[] = [];
   for (const item of rawTools) {
@@ -444,6 +444,28 @@ export function parseSubagentYaml(content: string, fallbackName: string): Subage
   return buildEntryFromParsed(fields, listFields, mapFields, "", fallbackName);
 }
 
+const PLAIN_MD_KNOWN_META_KEYS = new Set([
+  "name",
+  "description",
+  "type",
+  "url",
+  "headers",
+  "mode",
+  "isolation",
+  "tools",
+  "mcpServers",
+  "model",
+  "strictModel",
+  "thinkingLevel",
+  "maxTurns",
+  "maxTotalToolCalls",
+  "maxWallTimeMs",
+  "maxCost",
+  "timeoutMs",
+  "allowDelegation",
+  "disabled",
+]);
+
 /**
  * Parse a Markdown subagent file. Supports BOTH YAML frontmatter (`--- ... ---`)
  * and user-friendly frontmatter-free plain Markdown (`# Heading`, optional `Mode: ...`, `## Instructions`).
@@ -462,87 +484,104 @@ export function parseSubagentMarkdown(content: string, fallbackName: string): Su
 
   const lines = trimmed.split("\n");
   const fields: Record<string, string> = {};
-  const listFields: Record<string, string[]> = {};
   let cursor = 0;
 
-  // Optional `# Title` heading
+  // Optional `# Title` heading (used as name if valid or slugified when fallbackName is generic)
   let headingText = "";
   if (lines[0] && /^#\s+/.test(lines[0])) {
     headingText = lines[0].replace(/^#\s+/, "").trim();
-    if (headingText && VALID_NAME_RE.test(headingText)) {
-      fields["name"] = headingText;
+    if (headingText) {
+      if (VALID_NAME_RE.test(headingText)) {
+        fields["name"] = headingText;
+      } else {
+        const slug = headingText.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
+        if (slug && VALID_NAME_RE.test(slug) && (!fallbackName || fallbackName === "custom-agent")) {
+          fields["name"] = slug;
+        }
+      }
     }
     cursor = 1;
   }
 
   while (cursor < lines.length && !lines[cursor]!.trim()) cursor += 1;
 
-  // Optional short summary paragraph directly under `# Heading` (before Key: Value metadata)
+  const summaryLines: string[] = [];
   const metaLines: string[] = [];
   const bodyLines: string[] = [];
-  let inMetaPhase = true;
+  type PlainPhase = "summary" | "meta" | "body";
+  let phase: PlainPhase = "summary";
+  let activeIndentedMeta = false;
 
   for (let i = cursor; i < lines.length; i++) {
     const line = lines[i]!;
     const t = line.trim();
-    if (inMetaPhase && /^##\s+(?:instructions?|system prompt|prompt)\b/i.test(t)) {
-      inMetaPhase = false;
+
+    if ((phase !== "body" || bodyLines.length === 0) && /^##\s+(?:instructions?|system prompt|prompt)\b/i.test(t)) {
+      phase = "body";
+      activeIndentedMeta = false;
       continue;
     }
-    if (inMetaPhase) {
-      const kv = line.match(/^([A-Za-z][A-Za-z0-9_-]{1,30})\s*:\s*(.+)$/);
-      if (kv) {
-        const canonical = normalizeFieldKey(kv[1]!);
-        const knownKeys = new Set([
-          "name",
-          "description",
-          "type",
-          "url",
-          "mode",
-          "isolation",
-          "tools",
-          "mcpServers",
-          "model",
-          "strictModel",
-          "thinkingLevel",
-          "maxTurns",
-          "maxTotalToolCalls",
-          "maxWallTimeMs",
-          "maxCost",
-          "timeoutMs",
-          "allowDelegation",
-          "disabled",
-        ]);
-        if (knownKeys.has(canonical)) {
-          metaLines.push(line);
+
+    if (phase !== "body") {
+      if (activeIndentedMeta && /^\s+(?:-\s+.+|[^:\s][^:]*:\s*.*)$/.test(line)) {
+        metaLines.push(line);
+        continue;
+      }
+      activeIndentedMeta = false;
+
+      const kv = line.match(/^([A-Za-z][A-Za-z0-9_-]{1,30})\s*:\s*(.*)$/);
+      if (kv && PLAIN_MD_KNOWN_META_KEYS.has(normalizeFieldKey(kv[1]!))) {
+        phase = "meta";
+        metaLines.push(line);
+        if (!kv[2]!.trim()) activeIndentedMeta = true;
+        continue;
+      }
+
+      if (!t) {
+        if ((phase === "summary" && summaryLines.length > 0) || (phase === "meta" && metaLines.length > 0)) {
+          // Blank line after summary/metadata: peek ahead to see if another metadata line follows
+          let j = i + 1;
+          while (j < lines.length && !lines[j]!.trim()) j += 1;
+          const nextLine = lines[j] ?? "";
+          const nextKv = nextLine.match(/^([A-Za-z][A-Za-z0-9_-]{1,30})\s*:\s*(.*)$/);
+          const nextIsHeading = /^##\s+(?:instructions?|system prompt|prompt)\b/i.test(nextLine.trim());
+          if (nextIsHeading || (nextKv && PLAIN_MD_KNOWN_META_KEYS.has(normalizeFieldKey(nextKv[1]!)))) {
+            phase = "meta";
+            continue;
+          }
+          phase = "body";
           continue;
         }
-      }
-      if (!t && metaLines.length > 0 && bodyLines.length === 0) {
-        // Blank line after metadata transitions to instruction body
-        inMetaPhase = false;
         continue;
       }
-      if (metaLines.length === 0 && !fields["description"] && t && !t.startsWith("#")) {
-        // Treat initial plain summary line before metadata as candidate description & also preserve in body if no later body
-        bodyLines.push(line);
+
+      if (phase === "summary" && !t.startsWith("#")) {
+        summaryLines.push(t);
         continue;
       }
-      inMetaPhase = false;
+
+      phase = "body";
     }
+
     bodyLines.push(line);
   }
 
   const parsedMeta = parseKeyValueBlock(metaLines);
   for (const [k, v] of Object.entries(parsedMeta.fields)) fields[k] = v;
-  for (const [k, v] of Object.entries(parsedMeta.listFields)) listFields[k] = v;
 
-  const instruction = bodyLines.join("\n").trim() || headingText;
-  if (!fields["description"] && headingText && bodyLines.length === 0) {
+  if (!fields["description"] && summaryLines.length > 0) {
+    fields["description"] = summaryLines.join(" ").trim();
+  } else if (!fields["description"] && headingText && bodyLines.length === 0) {
     fields["description"] = headingText;
   }
 
-  return buildEntryFromParsed(fields, listFields, parsedMeta.mapFields, instruction, fallbackName);
+  const instruction =
+    bodyLines.join("\n").trim() ||
+    parsedMeta.fields["instruction"] ||
+    (summaryLines.length > 0 ? summaryLines.join("\n") : "") ||
+    headingText;
+
+  return buildEntryFromParsed(fields, parsedMeta.listFields, parsedMeta.mapFields, instruction, fallbackName);
 }
 
 /**
@@ -566,7 +605,13 @@ export function parseSubagentFile(
           const entries = Object.entries(parsed["agents"] as Record<string, SubagentConfigEntry>);
           if (entries.length > 0) {
             const [k, item] = entries[0]!;
-            return { ...item, name: item.name?.trim() || k };
+            const resolvedName = (item.name?.trim() || k).trim();
+            if (!VALID_NAME_RE.test(resolvedName)) return null;
+            return {
+              ...item,
+              name: resolvedName,
+              ...(item.tools ? { tools: expandToolsList(item.tools) } : {}),
+            };
           }
         }
         const raw = parsed as Partial<SubagentConfigEntry>;
@@ -594,8 +639,18 @@ export function parseSubagentFile(
   }
 
   // Auto-detect raw pasted text
-  if (trimmed.startsWith("---\n") || trimmed.startsWith("#")) {
+  if (trimmed.startsWith("---\n")) {
     return parseSubagentMarkdown(content, fallbackName);
+  }
+  const looksLikeYaml =
+    /^(?:#[^\n]*\n\s*)*[a-z_]+\s*:/i.test(trimmed) &&
+    (/\n(?:name|description|summary|instruction|instructions|tools|mode)\s*:/i.test(trimmed) ||
+      /^(?:name|description|summary)\s*:/i.test(trimmed));
+  if (looksLikeYaml) {
+    return parseSubagentYaml(content, fallbackName) ?? parseSubagentMarkdown(content, fallbackName);
+  }
+  if (trimmed.startsWith("#")) {
+    return parseSubagentMarkdown(content, fallbackName) ?? parseSubagentYaml(content, fallbackName);
   }
   return parseSubagentYaml(content, fallbackName) ?? parseSubagentMarkdown(content, fallbackName);
 }
@@ -756,10 +811,16 @@ function resolveEntry(
     }
   }
 
+  const expandedTools = expandToolsList(rawEntry.tools);
+  const normalizedEntry: SubagentConfigEntry = {
+    ...rawEntry,
+    ...(expandedTools ? { tools: expandedTools } : {}),
+  };
+
   let trusted = true;
   let trustReason: string | undefined;
-  if (origin === "project" && !opts.allowProjectUntrusted && requiresProjectTrust(rawEntry, mode, kind)) {
-    const fp = subagentFingerprint(cwd, name, rawEntry);
+  if (origin === "project" && !opts.allowProjectUntrusted && requiresProjectTrust(normalizedEntry, mode, kind)) {
+    const fp = subagentFingerprint(cwd, name, normalizedEntry);
     const saved = opts.trustMap?.[`${resolve(cwd)}::${name}`];
     if (saved !== fp) {
       trusted = false;
@@ -779,7 +840,7 @@ function resolveEntry(
     isolation,
     origin,
     sourcePath: opts.sourcePath,
-    ...(rawEntry.tools ? { tools: [...new Set(rawEntry.tools)] } : {}),
+    ...(expandedTools ? { tools: expandedTools } : {}),
     ...(rawEntry.mcpServers ? { mcpServers: [...new Set(rawEntry.mcpServers)] } : {}),
     ...(rawEntry.model ? { model: rawEntry.model.trim() } : {}),
     strictModel: rawEntry.strictModel === true,
@@ -798,7 +859,7 @@ function resolveEntry(
     ...(resolvedUrl ? { url: resolvedUrl } : {}),
     ...(resolvedHeaders ? { headers: resolvedHeaders } : {}),
     timeoutMs: clampInt(rawEntry.timeoutMs, DEFAULT_A2A_TIMEOUT_MS, 1_000, 300_000),
-    rawEntry,
+    rawEntry: normalizedEntry,
   };
 }
 
@@ -908,10 +969,8 @@ export async function loadSubagentConfigs(
     ...(await readAgentsJson(defaultProjectAgentsJsonPath(root), "project", warnings)),
   ];
 
-  const defs: ResolvedSubagentDef[] = [];
-  const seen = new Set<string>();
+  const resolvedByName = new Map<string, ResolvedSubagentDef>();
   for (const item of rawItems) {
-    if (seen.has(item.entry.name)) continue;
     const resolved = resolveEntry(item.entry, item.origin, root, {
       sourcePath: item.sourcePath,
       allowProjectUntrusted: opts.allowProjectUntrusted,
@@ -922,7 +981,12 @@ export async function loadSubagentConfigs(
       warnings.push(`Ignored invalid subagent entry "${item.entry.name}" (${item.sourcePath})`);
       continue;
     }
-    seen.add(resolved.name);
+    // Project definitions override user defaults of the same name (and retain fail-closed trust checks)
+    resolvedByName.set(resolved.name, resolved);
+  }
+
+  const defs: ResolvedSubagentDef[] = [];
+  for (const resolved of resolvedByName.values()) {
     if (!resolved.trusted && resolved.trustReason) warnings.push(resolved.trustReason);
     if (resolved.missingEnvVars.length > 0) {
       warnings.push(`Subagent "${resolved.name}" references unset env var(s): ${resolved.missingEnvVars.join(", ")}`);
@@ -940,7 +1004,7 @@ export async function saveSubagentConfig(
   opts: { userAgentsDir?: string; userAgentsJsonPath?: string; format?: SubagentFileFormat; templateComments?: boolean } = {},
 ): Promise<string> {
   if (!VALID_NAME_RE.test(entry.name)) {
-    throw new Error(`Invalid subagent name "${entry.name}": use [A-Za-z0-9_.-] (1-64 chars)`);
+    throw new Error(`Invalid subagent name "${entry.name}": start with alphanumeric and use [A-Za-z0-9_.-] (1-64 chars)`);
   }
   if (!entry.description.trim()) {
     throw new Error("Subagent description is required.");
@@ -977,15 +1041,26 @@ export async function saveSubagentConfig(
   const format: SubagentFileFormat = opts.format ?? "md";
   const dir = scope === "user" ? (opts.userAgentsDir ?? defaultUserAgentsDir()) : defaultProjectAgentsDir(cwd);
   const filePath = join(dir, `${entry.name}.${format}`);
+  const expanded = expandToolsList(entry.tools);
+  const { tools: _rawTools, ...entryWithoutTools } = entry;
+  const normalizedEntry: SubagentConfigEntry = {
+    ...entryWithoutTools,
+    ...(expanded ? { tools: expanded } : {}),
+  };
   const body = opts.templateComments
-    ? renderSubagentTemplate(entry, format)
+    ? renderSubagentTemplate(normalizedEntry, format)
     : format === "json"
-      ? JSON.stringify(entry, null, 2) + "\n"
+      ? JSON.stringify(normalizedEntry, null, 2) + "\n"
       : format === "yaml"
-        ? renderSubagentYaml(entry)
-        : renderSubagentMarkdown(entry);
+        ? renderSubagentYaml(normalizedEntry)
+        : renderSubagentMarkdown(normalizedEntry);
 
   await mkdir(dir, { recursive: true });
+  // Clean sibling format extensions in the same directory so switching .md -> .yaml doesn't leave stale shadows
+  for (const ext of ["md", "markdown", "yaml", "yml", "json"]) {
+    if (ext === format) continue;
+    await unlink(join(dir, `${entry.name}.${ext}`)).catch(() => {});
+  }
   await writeFile(filePath, body, {
     encoding: "utf8",
     mode: scope === "user" ? 0o600 : 0o644,
@@ -999,6 +1074,7 @@ export async function removeSubagentConfig(
   name: string,
   opts: { userAgentsDir?: string; userAgentsJsonPath?: string } = {},
 ): Promise<boolean> {
+  if (!VALID_NAME_RE.test(name)) return false;
   let removed = false;
   const dir = scope === "user" ? (opts.userAgentsDir ?? defaultUserAgentsDir()) : defaultProjectAgentsDir(cwd);
   for (const ext of ["md", "markdown", "yaml", "yml", "json"]) {
@@ -1041,14 +1117,13 @@ export async function setSubagentDisabledInFile(
         await writeFile(def.sourcePath, JSON.stringify(doc, null, 2) + "\n", "utf8");
         return true;
       }
-      const nextObj: SubagentConfigEntry = { ...def.rawEntry, disabled };
+      const { disabled: _prev, ...restObj } = def.rawEntry;
+      const nextObj: SubagentConfigEntry = disabled ? { ...restObj, disabled: true } : restObj;
       await writeFile(def.sourcePath, JSON.stringify(nextObj, null, 2) + "\n", "utf8");
       return true;
     }
-    const nextEntry: SubagentConfigEntry = {
-      ...def.rawEntry,
-      disabled,
-    };
+    const { disabled: _prev, ...restEntry } = def.rawEntry;
+    const nextEntry: SubagentConfigEntry = disabled ? { ...restEntry, disabled: true } : restEntry;
     if (def.sourcePath.endsWith(".yaml") || def.sourcePath.endsWith(".yml")) {
       await writeFile(def.sourcePath, renderSubagentYaml(nextEntry), "utf8");
       return true;

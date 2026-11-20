@@ -129,4 +129,44 @@ describe("CLI v1.0 flags and modes", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("manages multi-format subagents via `kern agents` (format, init yaml/md, list, disable, enable, remove)", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "kern-cli-agents-home-"));
+    const projDir = mkdtempSync(join(tmpdir(), "kern-cli-agents-proj-"));
+    const env = { ...process.env, HOME: fakeHome };
+    try {
+      const fmtRes = await execFileAsync(TSX_BIN, [CLI_ENTRY, "agents", "format"], { env });
+      expect(fmtRes.stdout).toContain("Markdown with frontmatter");
+      expect(fmtRes.stdout).toContain("Single-agent YAML");
+
+      const initRes = await execFileAsync(
+        TSX_BIN,
+        [CLI_ENTRY, "agents", "init", "reviewer", "--format", "yaml", "--preset", "reviewer", "--project", "--cwd", projDir],
+        { env },
+      );
+      expect(initRes.stdout).toContain("reviewer.yaml");
+      const yamlBody = readFileSync(join(projDir, ".kern", "agents", "reviewer.yaml"), "utf8");
+      expect(yamlBody).toContain("name: reviewer");
+      expect(yamlBody).toContain("mode: readonly");
+
+      const listRes = await execFileAsync(TSX_BIN, [CLI_ENTRY, "agents", "list", "--cwd", projDir], { env });
+      expect(listRes.stdout).toContain("reviewer\tlocal\tproject\tready");
+
+      const disRes = await execFileAsync(TSX_BIN, [CLI_ENTRY, "agents", "disable", "reviewer", "--cwd", projDir], { env });
+      expect(disRes.stdout).toContain("reviewer: disabled");
+
+      const enRes = await execFileAsync(TSX_BIN, [CLI_ENTRY, "agents", "enable", "reviewer", "--cwd", projDir], { env });
+      expect(enRes.stdout).toContain("reviewer: ready");
+
+      await expect(
+        execFileAsync(TSX_BIN, [CLI_ENTRY, "agents", "add", "..", "--project", "--cwd", projDir], { env }),
+      ).rejects.toThrow();
+
+      const rmRes = await execFileAsync(TSX_BIN, [CLI_ENTRY, "agents", "remove", "reviewer", "--project", "--cwd", projDir], { env });
+      expect(rmRes.stdout).toContain('Removed subagent "reviewer"');
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+      rmSync(projDir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

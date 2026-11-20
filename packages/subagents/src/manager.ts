@@ -1,6 +1,7 @@
 import { nullLogger, textResult, type Logger, type ToolDefinition, type ToolResult } from "@kern/protocol";
 import { discoverA2ACard, invokeA2AAgent } from "./a2a.js";
 import {
+  expandToolsList,
   loadSubagentConfigs,
   removeSubagentConfig,
   saveSubagentConfig,
@@ -98,11 +99,17 @@ export class SubagentManager {
 
   /** Discover configured local specialists and remote A2A agents. Dormant when 0 exist. */
   async discover(): Promise<{ agents: SubagentStatus[]; warnings: string[] }> {
+    const memoryEntries = [...this.agents.values()].filter((m) => m.def.origin === "memory");
     const { defs, warnings } = await loadSubagentConfigs(this.cwd, this.configOpts);
     this.warnings = [...warnings];
     this.agents.clear();
 
     await Promise.all(defs.map((def) => this.registerResolvedDef(def)));
+    for (const mem of memoryEntries) {
+      if (!this.agents.has(mem.def.name)) {
+        await this.registerResolvedDef(mem.def);
+      }
+    }
     this.syncRegistry();
     return { agents: this.listStatuses(), warnings: this.getWarnings() };
   }
@@ -266,6 +273,18 @@ export class SubagentManager {
     }
 
     // In-memory only
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(entry.name)) {
+      throw new Error(`Invalid subagent name "${entry.name}": start with alphanumeric and use [A-Za-z0-9_.-] (1-64 chars)`);
+    }
+    if (!entry.description.trim()) {
+      throw new Error("Subagent description is required.");
+    }
+    const expandedTools = expandToolsList(entry.tools);
+    const { tools: _rawTools, ...entryRest } = entry;
+    const normalizedEntry: SubagentConfigEntry = {
+      ...entryRest,
+      ...(expandedTools ? { tools: expandedTools } : {}),
+    };
     const def: ResolvedSubagentDef = {
       name: entry.name,
       description: entry.description,
@@ -277,7 +296,7 @@ export class SubagentManager {
           ? "readonly"
           : entry.isolation ?? (entry.mode === "write" ? "exclusive" : "readonly"),
       origin: "memory",
-      tools: entry.tools,
+      tools: expandedTools,
       mcpServers: entry.mcpServers,
       model: entry.model,
       strictModel: entry.strictModel === true,
@@ -293,7 +312,7 @@ export class SubagentManager {
       url: entry.url,
       headers: entry.headers,
       timeoutMs: entry.timeoutMs ?? 60_000,
-      rawEntry: entry,
+      rawEntry: normalizedEntry,
     };
     const status = await this.registerResolvedDef(def);
     this.syncRegistry();
@@ -543,6 +562,14 @@ export class SubagentManager {
             },
           });
         } else {
+          const extraTools: ToolDefinition[] = [];
+          if (def.allowDelegation && execCtx.depth + 1 < MAX_DEPTH) {
+            const nextAncestors = new Set(execCtx.ancestors);
+            nextAncestors.add(def.name);
+            extraTools.push(
+              this.createDelegateTool({ depth: execCtx.depth + 1, ancestors: nextAncestors }) as unknown as ToolDefinition,
+            );
+          }
           const runLocal = () =>
             runLocalSubagent({
               def,
@@ -553,6 +580,7 @@ export class SubagentManager {
               files: params.files,
               background: true,
               signal: ctrl.signal,
+              extraTools,
               onTurn: (t) => {
                 job.turns = t;
               },
@@ -813,10 +841,12 @@ export class SubagentManager {
         const name = args.name?.trim();
         const description = args.description?.trim();
         const instruction = args.instruction?.trim();
-        if (!name || !/^[A-Za-z0-9_.-]{1,64}$/.test(name) || !description || !instruction) {
-          return textResult("Invalid subagent proposal: valid name ([A-Za-z0-9_.-]), description, and instruction are required.", true, {
-            code: "E_TOOL_INVALID_ARGS",
-          });
+        if (!name || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name) || !description || !instruction) {
+          return textResult(
+            "Invalid subagent proposal: name must start with alphanumeric ([A-Za-z0-9][A-Za-z0-9_.-]{0,63}), and description + instruction are required.",
+            true,
+            { code: "E_TOOL_INVALID_ARGS" },
+          );
         }
 
         const mode: SubagentMode = args.mode === "write" ? "write" : "readonly";
@@ -830,12 +860,17 @@ export class SubagentManager {
           args.scope === "project" || args.scope === "user" ? args.scope : "memory";
         const format: SubagentFileFormat =
           args.format === "yaml" || args.format === "json" ? args.format : "md";
+        const expandedTools = expandToolsList(args.tools);
+        const existingAgent = this.agents.get(name);
 
         const promptLines = [
           `Allow creating${args.task ? " & running" : ""} subagent "${name}"?`,
+          ...(existingAgent
+            ? [`Note: replaces existing ${existingAgent.def.origin} subagent "${name}"`]
+            : []),
           `Scope: ${scope === "memory" ? "memory (this session only)" : `${scope} (saves .${format} file)`}`,
           `Capability: mode=${mode}, isolation=${isolation}`,
-          `Tools: ${args.tools?.length ? args.tools.join(", ") : `${mode} defaults`}${args.mcpServers?.length ? ` | MCP: ${args.mcpServers.join(", ")}` : ""}${args.model ? ` | Model: ${args.model}` : ""}`,
+          `Tools: ${expandedTools?.length ? expandedTools.join(", ") : `${mode} defaults`}${args.mcpServers?.length ? ` | MCP: ${args.mcpServers.join(", ")}` : ""}${args.model ? ` | Model: ${args.model}` : ""}`,
           ...(args.reason?.trim() ? [`Reason: ${args.reason.trim()}`] : []),
           `Description: ${description}`,
           `Instruction: ${instruction.length > 220 ? `${instruction.slice(0, 217)}...` : instruction}`,
@@ -882,7 +917,7 @@ export class SubagentManager {
           instruction,
           mode,
           isolation,
-          ...(args.tools?.length ? { tools: args.tools } : {}),
+          ...(expandedTools?.length ? { tools: expandedTools } : {}),
           ...(args.mcpServers?.length ? { mcpServers: args.mcpServers } : {}),
           ...(args.model?.trim() ? { model: args.model.trim() } : {}),
           ...(args.maxTurns !== undefined ? { maxTurns: args.maxTurns } : {}),

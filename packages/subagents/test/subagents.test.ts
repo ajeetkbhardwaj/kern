@@ -24,6 +24,7 @@ import {
   SUBAGENT_PRESETS,
   SubagentManager,
   discoverA2ACard,
+  expandToolsList,
   findSubagentPreset,
   parseSubagentFile,
   parseSubagentMarkdown,
@@ -31,6 +32,7 @@ import {
   renderSubagentMarkdown,
   renderSubagentTemplate,
   renderSubagentYaml,
+  saveSubagentConfig,
 } from "../src/index.js";
 
 const execFileAsync = promisify(execFile);
@@ -842,6 +844,193 @@ describe("@kern/subagents", () => {
       expect(approvedSetup.registry.has("delegate")).toBe(true);
 
       await approvedSetup.subagents.dispose();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("handles bug-hunt edge cases: traversal names, plain MD blank lines & bullets, commented YAML auto-detect, project overrides, and format switching", async () => {
+    const root = mkdtempSync(join(tmpdir(), "kern-sub-bughunt-"));
+    try {
+      const userAgentsDir = join(root, "__user_agents");
+      const userAgentsJsonPath = join(root, "__user_agents.json");
+      const trustFilePath = join(root, "__agent_trust.json");
+      mkdirSync(userAgentsDir, { recursive: true });
+      mkdirSync(join(root, ".kern", "agents"), { recursive: true });
+
+      // 1) Reject traversal & leading-dot names
+      for (const bad of [".", "..", ".hidden", "../escape"]) {
+        await expect(
+          saveSubagentConfig("project", root, { name: bad, description: "Invalid" }, { userAgentsDir, userAgentsJsonPath }),
+        ).rejects.toThrow(/Invalid subagent name/i);
+      }
+
+      // 2) Plain Markdown with spaces in heading, blank line before metadata, and bulleted tools list
+      const spacedMd = [
+        "# Security Reviewer",
+        "Reviews authentication flows and session checks.",
+        "",
+        "Mode: readonly",
+        "Tools:",
+        "  - read",
+        "  - grep",
+        "",
+        "## Instructions",
+        "Check every token verifier carefully.",
+      ].join("\n");
+      const parsedSpaced = parseSubagentFile(spacedMd, "", "custom-agent")!;
+      expect(parsedSpaced.name).toBe("security-reviewer");
+      expect(parsedSpaced.description).toBe("Reviews authentication flows and session checks.");
+      expect(parsedSpaced.tools).toEqual(["read", "grep"]);
+      expect(parsedSpaced.instruction).toBe("Check every token verifier carefully.");
+
+      // 3) Commented YAML template pasted without file extension auto-detects as YAML
+      const commentedYaml = renderSubagentTemplate(
+        {
+          name: "yaml-worker",
+          description: "Handles YAML-defined tasks",
+          mode: "readonly",
+          tools: ["readonly"],
+          instruction: "Inspect code thoroughly.",
+        },
+        "yaml",
+      );
+      const parsedAutoYaml = parseSubagentFile(commentedYaml, "")!;
+      expect(parsedAutoYaml.name).toBe("yaml-worker");
+      expect(parsedAutoYaml.tools).toEqual(expandToolsList(["readonly"]));
+
+      // 4) Switching format from md -> yaml removes stale .md sibling and project overrides user cleanly
+      await saveSubagentConfig(
+        "user",
+        root,
+        { name: "auditor", description: "User global auditor", mode: "readonly", tools: ["read"] },
+        { userAgentsDir, userAgentsJsonPath, format: "md" },
+      );
+      expect(readFileSync(join(userAgentsDir, "auditor.md"), "utf8")).toContain("User global auditor");
+
+      await saveSubagentConfig(
+        "user",
+        root,
+        { name: "auditor", description: "User YAML auditor", mode: "readonly", tools: ["read", "grep"] },
+        { userAgentsDir, userAgentsJsonPath, format: "yaml" },
+      );
+      expect(() => readFileSync(join(userAgentsDir, "auditor.md"), "utf8")).toThrow();
+      expect(readFileSync(join(userAgentsDir, "auditor.yaml"), "utf8")).toContain("User YAML auditor");
+
+      // Project override of "auditor" wins over user default, while write mode still enforces fail-closed trust
+      writeFileSync(
+        join(root, ".kern", "agents", "auditor.md"),
+        "---\nname: auditor\ndescription: Project write auditor\nmode: write\ntools: [read, edit]\n---\nEdit carefully.",
+      );
+
+      const dummyModel: ModelAdapter = {
+        info: { provider: "mock", modelId: "m1", contextWindow: 32_000, maxOutputTokens: 1000 },
+        async *stream() {
+          yield { type: "text_delta", delta: "ok" };
+          yield { type: "finished", reason: "stop" };
+        },
+      };
+      const subagents = new SubagentManager({
+        cwd: root,
+        logger: nullLogger,
+        userAgentsDir,
+        userAgentsJsonPath,
+        trustFilePath,
+      });
+      await subagents.discover();
+      const overridden = subagents.getStatus("auditor");
+      expect(overridden?.origin).toBe("project");
+      expect(overridden?.state).toBe("untrusted");
+      expect(overridden?.description).toBe("Project write auditor");
+
+      // Project subagent created with shorthand tools ("coding") must remain trusted after discover()
+      await subagents.addSubagent(
+        { name: "writer-shorthand", description: "Fix code", mode: "write", tools: ["coding"], instruction: "Edit files." },
+        { scope: "project", format: "md" },
+      );
+      expect(subagents.getStatus("writer-shorthand")?.state).toBe("ready");
+      await subagents.discover();
+      expect(subagents.getStatus("writer-shorthand")?.state).toBe("ready");
+      expect(subagents.getStatus("writer-shorthand")?.tools).toEqual(expandToolsList(["coding"]));
+
+      await subagents.dispose();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves memory subagents on discover(), expands tool shorthands in create-subagent, and warns on overwrite", async () => {
+    const root = mkdtempSync(join(tmpdir(), "kern-sub-mem-"));
+    try {
+      const seenChildTools: string[] = [];
+      const model: ModelAdapter = {
+        info: { provider: "mock", modelId: "m1", contextWindow: 32_000, maxOutputTokens: 1000 },
+        async *stream(req: ModelRequest): AsyncIterable<ModelStreamEvent> {
+          seenChildTools.push(...req.tools.map((t) => t.name));
+          yield { type: "text_delta", delta: "inspected with expanded tools" };
+          yield { type: "finished", reason: "stop" };
+        },
+      };
+
+      const prompts: string[] = [];
+      const { registry, subagents } = makeHostSetup({
+        cwd: root,
+        model,
+        requestApproval: async (prompt) => {
+          prompts.push(prompt);
+          return true;
+        },
+      });
+      await subagents.discover();
+
+      // Reject dot traversal name inside create-subagent
+      const badCreate = await registry.execute(
+        "create-subagent",
+        { name: "..", description: "bad", instruction: "bad" },
+        new AbortController().signal,
+      );
+      expect(badCreate.isError).toBe(true);
+      expect(badCreate.details?.code).toBe("E_TOOL_INVALID_ARGS");
+
+      // Create memory agent with tools: ["readonly"] shorthand -> runner MUST expose expanded read/grep/find/git-* tools
+      const createRes = await registry.execute(
+        "create-subagent",
+        {
+          name: "scout-mem",
+          description: "Session-only codebase scout",
+          instruction: "Search cleanly.",
+          mode: "readonly",
+          tools: ["readonly"],
+          scope: "memory",
+          task: "Scan workspace",
+        },
+        new AbortController().signal,
+      );
+      expect(createRes.isError).toBe(false);
+      expect(createRes.content[0]?.text).toContain("inspected with expanded tools");
+      expect(seenChildTools).toContain("read");
+      expect(seenChildTools).toContain("grep");
+      expect(seenChildTools).toContain("find");
+
+      // discover() must NOT wipe memory-scoped agents!
+      await subagents.discover();
+      expect(subagents.getStatus("scout-mem")?.state).toBe("ready");
+      expect(registry.has("delegate")).toBe(true);
+
+      // Re-proposing same name warns that it replaces an existing subagent
+      await registry.execute(
+        "create-subagent",
+        {
+          name: "scout-mem",
+          description: "Updated scout",
+          instruction: "Search again.",
+          mode: "readonly",
+        },
+        new AbortController().signal,
+      );
+      expect(prompts[1]).toContain('replaces existing memory subagent "scout-mem"');
+
+      await subagents.dispose();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

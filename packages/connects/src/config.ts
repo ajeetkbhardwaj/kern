@@ -9,7 +9,7 @@ import type {
   ResolvedMcpServerDef,
 } from "./types.js";
 
-const VALID_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const VALID_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export function defaultUserMcpPath(home = homedir()): string {

@@ -614,4 +614,30 @@ describe("@kern/connects", () => {
       srv.close();
     }
   });
+
+  it("rejects dot and traversal server names in loadMcpConfigs and saveMcpServerConfig", async () => {
+    const dir = makeTmp();
+    const userPath = join(dir, "mcp.json");
+    const trustPath = join(dir, "trust.json");
+    for (const badName of [".", "..", ".hidden", "../escape"]) {
+      await expect(
+        saveMcpServerConfig("user", dir, badName, { url: "https://example.com/mcp" }, { userConfigPath: userPath }),
+      ).rejects.toThrow(/Invalid server name/i);
+    }
+
+    writeFileSync(
+      join(dir, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          ".": { url: "https://example.com/a" },
+          "..": { url: "https://example.com/b" },
+          "valid-srv": { url: "https://example.com/c" },
+        },
+      }),
+    );
+
+    const loaded = await loadMcpConfigs(dir, { userConfigPath: userPath, trustFilePath: trustPath });
+    expect(loaded.defs.map((d) => d.name)).toEqual(["valid-srv"]);
+    expect(loaded.warnings.length).toBeGreaterThanOrEqual(2);
+  });
 });

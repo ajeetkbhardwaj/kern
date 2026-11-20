@@ -3137,6 +3137,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         else presetArg = tok;
       }
       const preset = presetArg ? findSubagentPreset(presetArg) : undefined;
+      if (presetArg && !preset) {
+        err(`Unknown preset "${presetArg}". Available: ${SUBAGENT_PRESETS.map((p) => p.id).join(", ")}`);
+        return;
+      }
       const entry: SubagentConfigEntry = preset
         ? { ...preset.entry, name }
         : {

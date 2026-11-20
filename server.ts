@@ -1479,6 +1479,7 @@ const INDEX_HTML = `<!doctype html>
 
     const agentDialog = document.getElementById("agent-dialog");
     let cachedAgentTemplates = {};
+    let lastAgentTemplateText = "";
     const syncAgentTypeFields = () => {
       const t = document.getElementById("agent-type").value;
       document.getElementById("agent-local-fields").style.display = t === "a2a" ? "none" : "block";
@@ -1492,19 +1493,32 @@ const INDEX_HTML = `<!doctype html>
       document.getElementById("agent-name").required = !isFile;
       document.getElementById("agent-description").required = !isFile;
     };
+    const applyStarterTemplateIfUntouched = () => {
+      const rawEl = document.getElementById("agent-raw-content");
+      const fmt = document.getElementById("agent-file-format").value;
+      const cur = rawEl.value.trim();
+      if (cachedAgentTemplates[fmt] && (!cur || cur === lastAgentTemplateText.trim())) {
+        rawEl.value = cachedAgentTemplates[fmt];
+        lastAgentTemplateText = cachedAgentTemplates[fmt];
+      }
+    };
     document.getElementById("agent-type").onchange = syncAgentTypeFields;
     document.getElementById("agent-input-mode").onchange = () => {
       syncAgentInputMode();
-      const rawEl = document.getElementById("agent-raw-content");
-      const fmt = document.getElementById("agent-file-format").value;
-      if (document.getElementById("agent-input-mode").value === "file" && !rawEl.value.trim() && cachedAgentTemplates[fmt]) {
-        rawEl.value = cachedAgentTemplates[fmt];
+      if (document.getElementById("agent-input-mode").value === "file") {
+        applyStarterTemplateIfUntouched();
+      }
+    };
+    document.getElementById("agent-file-format").onchange = () => {
+      if (document.getElementById("agent-input-mode").value === "file") {
+        applyStarterTemplateIfUntouched();
       }
     };
     document.getElementById("btn-agent-template").onclick = () => {
       const fmt = document.getElementById("agent-file-format").value;
       if (cachedAgentTemplates[fmt]) {
         document.getElementById("agent-raw-content").value = cachedAgentTemplates[fmt];
+        lastAgentTemplateText = cachedAgentTemplates[fmt];
       }
     };
 
@@ -1512,6 +1526,7 @@ const INDEX_HTML = `<!doctype html>
       const res = await fetch("/api/agents");
       const data = await res.json();
       cachedAgentTemplates = data.templates || {};
+      lastAgentTemplateText = "";
       document.getElementById("agent-format-hint").textContent = data.formatGuide || "";
       const presetSel = document.getElementById("agent-preset");
       presetSel.innerHTML = "<option value=''>custom</option>";
@@ -1539,6 +1554,9 @@ const INDEX_HTML = `<!doctype html>
       };
       syncAgentTypeFields();
       syncAgentInputMode();
+      if (document.getElementById("agent-input-mode").value === "file") {
+        applyStarterTemplateIfUntouched();
+      }
       agentDialog.showModal();
     }
 
@@ -1772,6 +1790,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (!name) {
       return sendJson(res, 400, { error: "Server name is required" });
     }
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) {
+      return sendJson(res, 400, { error: "Invalid server name: start with alphanumeric and use [A-Za-z0-9_.-] (1-64 chars)" });
+    }
     const transport =
       body.transport === "stdio" || body.transport === "http" || body.transport === "sse"
         ? body.transport
@@ -1816,8 +1837,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       }
     }
 
-    const server = await activeSession.connects.addServer(name, entry, { scope });
-    return sendJson(res, 200, { ok: true, server, snapshot: sessionSnapshot() });
+    try {
+      const server = await activeSession.connects.addServer(name, entry, { scope });
+      return sendJson(res, 200, { ok: true, server, snapshot: sessionSnapshot() });
+    } catch (err) {
+      return sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   if (method === "POST" && url.pathname === "/api/connects/reconnect") {
@@ -1908,8 +1933,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           error: "Could not parse subagent definition (ensure valid name & description in .md, .yaml, or .json format)",
         });
       }
-      const agent = await activeSession.subagents.addSubagent(parsed, { scope, ...(format ? { format } : {}) });
-      return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+      try {
+        const agent = await activeSession.subagents.addSubagent(parsed, { scope, ...(format ? { format } : {}) });
+        return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+      } catch (err) {
+        return sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
     }
 
     const rawEntry = (body.entry && typeof body.entry === "object" ? body.entry : body) as Record<string, unknown>;
@@ -1917,6 +1946,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const description = typeof rawEntry.description === "string" ? rawEntry.description.trim() : "";
     if (!name || !description) {
       return sendJson(res, 400, { error: "Agent name and description are required" });
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) {
+      return sendJson(res, 400, { error: "Invalid agent name: start with alphanumeric and use [A-Za-z0-9_.-] (1-64 chars)" });
     }
     const type = rawEntry.type === "a2a" || rawEntry.url ? "a2a" : "local";
     const entry: SubagentConfigEntry = {
@@ -1947,8 +1979,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (type === "a2a" && (!entry.url || !/^https?:\/\//i.test(entry.url))) {
       return sendJson(res, 400, { error: "Valid http(s) url is required for remote A2A agents" });
     }
-    const agent = await activeSession.subagents.addSubagent(entry, { scope, ...(format ? { format } : {}) });
-    return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+    try {
+      const agent = await activeSession.subagents.addSubagent(entry, { scope, ...(format ? { format } : {}) });
+      return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+    } catch (err) {
+      return sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   if (method === "POST" && url.pathname === "/api/agents/reload") {

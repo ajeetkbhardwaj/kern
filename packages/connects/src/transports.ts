@@ -722,8 +722,10 @@ export class HttpMcpClient implements McpTransportClient {
     }
     const id = this.nextId++;
     return new Promise<unknown>((resolve, reject) => {
+      const fetchCtrl = new AbortController();
       const timer = setTimeout(() => {
         this.ssePending.delete(id);
+        fetchCtrl.abort();
         reject(new Error(`MCP SSE request timed out: ${method}`));
       }, timeoutMs);
       if (typeof timer.unref === "function") timer.unref();
@@ -731,6 +733,7 @@ export class HttpMcpClient implements McpTransportClient {
       const onAbort = () => {
         this.ssePending.delete(id);
         clearTimeout(timer);
+        fetchCtrl.abort();
         reject(new Error(`MCP SSE request aborted: ${method}`));
       };
       if (signal?.aborted) {
@@ -756,7 +759,7 @@ export class HttpMcpClient implements McpTransportClient {
         method: "POST",
         headers: this.baseHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
-        signal,
+        signal: fetchCtrl.signal,
       })
         .then(async (res) => {
           if (!res.ok) {

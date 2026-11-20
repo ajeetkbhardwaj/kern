@@ -10,6 +10,7 @@ import {
 } from "@kern/agent-core";
 import { createAdapterFor, loadModelsFile } from "@kern/model";
 import {
+  KernError,
   boundText,
   nullLogger,
   redact,
@@ -342,9 +343,11 @@ export async function runLocalSubagent(opts: RunLocalSubagentOptions): Promise<T
       return textResult(`Subagent "${def.name}" aborted.`, true, { code: "E_CANCELLED" });
     }
 
-    // Check latest diagnostic or assistant output
+    // Check latest terminal diagnostic (ignore fail-open auto-compaction notices) or assistant output
     const entries = sessionManager.getActivePath();
-    const lastDiag = [...entries].reverse().find((e) => e.type === "diagnostic" && e.severity === "error");
+    const lastDiag = [...entries]
+      .reverse()
+      .find((e) => e.type === "diagnostic" && e.severity === "error" && e.code !== "E_COMPACTION_FAILED");
     if (lastDiag && lastDiag.type === "diagnostic") {
       return textResult(
         `Subagent "${def.name}" failed (${lastDiag.code}): ${lastDiag.message}`,
@@ -396,7 +399,7 @@ export async function runLocalSubagent(opts: RunLocalSubagentOptions): Promise<T
     return textResult(
       `Subagent "${def.name}" error: ${err instanceof Error ? err.message : String(err)}`,
       true,
-      { code: "E_TOOL_FAILED", subagent: def.name },
+      { code: err instanceof KernError ? err.code : "E_TOOL_FAILED", subagent: def.name },
     );
   } finally {
     childRuntime?.dispose();
