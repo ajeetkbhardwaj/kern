@@ -287,21 +287,25 @@ export async function loadMcpConfigs(
   };
 
   // 1. Env overrides
-  const envCommand = envSource["KERN_MCP_COMMAND"]?.trim();
-  if (envCommand) {
+  const envCommandRaw = envSource["KERN_MCP_COMMAND"]?.trim();
+  if (envCommandRaw) {
+    const expCmd = expandEnvString(envCommandRaw, envSource);
     seen.add("env");
+    if (expCmd.missing.length > 0) {
+      warnings.push(`MCP server "env" references unset env var(s): ${expCmd.missing.join(", ")}`);
+    }
     defs.push({
       name: "env",
       transport: "stdio",
       origin: "env",
-      shellCommand: envCommand,
+      shellCommand: expCmd.value,
       cwd: root,
       timeoutMs: DEFAULT_TIMEOUT_MS,
       disabled: false,
       deferred: false,
       trusted: true,
-      missingEnvVars: [],
-      rawEntry: { command: envCommand },
+      missingEnvVars: expCmd.missing,
+      rawEntry: { command: envCommandRaw },
     });
   }
   const envUrl = envSource["KERN_MCP_URL"]?.trim();

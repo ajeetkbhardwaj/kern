@@ -227,9 +227,9 @@ export class DefaultPolicy implements ToolPolicyEngine {
       return { decision: "require_approval", prompt: `Approve ${name} operation?` };
     }
 
-    // 9. Any non-read tool in ask mode
+    // 9. Any non-read tool in ask mode (`create-subagent` enforces mandatory per-proposal permission internally)
     const effect = input.sideEffect ?? (input.annotations?.readOnlyHint ? "read" : name === "read" ? "read" : "execute");
-    if (effect !== "read" && this.config.approvalMode === "ask" && !auto) {
+    if (name !== "create-subagent" && effect !== "read" && this.config.approvalMode === "ask" && !auto) {
       return { decision: "require_approval", prompt: `Approve ${name} operation?` };
     }
 

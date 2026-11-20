@@ -24,6 +24,7 @@ export class ContextBuilder {
   private readonly toolRegistry: ToolRegistry;
   private readonly logger: Logger;
   private systemExtra: string;
+  private readonly dynamicSections = new Map<string, string>();
 
   constructor(options: ContextBuilderOptions) {
     this.baseSystemPrompt = options.baseSystemPrompt;
@@ -36,8 +37,19 @@ export class ContextBuilder {
     this.systemExtra = text;
   }
 
+  setDynamicSection(key: string, text: string): void {
+    const trimmed = text.trim();
+    if (!trimmed) this.dynamicSections.delete(key);
+    else this.dynamicSections.set(key, trimmed);
+  }
+
   systemPrompt(): string {
-    return this.systemExtra ? `${this.baseSystemPrompt}\n\n${this.systemExtra}` : this.baseSystemPrompt;
+    const parts = [this.baseSystemPrompt];
+    if (this.systemExtra) parts.push(this.systemExtra);
+    for (const sec of this.dynamicSections.values()) {
+      parts.push(sec);
+    }
+    return parts.join("\n\n");
   }
 
   async build(sessions: SessionManager): Promise<ContextSnapshot> {

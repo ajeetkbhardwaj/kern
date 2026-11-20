@@ -53,10 +53,12 @@ export class BudgetTracker {
   private totalToolCalls = 0;
   private readonly byModel: Record<string, ModelBudgetUsage> = {};
   private readonly onEvent?: (event: AgentEvent) => void;
+  private readonly parent?: BudgetTracker;
 
-  constructor(limits: Partial<BudgetLimits> = {}, onEvent?: (event: AgentEvent) => void) {
+  constructor(limits: Partial<BudgetLimits> = {}, onEvent?: (event: AgentEvent) => void, parent?: BudgetTracker) {
     this.limits = { ...DEFAULT_BUDGET_LIMITS, ...limits };
     this.onEvent = onEvent;
+    this.parent = parent;
   }
 
   get limitsSnapshot(): BudgetLimits {
@@ -155,8 +157,9 @@ export class BudgetTracker {
     }
   }
 
-  /** Check elapsed wall time against maxWallTimeMs. */
+  /** Check elapsed wall time against maxWallTimeMs (and parent wall time if linked). */
   checkWallTime(): void {
+    this.parent?.checkWallTime();
     const maxWall = this.limits.maxWallTimeMs ?? 0;
     if (maxWall <= 0) return;
     const elapsed = Date.now() - this.runStartedAt;
@@ -177,6 +180,9 @@ export class BudgetTracker {
     this.byModel[model] = m;
 
     this.emitTokenUsage(input, output, cost, model);
+    if (this.parent) {
+      this.parent.recordUsage(input, output, cost, model);
+    }
     this.checkCostLimits();
   }
 

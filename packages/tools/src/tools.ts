@@ -93,6 +93,8 @@ export class ToolRegistry {
 
   unregister(name: string): void {
     this.tools.delete(name);
+    this.activatedTools.delete(name);
+    this.activeSet?.delete(name);
   }
 
   has(name: string): boolean {

@@ -26,6 +26,7 @@ export const TUI_COMMANDS: SlashCommandDef[] = [
 	{ name: "logout", description: "log out / clear saved credentials for a provider" },
 	{ name: "mcp", description: "manage MCP servers & external tool connectors" },
 	{ name: "connects", description: "alias for /mcp" },
+	{ name: "agents", description: "manage specialist subagents & remote A2A team members" },
 	{ name: "keys", description: "re-auth the current provider" },
 	{ name: "compact", description: "summarize history into a checkpoint" },
 	{ name: "diff", description: "show working-tree changes" },
@@ -44,7 +45,7 @@ export const TUI_HINTS =
 	"Enter send · Shift+Enter newline · Ctrl+P palette · Ctrl+F search · Ctrl+O details · PgUp/PgDn scroll · Tab complete · @ files · ! shell · Ctrl+C abort";
 
 export const QUICK_HELP =
-	"Quick actions: /login · /logout · /model · /mcp · /thinking · /safety · /budget · /session · /search · /help";
+	"Quick actions: /login · /logout · /model · /mcp · /agents · /thinking · /safety · /budget · /session · /search · /help";
 
 // Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
 export const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;

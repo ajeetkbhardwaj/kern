@@ -14,6 +14,7 @@
     "@kern/model": "*",
     "@kern/protocol": "*",
     "@kern/session-store": "*",
-    "@kern/connects": "*"
+    "@kern/connects": "*",
+    "@kern/subagents": "*"
   }
 }

@@ -504,4 +504,114 @@ describe("@kern/connects", () => {
       srv.close();
     }
   });
+
+  it("supports deferred MCP servers with mcp_tool_search on-demand activation", async () => {
+    const dir = makeTmp();
+    const mgr = new ConnectManager({ cwd: dir, userConfigPath: join(dir, "mcp.json"), trustFilePath: join(dir, "trust.json") });
+    managers.push(mgr);
+    const { ToolRegistry, AllowAllPolicy } = await import("../../tools/src/index.js");
+    const reg = new ToolRegistry({ workspaceRoot: dir, policy: new AllowAllPolicy() });
+    mgr.bindRegistry(reg);
+
+    const status = await mgr.addServer(
+      "lazysrv",
+      { command: process.execPath, args: ["-e", STDIO_MCP_SCRIPT], deferred: true, timeoutMs: 5000 },
+      { scope: "user" },
+    );
+    expect(status.state).toBe("connected");
+    expect(status.deferred).toBe(true);
+    // Deferred tools should be registered but withheld from listModelSchemas until searched
+    expect(reg.has("mcp__lazysrv__bump_counter")).toBe(true);
+    expect(reg.has("mcp_tool_search")).toBe(true);
+    const initialSchemas = reg.listModelSchemas().map((t) => t.name);
+    expect(initialSchemas).toContain("mcp_tool_search");
+    expect(initialSchemas).not.toContain("mcp__lazysrv__bump_counter");
+    expect(initialSchemas).not.toContain("mcp__lazysrv__slow_op");
+
+    const searchRes = await reg.callTool("mcp_tool_search", { query: "bump" });
+    expect(searchRes.isError).toBe(false);
+    expect(searchRes.content[0]?.text).toContain("mcp__lazysrv__bump_counter");
+    expect(searchRes.content[0]?.text).toContain("Activated 1 tool");
+
+    const afterSchemas = reg.listModelSchemas().map((t) => t.name);
+    expect(afterSchemas).toContain("mcp__lazysrv__bump_counter");
+    expect(afterSchemas).not.toContain("mcp__lazysrv__slow_op");
+
+    // Re-toggling/removing resets deferred activation state via ToolRegistry.unregister
+    await mgr.removeServer("lazysrv");
+    expect(reg.has("mcp__lazysrv__bump_counter")).toBe(false);
+    expect(reg.has("mcp_tool_search")).toBe(false);
+  });
+
+  it("refreshes tools live when stdio server sends notifications/tools/list_changed", async () => {
+    const dynamicScript = `
+      const readline = require("node:readline");
+      let unlocked = false;
+      const rl = readline.createInterface({ input: process.stdin });
+      function send(obj) { process.stdout.write(JSON.stringify(obj) + "\\n"); }
+      rl.on("line", (line) => {
+        if (!line.trim()) return;
+        const msg = JSON.parse(line);
+        if (msg.id === undefined) return;
+        if (msg.method === "initialize") {
+          return send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", serverInfo: { name: "dyn" }, capabilities: { tools: { listChanged: true } } } });
+        }
+        if (msg.method === "tools/list") {
+          const tools = [{ name: "unlock", inputSchema: { type: "object", properties: {} } }];
+          if (unlocked) tools.push({ name: "dynamic_tool", description: "Added dynamically", inputSchema: { type: "object", properties: {} } });
+          return send({ jsonrpc: "2.0", id: msg.id, result: { tools } });
+        }
+        if (msg.method === "tools/call" && msg.params?.name === "unlock") {
+          unlocked = true;
+          send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "unlocked" }] } });
+          setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/tools/list_changed", params: {} }), 20);
+          return;
+        }
+        return send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "dyn-ok" }] } });
+      });
+    `;
+
+    const dir = makeTmp();
+    const mgr = new ConnectManager({ cwd: dir, userConfigPath: join(dir, "mcp.json"), trustFilePath: join(dir, "trust.json") });
+    managers.push(mgr);
+    const reg = makeTestRegistry();
+    mgr.bindRegistry(reg);
+
+    await mgr.addServer("dyn", { command: process.execPath, args: ["-e", dynamicScript], timeoutMs: 5000 }, { scope: "memory" });
+    expect(reg.has("mcp__dyn__unlock")).toBe(true);
+    expect(reg.has("mcp__dyn__dynamic_tool")).toBe(false);
+
+    await reg.map.get("mcp__dyn__unlock")!.execute({}, makeToolCtx(dir));
+    for (let i = 0; i < 30 && !reg.has("mcp__dyn__dynamic_tool"); i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(reg.has("mcp__dyn__dynamic_tool")).toBe(true);
+  });
+
+  it("surfaces actionable auth hints on HTTP 401 and expands KERN_MCP_COMMAND", async () => {
+    const srv = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(401, { "www-authenticate": 'Bearer realm="mcp"' }).end("Unauthorized");
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    try {
+      const port = (srv.address() as { port: number }).port;
+      const dir = makeTmp();
+      const mgr = new ConnectManager({ cwd: dir, userConfigPath: join(dir, "mcp.json"), trustFilePath: join(dir, "trust.json") });
+      managers.push(mgr);
+      const status = await mgr.addServer("authed", { type: "http", url: `http://127.0.0.1:${port}/mcp` }, { scope: "memory" });
+      expect(status.state).toBe("error");
+      expect(status.error).toContain("HTTP 401");
+      expect(status.error).toContain("Authorization Bearer");
+      expect(status.error).toContain("WWW-Authenticate");
+
+      const loaded = await loadMcpConfigs(dir, {
+        userConfigPath: join(dir, "missing.json"),
+        trustFilePath: join(dir, "trust.json"),
+        envSource: { KERN_MCP_COMMAND: "echo ${MCP_ARG:-ok}", MCP_ARG: "expanded" },
+      });
+      expect(loaded.defs.find((d) => d.name === "env")?.shellCommand).toBe("echo expanded");
+    } finally {
+      srv.close();
+    }
+  });
 });

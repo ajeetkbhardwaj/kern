@@ -1,6 +1,17 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { createAgentSession, CONNECTOR_PRESETS, type AgentSession, type McpServerConfigEntry } from "./packages/coding-agent/src/index.js";
+import {
+  createAgentSession,
+  CONNECTOR_PRESETS,
+  SUBAGENT_FORMAT_GUIDE,
+  SUBAGENT_PRESETS,
+  parseSubagentFile,
+  renderSubagentTemplate,
+  type AgentSession,
+  type McpServerConfigEntry,
+  type SubagentConfigEntry,
+  type SubagentFileFormat,
+} from "./packages/coding-agent/src/index.js";
 import type { SessionManager } from "./packages/session-store/src/index.js";
 import { createLogger, type AgentEvent, type ThinkingLevel } from "./packages/protocol/src/index.js";
 import {
@@ -187,6 +198,8 @@ function sessionSnapshot() {
     contextUsage: activeSession.contextUsage(),
     tools: activeSession.toolNames(),
     connects: activeSession.connects?.listStatuses() ?? [],
+    subagents: activeSession.subagents?.listStatuses() ?? [],
+    subagentJobs: activeSession.subagents?.listBackgroundJobs() ?? [],
     messages,
   };
 }
@@ -521,6 +534,7 @@ const INDEX_HTML = `<!doctype html>
     </div>
     <div class="header-actions">
       <span class="badge" id="session-badge">session: <strong>…</strong></span>
+      <button id="btn-agents">+ Agent</button>
       <button id="btn-mcp">+ MCP</button>
       <button id="btn-login">Login</button>
       <button id="btn-logout">Logout</button>
@@ -533,9 +547,9 @@ const INDEX_HTML = `<!doctype html>
     <section class="workspace">
       <div id="transcript"></div>
       <div id="approval-bar">
-        <div>
+        <div style="flex:1; min-width:240px;">
           <strong style="color: var(--warn); font-family: var(--mono);">Approval Required</strong>
-          <div id="approval-text" style="font-family: var(--mono); font-size: 12px; margin-top: 2px;"></div>
+          <div id="approval-text" style="font-family: var(--mono); font-size: 12px; margin-top: 4px; white-space: pre-wrap; max-height: 220px; overflow-y: auto; line-height: 1.45;"></div>
         </div>
         <div style="display: flex; gap: 6px;">
           <button class="primary" id="btn-approve-once">Allow Once</button>
@@ -600,6 +614,14 @@ const INDEX_HTML = `<!doctype html>
           <button type="button" id="btn-mcp-side" style="font-size:11px; padding:2px 7px;">+ Add</button>
         </div>
         <div class="mcp-list" id="mcp-list"></div>
+      </div>
+
+      <div class="panel-section">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+          <h3 style="margin:0;">Subagents (Team)</h3>
+          <button type="button" id="btn-agents-side" style="font-size:11px; padding:2px 7px;">+ Add</button>
+        </div>
+        <div class="mcp-list" id="agents-list"></div>
       </div>
 
       <div class="panel-section">
@@ -691,9 +713,122 @@ const INDEX_HTML = `<!doctype html>
           <option value="memory">Session only (in-memory)</option>
         </select>
       </div>
+      <div class="form-row" style="display:flex; align-items:center; gap:8px;">
+        <input id="mcp-deferred" type="checkbox" style="width:auto;" />
+        <label for="mcp-deferred" style="margin:0; text-transform:none; letter-spacing:0;">Defer tool schemas until searched via <code>mcp_tool_search</code></label>
+      </div>
+      <div id="mcp-preset-hint" style="display:none; font-size:11.5px; color:var(--muted); margin-bottom:8px;"></div>
       <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
         <button type="button" id="btn-mcp-cancel">Cancel</button>
         <button type="submit" class="primary">Connect Server</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="agent-dialog">
+    <h3 style="margin-top:0; font-family: var(--mono);">Add Specialist / A2A Agent</h3>
+    <form method="dialog" id="agent-form">
+      <div class="form-row">
+        <label>Input Mode &amp; File Format</label>
+        <div style="display:flex; gap:8px;">
+          <select id="agent-input-mode" style="flex:1;">
+            <option value="form">Visual Form Builder</option>
+            <option value="file">Paste / Edit Agent File (.md / .yaml / .json)</option>
+          </select>
+          <select id="agent-file-format" style="width:140px;">
+            <option value="md">Markdown (.md)</option>
+            <option value="yaml">YAML (.yaml)</option>
+            <option value="json">JSON (.json)</option>
+          </select>
+        </div>
+      </div>
+      <div id="agent-form-fields">
+        <div class="form-row">
+          <label>Preset Template (opt-in)</label>
+          <select id="agent-preset"></select>
+        </div>
+        <div class="form-row">
+          <label>Agent Name</label>
+          <input id="agent-name" required placeholder="explorer" />
+        </div>
+        <div class="form-row">
+          <label>Type</label>
+          <select id="agent-type">
+            <option value="local">Local Specialist Subagent</option>
+            <option value="a2a">Remote A2A Agent (HTTP JSON-RPC)</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Routing Description (visible to root orchestrator)</label>
+          <input id="agent-description" required placeholder="Read-only specialist for tracing symbols and tests" />
+        </div>
+        <div id="agent-local-fields">
+          <div class="form-row">
+            <label>Mode &amp; Isolation</label>
+            <div style="display:flex; gap:8px;">
+              <select id="agent-mode" style="flex:1;">
+                <option value="readonly">readonly</option>
+                <option value="write">write</option>
+              </select>
+              <select id="agent-isolation" style="flex:1;">
+                <option value="readonly">readonly</option>
+                <option value="exclusive">exclusive lock</option>
+                <option value="worktree">git worktree</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Model Override (optional provider/modelId)</label>
+            <input id="agent-model" placeholder="leave blank to inherit active model" />
+          </div>
+          <div class="form-row">
+            <label>Allowed Built-in Tools (comma-separated or readonly | coding | research)</label>
+            <input id="agent-tools" placeholder="read, grep, find, git-status, git-diff" />
+          </div>
+          <div class="form-row">
+            <label>Shared Parent MCP Servers (comma-separated, optional)</label>
+            <input id="agent-mcp" placeholder="context7, github" />
+          </div>
+          <div class="form-row">
+            <label>System Instruction</label>
+            <textarea id="agent-instruction" style="min-height:68px;" placeholder="Role instruction for the specialist..."></textarea>
+          </div>
+        </div>
+        <div id="agent-a2a-fields" style="display:none;">
+          <div class="form-row">
+            <label>A2A Server Base URL</label>
+            <input id="agent-url" placeholder="http://127.0.0.1:41241" />
+          </div>
+          <div class="form-row">
+            <label>Authorization / Bearer Header (optional)</label>
+            <input id="agent-auth" type="password" placeholder="Bearer ... or $" />
+          </div>
+        </div>
+      </div>
+      <div id="agent-file-fields" style="display:none;">
+        <div class="form-row">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+            <label style="margin:0;">Raw Definition (Frontmatter MD, Plain # MD, YAML, or JSON)</label>
+            <button type="button" id="btn-agent-template" style="font-size:11px; padding:2px 8px;">Load Starter Template</button>
+          </div>
+          <textarea id="agent-raw-content" style="min-height:190px; font-size:12px;" placeholder="# reviewer&#10;Audits code and tests for regressions.&#10;Mode: readonly&#10;Tools: readonly&#10;&#10;## Instructions&#10;Inspect changed files and cite line numbers."></textarea>
+        </div>
+        <details style="margin-bottom:10px;">
+          <summary style="cursor:pointer; font-size:11.5px; color:var(--muted); font-family:var(--mono);">Supported file formats &amp; shorthands</summary>
+          <pre id="agent-format-hint" style="margin:6px 0 0; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; font-size:11px; color:var(--muted); white-space:pre-wrap; max-height:170px; overflow-y:auto;"></pre>
+        </details>
+      </div>
+      <div class="form-row">
+        <label>Config Scope</label>
+        <select id="agent-scope">
+          <option value="user">User (~/.kern/agents)</option>
+          <option value="project">Project (.kern/agents)</option>
+          <option value="memory">Session only (in-memory)</option>
+        </select>
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
+        <button type="button" id="btn-agent-cancel">Cancel</button>
+        <button type="submit" class="primary">Save Agent</button>
       </div>
     </form>
   </dialog>
@@ -786,7 +921,13 @@ const INDEX_HTML = `<!doctype html>
           title.appendChild(strong);
           const badge = document.createElement("span");
           badge.style.color = "var(--muted)";
-          badge.textContent = s.state === "connected" ? s.tools.length + " tools" : s.state;
+          const extraCounts = [
+            s.tools.length + " tools",
+            s.resources?.length ? s.resources.length + " res" : "",
+            s.prompts?.length ? s.prompts.length + " prompts" : "",
+            s.deferred ? "deferred" : "",
+          ].filter(Boolean).join(" · ");
+          badge.textContent = s.state === "connected" ? extraCounts : s.state;
           head.appendChild(title);
           head.appendChild(badge);
           card.appendChild(head);
@@ -847,6 +988,82 @@ const INDEX_HTML = `<!doctype html>
         }
       }
 
+      const agentsListEl = document.getElementById("agents-list");
+      agentsListEl.innerHTML = "";
+      const agents = snap.subagents || [];
+      const bgJobs = snap.subagentJobs || [];
+      if (agents.length === 0) {
+        const empty = document.createElement("div");
+        empty.style.cssText = "color: var(--muted); font-family: var(--mono); font-size: 11.5px;";
+        empty.textContent = "Solo mode (0 subagents configured).";
+        agentsListEl.appendChild(empty);
+      } else {
+        for (const a of agents) {
+          const card = document.createElement("div");
+          card.className = "mcp-card";
+          const head = document.createElement("div");
+          head.className = "mcp-card-head";
+          const title = document.createElement("span");
+          const dot = document.createElement("span");
+          dot.className = "mcp-dot " + (a.state === "ready" ? "connected" : a.state === "untrusted" ? "untrusted" : a.state === "error" ? "error" : "");
+          title.appendChild(dot);
+          const strong = document.createElement("strong");
+          strong.textContent = a.name;
+          title.appendChild(strong);
+          const badge = document.createElement("span");
+          badge.style.color = "var(--muted)";
+          const runningBg = bgJobs.filter((j) => j.agent === a.name && j.running).length;
+          badge.textContent = (a.type === "a2a" ? "a2a" : a.mode + "/" + a.isolation) + (runningBg ? " · " + runningBg + " running" : "");
+          head.appendChild(title);
+          head.appendChild(badge);
+          card.appendChild(head);
+
+          const meta = document.createElement("div");
+          meta.style.cssText = "color: var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
+          meta.textContent = a.warning || a.error || a.description;
+          card.appendChild(meta);
+
+          const actions = document.createElement("div");
+          actions.className = "mcp-actions";
+          const mkBtn = (label, onClick, danger = false) => {
+            const b = document.createElement("button");
+            b.type = "button";
+            if (danger) b.className = "danger";
+            b.textContent = label;
+            b.onclick = onClick;
+            actions.appendChild(b);
+          };
+          if (a.state === "untrusted") {
+            mkBtn("Trust", async () => {
+              const r = await fetch("/api/agents/trust", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ name: a.name }),
+              });
+              const d = await r.json();
+              if (d.snapshot) renderSnapshot(d.snapshot);
+            });
+          }
+          mkBtn(a.disabled ? "Enable" : "Disable", async () => {
+            const r = await fetch("/api/agents/toggle", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ name: a.name, disabled: !a.disabled }),
+            });
+            const d = await r.json();
+            if (d.snapshot) renderSnapshot(d.snapshot);
+          });
+          mkBtn("Remove", async () => {
+            const r = await fetch("/api/agents?name=" + encodeURIComponent(a.name), { method: "DELETE" });
+            const d = await r.json();
+            if (d.snapshot) renderSnapshot(d.snapshot);
+            addEntry("system", "agents", "Removed subagent " + a.name);
+          }, true);
+          card.appendChild(actions);
+          agentsListEl.appendChild(card);
+        }
+      }
+
       const toolsEl = document.getElementById("tools-list");
       toolsEl.innerHTML = "";
       for (const t of snap.tools) {
@@ -880,6 +1097,7 @@ const INDEX_HTML = `<!doctype html>
           "  /logout [provider|--all]  Clear saved provider credentials\\n" +
           "  /tools                    List registered kernel & MCP tools\\n" +
           "  /mcp                      Show connected MCP servers & status\\n" +
+          "  /agents                   Show configured subagents & A2A team members\\n" +
           "  /tool <name> [json-args]  Invoke a kernel tool directly (e.g. /tool read {\\"path\\":\\"README.md\\"})\\n" +
           "  /compact [instructions]   Compact session context\\n" +
           "  /new                      Start a new session\\n" +
@@ -899,11 +1117,23 @@ const INDEX_HTML = `<!doctype html>
       if (trimmed === "/mcp") {
         const snap = await refreshSession();
         const lines = (snap.connects || []).map((s) =>
-          s.name + " [" + s.transport + ", " + s.origin + "]: " + s.state +
+          s.name + " [" + s.transport + ", " + s.origin + (s.deferred ? ", deferred" : "") + "]: " + s.state +
           (s.tools?.length ? " (" + s.tools.map((t) => t.registeredName).join(", ") + ")" : "") +
+          (s.resources?.length ? " [" + s.resources.length + " resource(s)]" : "") +
+          (s.prompts?.length ? " [" + s.prompts.length + " prompt(s)]" : "") +
           (s.error ? " — " + s.error : "")
         );
         addEntry("system", "mcp", lines.join("\\n") || "No MCP servers configured. Click '+ MCP' to add one.");
+        return;
+      }
+      if (trimmed === "/agents" || trimmed === "/team") {
+        const snap = await refreshSession();
+        const lines = (snap.subagents || []).map((a) =>
+          a.name + " [" + a.type + ", " + (a.type === "a2a" ? a.url : a.mode + "/" + a.isolation) + ", " + a.origin + "]: " + a.state +
+          (a.model ? " (model=" + a.model + ")" : "") +
+          (a.warning ? " — " + a.warning : "")
+        );
+        addEntry("system", "agents", lines.join("\\n") || "No subagents configured (solo mode). Click '+ Agent' to add an opt-in specialist or A2A agent.");
         return;
       }
       if (trimmed === "/tools") {
@@ -1166,16 +1396,37 @@ const INDEX_HTML = `<!doctype html>
       }
       presetSel.onchange = () => {
         const sel = presetSel.selectedOptions[0];
-        if (!sel || !sel.dataset.preset) return;
+        const hintEl = document.getElementById("mcp-preset-hint");
+        if (!sel || !sel.dataset.preset) {
+          hintEl.style.display = "none";
+          hintEl.textContent = "";
+          return;
+        }
         const p = JSON.parse(sel.dataset.preset);
         document.getElementById("mcp-name").value = p.id;
         document.getElementById("mcp-transport").value = p.transport;
         syncMcpTransportFields();
         document.getElementById("mcp-url").value = p.entry.url || "";
-        document.getElementById("mcp-auth").value = p.entry.headers?.Authorization || "";
+        const presetAuth = p.entry.headers?.Authorization || "";
+        const authEl = document.getElementById("mcp-auth");
+        if (presetAuth.includes("$" + "{")) {
+          authEl.value = "";
+          authEl.placeholder = presetAuth + " (enter token or leave empty to use env)";
+        } else {
+          authEl.value = presetAuth;
+          authEl.placeholder = "Bearer ... or raw token";
+        }
         document.getElementById("mcp-command").value = p.entry.command || "";
         document.getElementById("mcp-args").value = (p.entry.args || []).join(" ");
         document.getElementById("mcp-env").value = Object.entries(p.entry.env || {}).map(([k, v]) => k + "=" + v).join("\\n");
+        document.getElementById("mcp-deferred").checked = Boolean(p.entry.deferred);
+        if (p.variables && p.variables.length > 0) {
+          hintEl.style.display = "block";
+          hintEl.textContent = "Variables: " + p.variables.map((v) => v.key + (v.required ? " (required)" : " (optional)")).join(", ");
+        } else {
+          hintEl.style.display = "none";
+          hintEl.textContent = "";
+        }
       };
       syncMcpTransportFields();
       mcpDialog.showModal();
@@ -1189,7 +1440,8 @@ const INDEX_HTML = `<!doctype html>
       const name = document.getElementById("mcp-name").value.trim();
       const transport = document.getElementById("mcp-transport").value;
       const scope = document.getElementById("mcp-scope").value;
-      const body = { name, transport, scope };
+      const deferred = document.getElementById("mcp-deferred").checked;
+      const body = { name, transport, scope, ...(deferred ? { deferred: true } : {}) };
       if (transport === "stdio") {
         body.command = document.getElementById("mcp-command").value.trim();
         const argsRaw = document.getElementById("mcp-args").value.trim();
@@ -1222,6 +1474,129 @@ const INDEX_HTML = `<!doctype html>
           s.name + ": " + s.state + (s.error ? " — " + s.error : " (" + (s.tools?.length || 0) + " tool(s))"));
       }
       mcpDialog.close();
+      await refreshSession();
+    };
+
+    const agentDialog = document.getElementById("agent-dialog");
+    let cachedAgentTemplates = {};
+    const syncAgentTypeFields = () => {
+      const t = document.getElementById("agent-type").value;
+      document.getElementById("agent-local-fields").style.display = t === "a2a" ? "none" : "block";
+      document.getElementById("agent-a2a-fields").style.display = t === "a2a" ? "block" : "none";
+    };
+    const syncAgentInputMode = () => {
+      const mode = document.getElementById("agent-input-mode").value;
+      const isFile = mode === "file";
+      document.getElementById("agent-form-fields").style.display = isFile ? "none" : "block";
+      document.getElementById("agent-file-fields").style.display = isFile ? "block" : "none";
+      document.getElementById("agent-name").required = !isFile;
+      document.getElementById("agent-description").required = !isFile;
+    };
+    document.getElementById("agent-type").onchange = syncAgentTypeFields;
+    document.getElementById("agent-input-mode").onchange = () => {
+      syncAgentInputMode();
+      const rawEl = document.getElementById("agent-raw-content");
+      const fmt = document.getElementById("agent-file-format").value;
+      if (document.getElementById("agent-input-mode").value === "file" && !rawEl.value.trim() && cachedAgentTemplates[fmt]) {
+        rawEl.value = cachedAgentTemplates[fmt];
+      }
+    };
+    document.getElementById("btn-agent-template").onclick = () => {
+      const fmt = document.getElementById("agent-file-format").value;
+      if (cachedAgentTemplates[fmt]) {
+        document.getElementById("agent-raw-content").value = cachedAgentTemplates[fmt];
+      }
+    };
+
+    async function openAgentDialog() {
+      const res = await fetch("/api/agents");
+      const data = await res.json();
+      cachedAgentTemplates = data.templates || {};
+      document.getElementById("agent-format-hint").textContent = data.formatGuide || "";
+      const presetSel = document.getElementById("agent-preset");
+      presetSel.innerHTML = "<option value=''>custom</option>";
+      for (const p of data.presets || []) {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = p.name + " (" + (p.entry?.mode || "readonly") + ")";
+        opt.dataset.preset = JSON.stringify(p);
+        presetSel.appendChild(opt);
+      }
+      presetSel.onchange = () => {
+        const sel = presetSel.selectedOptions[0];
+        if (!sel || !sel.dataset.preset) return;
+        const p = JSON.parse(sel.dataset.preset);
+        document.getElementById("agent-name").value = p.entry.name || p.id;
+        document.getElementById("agent-type").value = p.entry.type || "local";
+        syncAgentTypeFields();
+        document.getElementById("agent-description").value = p.entry.description || "";
+        document.getElementById("agent-mode").value = p.entry.mode || "readonly";
+        document.getElementById("agent-isolation").value = p.entry.isolation || "readonly";
+        document.getElementById("agent-model").value = p.entry.model || "";
+        document.getElementById("agent-tools").value = (p.entry.tools || []).join(", ");
+        document.getElementById("agent-mcp").value = (p.entry.mcpServers || []).join(", ");
+        document.getElementById("agent-instruction").value = p.entry.instruction || "";
+      };
+      syncAgentTypeFields();
+      syncAgentInputMode();
+      agentDialog.showModal();
+    }
+
+    document.getElementById("btn-agents").onclick = openAgentDialog;
+    document.getElementById("btn-agents-side").onclick = openAgentDialog;
+    document.getElementById("btn-agent-cancel").onclick = () => agentDialog.close();
+    document.getElementById("agent-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const inputMode = document.getElementById("agent-input-mode").value;
+      const format = document.getElementById("agent-file-format").value;
+      const scope = document.getElementById("agent-scope").value;
+      let payload;
+      if (inputMode === "file") {
+        const rawContent = document.getElementById("agent-raw-content").value.trim();
+        if (!rawContent) {
+          addEntry("error", "agents", "Paste or load a subagent definition before saving.");
+          return;
+        }
+        payload = { rawContent, format, scope };
+      } else {
+        const type = document.getElementById("agent-type").value;
+        const entry = {
+          name: document.getElementById("agent-name").value.trim(),
+          type,
+          description: document.getElementById("agent-description").value.trim(),
+        };
+        if (type === "a2a") {
+          entry.url = document.getElementById("agent-url").value.trim();
+          const auth = document.getElementById("agent-auth").value.trim();
+          if (auth) {
+            entry.headers = { Authorization: /^bearer\\s+/i.test(auth) || auth.startsWith("$") ? auth : "Bearer " + auth };
+          }
+        } else {
+          entry.mode = document.getElementById("agent-mode").value;
+          entry.isolation = document.getElementById("agent-isolation").value;
+          const model = document.getElementById("agent-model").value.trim();
+          if (model) entry.model = model;
+          const toolsRaw = document.getElementById("agent-tools").value.trim();
+          if (toolsRaw) entry.tools = toolsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+          const mcpRaw = document.getElementById("agent-mcp").value.trim();
+          if (mcpRaw) entry.mcpServers = mcpRaw.split(",").map((s) => s.trim()).filter(Boolean);
+          const instruction = document.getElementById("agent-instruction").value.trim();
+          if (instruction) entry.instruction = instruction;
+        }
+        payload = { entry, scope, format };
+      }
+      const res = await fetch("/api/agents", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        addEntry("error", "agents", data.error || "Failed saving agent");
+      } else {
+        addEntry("system", "agents", "Saved " + data.agent.type + " agent " + data.agent.name + ": " + data.agent.state);
+      }
+      agentDialog.close();
       await refreshSession();
     };
 
@@ -1406,7 +1781,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
             ? "stdio"
             : "http";
 
-    const entry: McpServerConfigEntry = { transport };
+    const entry: McpServerConfigEntry = {
+      transport,
+      ...(body.deferred === true ? { deferred: true } : {}),
+    };
     if (transport === "stdio") {
       const command = typeof body.command === "string" ? body.command.trim() : "";
       if (!command) {
@@ -1482,6 +1860,126 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const name = url.searchParams.get("name")?.trim() ?? "";
     if (!name) return sendJson(res, 400, { error: "name query parameter is required" });
     const removed = await activeSession.connects.removeServer(name);
+    return sendJson(res, 200, { ok: true, removed, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "GET" && url.pathname === "/api/agents") {
+    const sample: SubagentConfigEntry = {
+      name: "specialist",
+      type: "local",
+      description: "Focused specialist agent for inspecting code or tests",
+      mode: "readonly",
+      isolation: "readonly",
+      tools: ["read", "grep", "find", "git-status", "git-diff"],
+      maxTurns: 12,
+      instruction: "Investigate carefully and report exact file paths, line numbers, and concrete findings.",
+    };
+    return sendJson(res, 200, {
+      agents: activeSession.subagents?.listStatuses() ?? [],
+      backgroundJobs: activeSession.subagents?.listBackgroundJobs() ?? [],
+      warnings: activeSession.subagents?.getWarnings() ?? [],
+      presets: SUBAGENT_PRESETS,
+      formatGuide: SUBAGENT_FORMAT_GUIDE,
+      templates: {
+        md: renderSubagentTemplate(sample, "md"),
+        yaml: renderSubagentTemplate(sample, "yaml"),
+        json: renderSubagentTemplate(sample, "json"),
+      },
+    });
+  }
+
+  if (method === "POST" && url.pathname === "/api/agents") {
+    if (!activeSession.subagents) {
+      return sendJson(res, 501, { error: "Subagent manager unavailable" });
+    }
+    const body = await readJsonBody(req);
+    const scope = body.scope === "project" || body.scope === "memory" ? body.scope : "user";
+    const format: SubagentFileFormat | undefined =
+      body.format === "yaml" || body.format === "json" || body.format === "md" ? body.format : undefined;
+
+    if (typeof body.rawContent === "string" && body.rawContent.trim()) {
+      const parsed = parseSubagentFile(
+        body.rawContent,
+        format ? `.${format}` : "",
+        typeof body.name === "string" && body.name.trim() ? body.name.trim() : "custom-agent",
+      );
+      if (!parsed) {
+        return sendJson(res, 400, {
+          error: "Could not parse subagent definition (ensure valid name & description in .md, .yaml, or .json format)",
+        });
+      }
+      const agent = await activeSession.subagents.addSubagent(parsed, { scope, ...(format ? { format } : {}) });
+      return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+    }
+
+    const rawEntry = (body.entry && typeof body.entry === "object" ? body.entry : body) as Record<string, unknown>;
+    const name = typeof rawEntry.name === "string" ? rawEntry.name.trim() : "";
+    const description = typeof rawEntry.description === "string" ? rawEntry.description.trim() : "";
+    if (!name || !description) {
+      return sendJson(res, 400, { error: "Agent name and description are required" });
+    }
+    const type = rawEntry.type === "a2a" || rawEntry.url ? "a2a" : "local";
+    const entry: SubagentConfigEntry = {
+      name,
+      description,
+      type,
+      ...(typeof rawEntry.instruction === "string" && rawEntry.instruction.trim() ? { instruction: rawEntry.instruction.trim() } : {}),
+      ...(rawEntry.mode === "write" || rawEntry.mode === "readonly" ? { mode: rawEntry.mode } : {}),
+      ...(rawEntry.isolation === "readonly" || rawEntry.isolation === "exclusive" || rawEntry.isolation === "worktree"
+        ? { isolation: rawEntry.isolation }
+        : {}),
+      ...(Array.isArray(rawEntry.tools) ? { tools: rawEntry.tools.map((t) => String(t).trim()).filter(Boolean) } : {}),
+      ...(Array.isArray(rawEntry.mcpServers)
+        ? { mcpServers: rawEntry.mcpServers.map((s) => String(s).trim()).filter(Boolean) }
+        : {}),
+      ...(typeof rawEntry.model === "string" && rawEntry.model.trim() ? { model: rawEntry.model.trim() } : {}),
+      ...(typeof rawEntry.url === "string" && rawEntry.url.trim() ? { url: rawEntry.url.trim() } : {}),
+      ...(rawEntry.headers && typeof rawEntry.headers === "object" && !Array.isArray(rawEntry.headers)
+        ? {
+            headers: Object.fromEntries(
+              Object.entries(rawEntry.headers as Record<string, unknown>)
+                .filter(([, v]) => typeof v === "string")
+                .map(([k, v]) => [k, v as string]),
+            ),
+          }
+        : {}),
+    };
+    if (type === "a2a" && (!entry.url || !/^https?:\/\//i.test(entry.url))) {
+      return sendJson(res, 400, { error: "Valid http(s) url is required for remote A2A agents" });
+    }
+    const agent = await activeSession.subagents.addSubagent(entry, { scope, ...(format ? { format } : {}) });
+    return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "POST" && url.pathname === "/api/agents/reload") {
+    if (!activeSession.subagents) return sendJson(res, 501, { error: "Subagent manager unavailable" });
+    const resDiscover = await activeSession.subagents.discover();
+    return sendJson(res, 200, { ok: true, ...resDiscover, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "POST" && url.pathname === "/api/agents/toggle") {
+    if (!activeSession.subagents) return sendJson(res, 501, { error: "Subagent manager unavailable" });
+    const body = await readJsonBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return sendJson(res, 400, { error: "name is required" });
+    const agent = await activeSession.subagents.toggleSubagent(name, Boolean(body.disabled));
+    return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "POST" && url.pathname === "/api/agents/trust") {
+    if (!activeSession.subagents) return sendJson(res, 501, { error: "Subagent manager unavailable" });
+    const body = await readJsonBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return sendJson(res, 400, { error: "name is required" });
+    const agent = await activeSession.subagents.trustSubagent(name);
+    return sendJson(res, 200, { ok: true, agent, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "DELETE" && url.pathname === "/api/agents") {
+    if (!activeSession.subagents) return sendJson(res, 501, { error: "Subagent manager unavailable" });
+    const name = url.searchParams.get("name")?.trim() ?? "";
+    if (!name) return sendJson(res, 400, { error: "name query parameter is required" });
+    const removed = await activeSession.subagents.removeSubagent(name);
     return sendJson(res, 200, { ok: true, removed, snapshot: sessionSnapshot() });
   }
 
@@ -1606,6 +2104,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return sendJson(res, 501, { error: "newSession unavailable" });
     }
     const created = await activeSession.newSession();
+    await activeSession.subagents?.dispose().catch(() => {});
+    await activeSession.connects?.dispose().catch(() => {});
     activeSession.dispose();
     activeSession = created.session;
     activeManager = created.manager;
@@ -1683,6 +2183,7 @@ let shuttingDown = false;
 async function shutdownServer() {
   if (shuttingDown) return;
   shuttingDown = true;
+  await activeSession?.subagents?.dispose().catch(() => {});
   await activeSession?.connects?.dispose().catch(() => {});
   activeSession?.dispose();
   server.close(() => process.exit(0));

@@ -12,7 +12,17 @@ import { join, resolve, dirname, relative } from "node:path";
 import { spawn } from "node:child_process";
 import type { AgentEvent, AskUserRequest, Logger, ModelAdapter, ThinkingLevel } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
-import { ResourceLoader, resolveSkillInvocation, type AgentSession } from "@kern/coding-agent";
+import {
+  ResourceLoader,
+  resolveSkillInvocation,
+  SUBAGENT_FORMAT_GUIDE,
+  SUBAGENT_PRESETS,
+  findSubagentPreset,
+  type AgentSession,
+  type SubagentConfigEntry,
+  type SubagentFileFormat,
+  type SubagentStatus,
+} from "@kern/coding-agent";
 import { CONNECTOR_PRESETS, type McpServerConfigEntry, type McpServerStatus } from "@kern/connects";
 import type { SessionManager } from "@kern/session-store";
 import {
@@ -657,6 +667,28 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
                   : s.state;
               return `${mark} ${s.name} ${theme.muted(`(${s.transport} · ${detail})`)}`;
             });
+      const teamAgents = session.subagents?.listStatuses() ?? [];
+      const readyAgents = teamAgents.filter((a) => a.state === "ready");
+      const activeBg = session.subagents?.listBackgroundJobs().filter((j) => j.running).length ?? 0;
+      const teamSummary =
+        teamAgents.length === 0
+          ? "none (/agents)"
+          : `${readyAgents.length}/${teamAgents.length} ready${activeBg > 0 ? ` · ${activeBg} bg` : ""}`;
+      const teamLines =
+        teamAgents.length === 0
+          ? [theme.muted("No subagents configured (solo mode). Run /agents.")]
+          : teamAgents.map((a) => {
+              const mark =
+                a.state === "ready"
+                  ? theme.success("●")
+                  : a.state === "untrusted"
+                    ? theme.warn("!")
+                    : a.state === "error"
+                      ? theme.error("✖")
+                      : theme.muted("○");
+              const detail = a.type === "a2a" ? "a2a" : `${a.mode}/${a.isolation}`;
+              return `${mark} ${a.name} ${theme.muted(`(${detail} · ${a.state})`)}`;
+            });
       sidebarPanel.setSections([
         {
           key: "session",
@@ -670,6 +702,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             `${theme.muted("Name")} ${sessionName}`,
             `${theme.muted("Mode")} ${modeLabel()} · ${session.safetyMode?.() ?? "balanced"}`,
             `${theme.muted("MCP")} ${mcpSummary}`,
+            `${theme.muted("Team")} ${teamSummary}`,
             `${theme.muted("State")} ${busy ? `running (${activity})` : "ready"}`,
             `${theme.muted("CWD")}`,
             `  ${cwd}`,
@@ -681,6 +714,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           collapsible: true,
           defaultExpanded: mcpServers.length > 0,
           lines: mcpLines,
+        },
+        {
+          key: "subagents",
+          title: "Subagents (Team)",
+          collapsible: true,
+          defaultExpanded: teamAgents.length > 0,
+          lines: teamLines,
         },
         {
           key: "usage",
@@ -2114,6 +2154,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     session = next.session;
     manager = next.manager;
     if (prevSession && prevSession !== next.session) {
+      void prevSession.subagents?.dispose().catch(() => {});
       void prevSession.connects?.dispose().catch(() => {});
       prevSession.dispose();
     }
@@ -2302,7 +2343,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     for (const s of servers) {
       const badge =
         s.state === "connected"
-          ? theme.success(`connected · ${s.tools.length} tool(s)`)
+          ? theme.success(`connected · ${s.tools.length} tool(s)${s.deferred ? " (deferred)" : ""}`)
           : s.state === "error"
             ? theme.error(`error: ${s.error ?? "failed"}`)
             : s.state === "untrusted"
@@ -2327,7 +2368,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const inspectMcpServer = (s: McpServerStatus) => {
     say(theme.bold(`mcp · ${s.name}`));
-    info(`  transport: ${s.transport} (${s.origin}) · state: ${s.state}`);
+    info(`  transport: ${s.transport} (${s.origin}) · state: ${s.state}${s.deferred ? " · deferred (via mcp_tool_search)" : ""}`);
     info(`  target: ${s.target}`);
     if (s.serverInfo?.name) info(`  serverInfo: ${s.serverInfo.name}${s.serverInfo.version ? ` v${s.serverInfo.version}` : ""}`);
     if (s.error) err(`  error: ${s.error}`);
@@ -2661,22 +2702,470 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       ok(`${targetName}: ${next.state}`);
       return;
     }
+    if (sub === "inspect") {
+      const targetName = tokens[1];
+      if (!targetName) {
+        err("Usage: /mcp inspect <name>");
+        return;
+      }
+      const target = mgr.getServerStatus(targetName);
+      if (!target) {
+        err(`Unknown MCP server "${targetName}".`);
+        return;
+      }
+      inspectMcpServer(target);
+      return;
+    }
     if (sub === "add") {
-      const name = tokens[1];
-      const target = tokens[2];
-      const extraArgs = tokens.slice(3);
+      let deferred = false;
+      const filtered: string[] = [];
+      for (const tok of tokens.slice(1)) {
+        if (tok === "--deferred") deferred = true;
+        else filtered.push(tok);
+      }
+      const name = filtered[0];
+      const target = filtered[1];
+      const extraArgs = filtered.slice(2);
       if (!name || !target) {
-        err("Usage: /mcp add <name> <https://url | command> [args...]");
+        err("Usage: /mcp add <name> <https://url | command> [args...] [--deferred]");
         return;
       }
       const isRemote = /^https?:\/\//i.test(target);
       const entry: McpServerConfigEntry = isRemote
-        ? { transport: /\/sse(?:[/?#]|$)/i.test(target) ? "sse" : "http", url: target }
-        : { transport: "stdio", command: target, ...(extraArgs.length > 0 ? { args: extraArgs } : {}) };
+        ? { transport: /\/sse(?:[/?#]|$)/i.test(target) ? "sse" : "http", url: target, ...(deferred ? { deferred: true } : {}) }
+        : { transport: "stdio", command: target, ...(extraArgs.length > 0 ? { args: extraArgs } : {}), ...(deferred ? { deferred: true } : {}) };
       await connectAndReportMcp(name, entry, "user");
       return;
     }
-    err(`Unknown /mcp action "${sub}". Try /mcp, /mcp list, /mcp presets, /mcp add <name> <url|cmd>, /mcp reconnect, /mcp trust <name>, /mcp remove <name>.`);
+    err(`Unknown /mcp action "${sub}". Try /mcp, /mcp list, /mcp inspect <name>, /mcp presets, /mcp add <name> <url|cmd>, /mcp reconnect, /mcp trust <name>, /mcp remove <name>.`);
+  };
+
+  const printAgentsStatus = (agents: SubagentStatus[]) => {
+    say(theme.bold("subagents & A2A team"));
+    if (agents.length === 0) {
+      info("  No specialists configured (core loop runs solo with zero delegation overhead). Use `/agents` to add opt-in presets or A2A agents.");
+      return;
+    }
+    for (const a of agents) {
+      const badge =
+        a.state === "ready"
+          ? theme.success(`ready · ${a.type === "a2a" ? "a2a" : `${a.mode}/${a.isolation}`}`)
+          : a.state === "untrusted"
+            ? theme.warn(`untrusted (run /agents trust ${a.name})`)
+            : a.state === "error"
+              ? theme.error(`error: ${a.error ?? "failed"}`)
+              : theme.muted(a.state);
+      say(`  ${theme.accent(a.name)}  ${theme.muted(`${a.type} · ${a.origin}`)}  ${badge}`);
+      info(`    ${a.description}`);
+      if (a.model) info(`    model: ${a.model}`);
+      if (a.tools?.length) info(`    tools: ${a.tools.join(", ")}`);
+      if (a.mcpServers?.length) info(`    mcp: ${a.mcpServers.join(", ")}`);
+      if (a.url) info(`    url: ${a.url}`);
+      if (a.skills?.length) info(`    skills: ${a.skills.map((sk) => sk.name).join(", ")}`);
+      if (a.warning) info(`    warning: ${a.warning}`);
+    }
+  };
+
+  const inspectSubagent = (a: SubagentStatus) => {
+    say(theme.bold(`agent · ${a.name}`));
+    info(`  type: ${a.type} (${a.origin}) · state: ${a.state} · mode: ${a.mode} (${a.isolation})`);
+    info(`  description: ${a.description}`);
+    if (a.sourcePath) info(`  source: ${a.sourcePath}`);
+    if (a.model) info(`  model: ${a.model}`);
+    if (a.tools?.length) info(`  tools: ${a.tools.join(", ")}`);
+    if (a.mcpServers?.length) info(`  mcpServers: ${a.mcpServers.join(", ")}`);
+    if (a.url) info(`  url: ${a.url}`);
+    if (a.skills?.length) info(`  A2A skills: ${a.skills.map((sk) => sk.name).join(", ")}`);
+    if (a.warning) info(`  warning: ${a.warning}`);
+  };
+
+  const saveAndReportSubagent = async (
+    entry: SubagentConfigEntry,
+    scope: "user" | "project" | "memory",
+    opts?: { format?: SubagentFileFormat; templateComments?: boolean },
+  ) => {
+    const mgr = session.subagents;
+    if (!mgr) {
+      err("Subagent manager is unavailable on this session.");
+      return;
+    }
+    try {
+      const status = await mgr.addSubagent(entry, {
+        scope,
+        ...(opts?.format ? { format: opts.format } : {}),
+        ...(opts?.templateComments ? { templateComments: true } : {}),
+      });
+      updateSidebar();
+      printStatus();
+      ok(`Added ${status.type} agent "${status.name}" (${scope}): ${status.state}.`);
+      if (status.sourcePath) info(`  file: ${status.sourcePath}`);
+      if (status.warning) info(`  warning: ${status.warning}`);
+    } catch (error) {
+      err(`Failed saving subagent "${entry.name}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const runAgentsWizard = async (): Promise<void> => {
+    const mgr = session.subagents;
+    if (!mgr) {
+      err("Subagent manager is unavailable on this session.");
+      return;
+    }
+    if (busy) {
+      toast("Wait for the current turn to settle before modifying team subagents.");
+      return;
+    }
+
+    const agents = mgr.listStatuses();
+    const menuItems: Array<{ value: string; label: string; description?: string }> = [
+      { value: "__preset__", label: "Install specialist preset…", description: "explorer, reviewer, coder, researcher (opt-in templates)" },
+      { value: "__init__", label: "Create editable agent file…", description: "Scaffold .md, .yaml, or .json file to customize in any editor" },
+      { value: "__local__", label: "Add custom local specialist…", description: "Define a specialized sub-session prompt, tools & model" },
+      { value: "__a2a__", label: "Add remote A2A agent…", description: "Connect an Agent-to-Agent HTTP/JSON-RPC server" },
+      { value: "__format__", label: "Show file format guide (.md / .yaml / .json)", description: "Frontmatter, plain Markdown #, YAML, JSON & tool shorthands" },
+      { value: "__reload__", label: "Reload from disk", description: "Re-read ~/.kern/agents and .kern/agents" },
+      ...agents.map((a) => ({
+        value: `agent:${a.name}`,
+        label: `${a.state === "ready" ? "●" : a.state === "untrusted" ? "!" : a.state === "error" ? "✖" : "○"} ${a.name}`,
+        description: `${a.type === "a2a" ? "a2a" : `${a.mode}/${a.isolation}`} · ${a.state}`,
+      })),
+    ];
+
+    const pick = await pickOne("subagents & A2A team", menuItems);
+    if (!pick) return;
+
+    if (pick === "__reload__") {
+      const res = await mgr.discover();
+      updateSidebar();
+      printStatus();
+      printAgentsStatus(res.agents);
+      return;
+    }
+
+    if (pick === "__format__") {
+      say(theme.bold("subagent file formats"));
+      info(SUBAGENT_FORMAT_GUIDE);
+      return;
+    }
+
+    if (pick === "__init__") {
+      const name = (await promptText("new agent file name ([a-z0-9_-])"))?.trim();
+      if (!name) return;
+      const fmtPick = await pickOne("file format", [
+        { value: "md", label: "Markdown (.md)", description: "Frontmatter or plain # Heading + body" },
+        { value: "yaml", label: "YAML (.yaml)", description: "Clean key/value config with multiline instruction" },
+        { value: "json", label: "JSON (.json)", description: "Single-agent JSON file" },
+      ]);
+      if (!fmtPick) return;
+      const starterPick = await pickOne("starter template", [
+        { value: "blank", label: "Minimal starter", description: "Readonly specialist template with helpful comments" },
+        ...SUBAGENT_PRESETS.map((p) => ({
+          value: p.id,
+          label: `Based on ${p.name}`,
+          description: p.description,
+        })),
+      ]);
+      if (!starterPick) return;
+      const scope = await pickOne("save scope", [
+        { value: "user", label: "User (~/.kern/agents)", description: "available in all workspaces" },
+        { value: "project", label: "Project (.kern/agents)", description: "saved in current repo" },
+      ]);
+      if (!scope) return;
+      const preset = starterPick !== "blank" ? findSubagentPreset(starterPick) : undefined;
+      const entry: SubagentConfigEntry = preset
+        ? { ...preset.entry, name }
+        : {
+            name,
+            type: "local",
+            description: `Custom specialist agent (${name})`,
+            mode: "readonly",
+            isolation: "readonly",
+            tools: ["read", "grep", "find", "git-status", "git-diff"],
+            maxTurns: 12,
+            instruction: `You are the "${name}" specialist.\nExplain findings concisely with exact file paths, line numbers, and actionable recommendations.`,
+          };
+      await saveAndReportSubagent(entry, scope as "user" | "project", {
+        format: fmtPick as SubagentFileFormat,
+        templateComments: true,
+      });
+      info("Edit the generated file anytime and run `/agents reload` to apply changes.");
+      return;
+    }
+
+    if (pick === "__preset__") {
+      const presetId = await pickOne(
+        "agents — choose specialist preset",
+        SUBAGENT_PRESETS.map((p) => ({
+          value: p.id,
+          label: `${p.name} (${p.id})`,
+          description: `${p.entry.mode ?? "readonly"} · ${p.description}`,
+        })),
+      );
+      if (!presetId) return;
+      const preset = SUBAGENT_PRESETS.find((p) => p.id === presetId);
+      if (!preset) return;
+      const customModel = await promptText("optional model override (provider/id, leave empty to use active model)", "");
+      if (customModel === null) return;
+      const scope = await pickOne("save scope", [
+        { value: "user", label: "User (~/.kern/agents)", description: "available in all workspaces" },
+        { value: "project", label: "Project (.kern/agents)", description: "saved in current repo (auto-trusted)" },
+      ]);
+      if (!scope) return;
+      const entry: SubagentConfigEntry = {
+        ...preset.entry,
+        ...(customModel.trim() ? { model: customModel.trim() } : {}),
+      };
+      await saveAndReportSubagent(entry, scope as "user" | "project");
+      return;
+    }
+
+    if (pick === "__local__") {
+      const name = (await promptText("specialist name ([a-z0-9_-])"))?.trim();
+      if (!name) return;
+      const description = (await promptText("routing description (shown to orchestrator)"))?.trim();
+      if (!description) return;
+      const mode = await pickOne("tool mode", [
+        { value: "readonly", label: "readonly", description: "read/grep/find/git inspect + optional read-only MCP" },
+        { value: "write", label: "write", description: "can edit files & run commands (serialized or worktree)" },
+      ]);
+      if (!mode) return;
+      let isolation: "readonly" | "exclusive" | "worktree" = "readonly";
+      if (mode === "write") {
+        const pickedIso = await pickOne("workspace isolation", [
+          { value: "exclusive", label: "exclusive lock", description: "serializes write access on main workspace" },
+          { value: "worktree", label: "git worktree", description: "runs in temporary detached git worktree" },
+        ]);
+        if (!pickedIso) return;
+        isolation = pickedIso as "exclusive" | "worktree";
+      }
+      const toolsRaw = await promptText("allowed built-in tools (comma-separated, empty = role default)", "");
+      if (toolsRaw === null) return;
+      const mcpRaw = await promptText("parent MCP server names to share (comma-separated, optional)", "");
+      if (mcpRaw === null) return;
+      const modelRaw = await promptText("model override (provider/id, empty = inherit parent)", "");
+      if (modelRaw === null) return;
+      const instruction = (await promptText("specialist system instruction", ""))?.trim();
+      const scope = await pickOne("save scope", [
+        { value: "user", label: "User (~/.kern/agents)", description: "available globally" },
+        { value: "project", label: "Project (.kern/agents)", description: "saved in workspace (auto-trusted)" },
+      ]);
+      if (!scope) return;
+      const entry: SubagentConfigEntry = {
+        name,
+        type: "local",
+        description,
+        mode: mode as "readonly" | "write",
+        isolation,
+        ...(toolsRaw.trim() ? { tools: toolsRaw.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
+        ...(mcpRaw.trim() ? { mcpServers: mcpRaw.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
+        ...(modelRaw.trim() ? { model: modelRaw.trim() } : {}),
+        ...(instruction ? { instruction } : {}),
+      };
+      await saveAndReportSubagent(entry, scope as "user" | "project");
+      return;
+    }
+
+    if (pick === "__a2a__") {
+      const name = (await promptText("remote A2A agent name ([a-z0-9_-])"))?.trim();
+      if (!name) return;
+      const url = (await promptText("A2A endpoint URL", "http://127.0.0.1:41241"))?.trim();
+      if (!url || !/^https?:\/\//i.test(url)) {
+        err("URL must start with http:// or https://");
+        return;
+      }
+      const description = (await promptText("agent description", `Remote A2A specialist (${name})`))?.trim();
+      if (!description) return;
+      const authVal = await promptText("Authorization / Bearer token header (optional, supports ${ENV_VAR})", "");
+      if (authVal === null) return;
+      const scope = await pickOne("save scope", [
+        { value: "user", label: "User (~/.kern/agents.json)", description: "available globally" },
+        { value: "project", label: "Project (.kern/agents.json)", description: "saved in workspace (auto-trusted)" },
+      ]);
+      if (!scope) return;
+      const tok = authVal.trim();
+      const entry: SubagentConfigEntry = {
+        name,
+        type: "a2a",
+        url,
+        description,
+        ...(tok ? { headers: { Authorization: /^bearer\s+/i.test(tok) || tok.startsWith("${") ? tok : `Bearer ${tok}` } } : {}),
+      };
+      await saveAndReportSubagent(entry, scope as "user" | "project");
+      return;
+    }
+
+    if (pick.startsWith("agent:")) {
+      const name = pick.slice(6);
+      const target = mgr.getStatus(name);
+      if (!target) return;
+      const action = await pickOne(`agent · ${name} (${target.state})`, [
+        { value: "inspect", label: "Inspect configuration & capabilities", description: target.description },
+        ...(target.state === "untrusted"
+          ? [{ value: "trust", label: "Trust project agent", description: "approve SHA-256 fingerprint in ~/.kern/agent-trust.json" }]
+          : []),
+        {
+          value: target.disabled ? "enable" : "disable",
+          label: target.disabled ? "Enable agent" : "Disable agent",
+          description: target.disabled ? "expose to orchestrator" : "hide from orchestrator without deleting",
+        },
+        { value: "remove", label: "Remove agent", description: "delete configuration file entry" },
+      ]);
+      if (!action) return;
+      if (action === "inspect") {
+        inspectSubagent(target);
+      } else if (action === "trust") {
+        const next = await mgr.trustSubagent(name);
+        updateSidebar();
+        printStatus();
+        inspectSubagent(next);
+      } else if (action === "enable" || action === "disable") {
+        const next = await mgr.toggleSubagent(name, action === "disable");
+        updateSidebar();
+        printStatus();
+        ok(`${name}: ${next.state}`);
+      } else if (action === "remove") {
+        await mgr.removeSubagent(name);
+        updateSidebar();
+        printStatus();
+        ok(`Removed subagent "${name}".`);
+      }
+    }
+  };
+
+  const runAgentsCommand = async (arg: string): Promise<void> => {
+    const mgr = session.subagents;
+    if (!mgr) {
+      err("Subagent manager is unavailable on this session.");
+      return;
+    }
+    const tokens = arg.trim().split(/\s+/).filter(Boolean);
+    const sub = (tokens[0] ?? "").toLowerCase();
+    if (!sub) {
+      await runAgentsWizard();
+      return;
+    }
+    if (sub === "list" || sub === "ls" || sub === "status") {
+      printAgentsStatus(mgr.listStatuses());
+      return;
+    }
+    if (sub === "presets") {
+      say(theme.bold("subagent presets (opt-in)"));
+      for (const p of SUBAGENT_PRESETS) {
+        say(`  ${theme.accent(p.id)}  ${theme.muted(`${p.entry.mode ?? "readonly"}/${p.entry.isolation ?? "readonly"} — ${p.description}`)}`);
+      }
+      return;
+    }
+    if (sub === "bg" || sub === "jobs") {
+      const jobs = mgr.listBackgroundJobs();
+      if (jobs.length === 0) {
+        info("No background subagent runs in this session.");
+        return;
+      }
+      for (const j of jobs) {
+        say(`  ${j.jobId} [${j.running ? "running" : j.exitReason ?? "done"}] ${j.agent} · turns=${j.turns}${j.lastProgress ? ` · ${j.lastProgress}` : ""}`);
+      }
+      return;
+    }
+    if (sub === "inspect") {
+      const name = tokens[1];
+      if (!name) { err("Usage: /agents inspect <name>"); return; }
+      const target = mgr.getStatus(name);
+      if (!target) { err(`Unknown subagent "${name}".`); return; }
+      inspectSubagent(target);
+      return;
+    }
+    if (busy) {
+      toast("Wait for the current turn to settle before modifying team subagents.");
+      return;
+    }
+    if (sub === "reload") {
+      const res = await mgr.discover();
+      updateSidebar();
+      printStatus();
+      printAgentsStatus(res.agents);
+      return;
+    }
+    if (sub === "trust") {
+      const name = tokens[1];
+      if (!name) { err("Usage: /agents trust <name>"); return; }
+      const next = await mgr.trustSubagent(name);
+      updateSidebar();
+      printStatus();
+      inspectSubagent(next);
+      return;
+    }
+    if (sub === "enable" || sub === "disable") {
+      const name = tokens[1];
+      if (!name) { err(`Usage: /agents ${sub} <name>`); return; }
+      const next = await mgr.toggleSubagent(name, sub === "disable");
+      updateSidebar();
+      printStatus();
+      ok(`${name}: ${next.state}`);
+      return;
+    }
+    if (sub === "remove" || sub === "rm") {
+      const name = tokens[1];
+      if (!name) { err("Usage: /agents remove <name>"); return; }
+      const removed = await mgr.removeSubagent(name);
+      updateSidebar();
+      printStatus();
+      if (removed) ok(`Removed subagent "${name}".`);
+      else info(`Subagent "${name}" was not configured.`);
+      return;
+    }
+    if (sub === "format" || sub === "guide") {
+      say(theme.bold("subagent file formats"));
+      info(SUBAGENT_FORMAT_GUIDE);
+      return;
+    }
+    if (sub === "init" || sub === "new") {
+      const rawArgs = tokens.slice(1);
+      const isProject = rawArgs.includes("--project") || rawArgs.includes("-p");
+      const filtered = rawArgs.filter((t) => t !== "--project" && t !== "-p");
+      const name = filtered[0];
+      if (!name) {
+        err("Usage: /agents init <name> [md|yaml|json] [preset] [--project]");
+        return;
+      }
+      let fmt: SubagentFileFormat = "md";
+      let presetArg: string | undefined;
+      for (const tok of filtered.slice(1)) {
+        const low = tok.toLowerCase();
+        if (low === "md" || low === "markdown") fmt = "md";
+        else if (low === "yaml" || low === "yml") fmt = "yaml";
+        else if (low === "json") fmt = "json";
+        else presetArg = tok;
+      }
+      const preset = presetArg ? findSubagentPreset(presetArg) : undefined;
+      const entry: SubagentConfigEntry = preset
+        ? { ...preset.entry, name }
+        : {
+            name,
+            type: "local",
+            description: `Custom specialist agent (${name})`,
+            mode: "readonly",
+            isolation: "readonly",
+            tools: ["read", "grep", "find", "git-status", "git-diff"],
+            maxTurns: 12,
+            instruction: `You are the "${name}" specialist.\nExplain findings concisely with exact file paths, line numbers, and actionable recommendations.`,
+          };
+      await saveAndReportSubagent(entry, isProject ? "project" : "user", { format: fmt, templateComments: true });
+      info("Edit the file anytime and run `/agents reload` to apply changes.");
+      return;
+    }
+    if (sub === "preset") {
+      const presetId = tokens[1];
+      if (!presetId) { err("Usage: /agents preset <explorer|reviewer|coder|researcher>"); return; }
+      const preset = SUBAGENT_PRESETS.find((p) => p.id === presetId.toLowerCase());
+      if (!preset) { err(`Unknown preset "${presetId}". Run /agents presets.`); return; }
+      const entry: SubagentConfigEntry = {
+        ...preset.entry,
+        ...(tokens[2] ? { name: tokens[2] } : {}),
+      };
+      await saveAndReportSubagent(entry, "user");
+      return;
+    }
+    err(`Unknown /agents action "${sub}". Try /agents, /agents list, /agents format, /agents init <name> [md|yaml|json], /agents presets, /agents preset <id>, /agents inspect <name>, /agents trust <name>, /agents reload, /agents remove <name>.`);
   };
 
   // --- slash commands -------------------------------------------------------------------
@@ -2755,6 +3244,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       case "/mcp":
       case "/connects":
         await runMcpCommand(arg);
+        return true;
+      case "/agents":
+      case "/team":
+        await runAgentsCommand(arg);
         return true;
       case "/compact": {
         if (busy) {
@@ -3073,6 +3566,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         queue,
         lastUserPrompt,
       }),
+      session.subagents?.dispose(),
       session.connects?.dispose(),
     ]).finally(() => {
       session.dispose();

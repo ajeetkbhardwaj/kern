@@ -30,6 +30,7 @@ import {
 } from "@kern/tools";
 import { createLogger, type AskUserRequest, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition, type CostSnapshot } from "@kern/protocol";
 import { ConnectManager, type LoadMcpConfigsOptions } from "@kern/connects";
+import { SubagentManager, type LoadSubagentsOptions } from "@kern/subagents";
 import type { BudgetLimits, BudgetUsage, ContextUsage } from "@kern/agent-core";
 import { SettingsManager, type PermissionRulesSettings } from "./settings.js";
 
@@ -65,6 +66,12 @@ export interface CreateAgentSessionOptions {
   connectsOptions?: LoadMcpConfigsOptions;
   /** Optional pre-created ConnectManager instance. */
   connectManager?: ConnectManager;
+  /** Auto-discover configured subagents/A2A team members (zero active by default). Default true. */
+  enableSubagents?: boolean;
+  /** Optional subagent discovery/trust config options. */
+  subagentsOptions?: LoadSubagentsOptions;
+  /** Optional pre-created SubagentManager instance. */
+  subagentManager?: SubagentManager;
   /** Default reasoning mode for the active model. */
   thinkingLevel?: ThinkingLevel;
   /** Resume the most recent session instead of creating a new one. */
@@ -117,6 +124,8 @@ export interface AgentSession {
   exportMarkdown?(): string;
   /** Live MCP / external connector hub for this session. */
   connects?: ConnectManager;
+  /** Opt-in team subagents & remote A2A delegation manager (dormant when 0 configured). */
+  subagents?: SubagentManager;
 }
 
 export interface AgentSessionRuntime {
@@ -280,9 +289,9 @@ async function buildSessionWithRuntime(
   const resolvedThinkingLevel: ThinkingLevel =
     options._explicitThinkingLevel ?? persistedThinkingLevel ?? options._settingsThinkingLevel ?? options.thinkingLevel ?? "medium";
 
-  const model = options.model ?? createFakeModel();
+  let activeModelAdapter = options.model ?? createFakeModel();
   const runtime = new AgentRuntime({
-    model,
+    model: activeModelAdapter,
     fallbackModels: options.fallbackModels,
     tools,
     sessions: manager,
@@ -296,6 +305,46 @@ async function buildSessionWithRuntime(
     requestApproval: options.requestApproval,
   });
 
+  const ownsSubagentManager = !options.subagentManager;
+  const subagentManager =
+    options.subagentManager ??
+    new SubagentManager({
+      cwd: options.cwd,
+      logger,
+      ...(options.subagentsOptions ?? {}),
+    });
+  if (options.enableSubagents !== false) {
+    subagentManager.bindRuntime(tools, {
+      cwd: options.cwd,
+      logger,
+      getModel: () => activeModelAdapter,
+      getThinkingLevel: () => runtime.thinkingMode(),
+      getParentBudget: () => runtime.budgetTracker(),
+      getBudgetLimits: () => runtime.budgetLimits(),
+      getPolicyConfig: () => policyConfig,
+      getSafetyMode: () => policy.safetyMode(),
+      getPermissionRules: () => options.permissionRules,
+      requestApproval: options.requestApproval,
+      askUser: options.askUser,
+      connects: connectManager,
+      contextBuilder,
+      storageRoot: options.storageRoot,
+      parentSessionId: manager.sessionId,
+    });
+    if (ownsSubagentManager) {
+      try {
+        const { warnings } = await subagentManager.discover();
+        for (const w of warnings) {
+          logger.warn("subagent_discovery_notice", { message: w });
+        }
+      } catch (error) {
+        logger.warn("subagent_discovery_failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
   const session: AgentSession = {
     prompt: (text, opts) => runtime.runUserTurn(text, opts ?? {}),
     subscribe: (l) => events.subscribe(l),
@@ -303,7 +352,10 @@ async function buildSessionWithRuntime(
     budgetLimits: () => runtime.budgetLimits(),
     setBudgetLimits: (limits) => runtime.setBudgetLimits(limits),
     isBusy: () => runtime.isBusy(),
-    setModel: (adapter) => runtime.setModel(adapter),
+    setModel: async (adapter) => {
+      await runtime.setModel(adapter);
+      activeModelAdapter = adapter;
+    },
     modelInfo: () => runtime.modelInfo(),
     thinkingMode: () => runtime.thinkingMode(),
     setThinkingLevel: (level) => runtime.setThinkingLevel(level),
@@ -317,11 +369,13 @@ async function buildSessionWithRuntime(
     toolNames: () => runtime.toolNames(),
     callToolAsUser: (name, args, signal) => runtime.callToolAsUser(name, args, signal),
     dispose: () => {
+      if (ownsSubagentManager) void subagentManager.dispose();
       void backgroundJobs.dispose();
       if (ownsConnectManager) void connectManager.dispose();
       runtime.dispose();
     },
     connects: connectManager,
+    subagents: subagentManager,
     isDisposed: () => runtime.isDisposed(),
     sessionName: () => manager.sessionName,
     activeLeafId: () => manager.activeLeafId,

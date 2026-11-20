@@ -136,7 +136,7 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions): ModelAdapter
 
         const pending = new Map<number, { id: string; name: string; args: string }>();
         let finishReason: string | null = null;
-        const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+        const contentType = (res.headers?.get?.("content-type") ?? "").toLowerCase();
 
         if (contentType.includes("application/json")) {
           let payload: SSEChunk;

@@ -333,16 +333,16 @@ export function isRetryableModelError(kind: ModelErrorKind): boolean {
 }
 
 export function classifyModelError(error: unknown): ModelErrorKind {
-  if (error instanceof KernError && error.kind) return error.kind;
+  if (error instanceof KernError) return error.kind ?? "unknown";
   if (error instanceof Error) {
     const message = error.message.toLowerCase();
-    if (/unauthorized|forbidden|401|invalid api key|auth/i.test(message)) return "auth";
-    if (/429|rate limit|too many requests/i.test(message)) return "rate_limit";
+    if (/unauthorized|forbidden|\b401\b|invalid api key|auth/i.test(message)) return "auth";
+    if (/\b429\b|rate limit|too many requests/i.test(message)) return "rate_limit";
     if (/timeout|timed out|econnreset|esockettimedout|deadline exceeded/i.test(message)) return "timeout";
     if (/network|fetch failed|econnrefused|enotfound|socket hang up|dns|reset by peer|connection refused/i.test(message)) return "network";
-    if (/overloaded|temporarily unavailable|service unavailable|bad gateway|gateway timeout|503|504/i.test(message)) return "overloaded";
+    if (/overloaded|temporarily unavailable|service unavailable|bad gateway|gateway timeout|\b503\b|\b504\b/i.test(message)) return "overloaded";
     if (/context.*(length|window)|token.*limit|maximum context|too many tokens/i.test(message)) return "context_length";
-    if (/invalid request|400|bad request|malformed.*request|unsupported.*parameter/i.test(message)) return "invalid_request";
+    if (/invalid request|\b400\b|bad request|malformed.*request|unsupported.*parameter/i.test(message)) return "invalid_request";
     if (/malformed|parse.*json|unexpected token|invalid json|response.*format/i.test(message)) return "malformed_response";
     if (/abort|cancelled|aborted/i.test(message)) return "cancelled";
   }

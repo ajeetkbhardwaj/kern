@@ -62,8 +62,19 @@ describe("Phase 5 session runtime + settings", () => {
       "todo",
       "web-fetch",
       "ask-user",
+      "create-subagent",
     ]);
     session.dispose();
+
+    const noSub = await createAgentSession({
+      cwd: process.cwd(),
+      loadResources: false,
+      enableCompaction: false,
+      enableConnects: false,
+      enableSubagents: false,
+    });
+    expect(noSub.session.toolNames()).not.toContain("create-subagent");
+    noSub.session.dispose();
   });
 
   it("wires askUser handler when provided and fails closed when absent", async () => {
@@ -343,6 +354,206 @@ describe("Phase 5 session runtime + settings", () => {
       expect(finalText?.type === "text" ? finalText.text : "").toBe("Result from MCP: sum=42");
 
       await session.connects!.dispose();
+      session.dispose();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps delegate absent by default and executes orchestrator -> explorer delegation end-to-end when enabled", async () => {
+    const root = mkdtempSync(join(tmpdir(), "kern-e2e-subagents-"));
+    try {
+      writeFileSync(join(root, "secret-note.txt"), "team-delegation-token-99\n");
+
+      let rootTurns = 0;
+      let childTurns = 0;
+      const model: ModelAdapter = {
+        info: {
+          provider: "mock",
+          modelId: "orch-1",
+          contextWindow: 32_000,
+          maxOutputTokens: 1000,
+          inputCostPer1M: 40,
+          outputCostPer1M: 40,
+        },
+        async *stream(req: ModelRequest): AsyncIterable<ModelStreamEvent> {
+          const isChild = req.systemPrompt.includes('You are "explorer"');
+          if (isChild) {
+            childTurns += 1;
+            if (childTurns === 1) {
+              yield {
+                type: "tool_call_complete",
+                call: { type: "tool_call", id: "c1", name: "read", arguments: { path: "secret-note.txt" } },
+              };
+              yield { type: "usage", usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0 } };
+              yield { type: "finished", reason: "tool_use" };
+              return;
+            }
+            const toolMsg = req.messages.find((m) => m.role === "tool");
+            const txt = toolMsg?.content[0]?.type === "tool_result" ? toolMsg.content[0].content[0]?.text ?? "" : "";
+            yield { type: "text_delta", delta: `Found token: ${txt.trim()}` };
+            yield { type: "usage", usage: { input: 30, output: 15, cacheRead: 0, cacheWrite: 0 } };
+            yield { type: "finished", reason: "stop" };
+            return;
+          }
+
+          rootTurns += 1;
+          if (rootTurns === 1) {
+            expect(req.systemPrompt).toContain("<team>");
+            yield {
+              type: "tool_call_complete",
+              call: { type: "tool_call", id: "d1", name: "delegate", arguments: { agent: "explorer", task: "Read secret-note.txt" } },
+            };
+            yield { type: "finished", reason: "tool_use" };
+            return;
+          }
+          const toolMsg = req.messages.find((m) => m.role === "tool");
+          const report = toolMsg?.content[0]?.type === "tool_result" ? toolMsg.content[0].content[0]?.text ?? "" : "";
+          yield { type: "text_delta", delta: `Orchestrator received -> ${report}` };
+          yield { type: "finished", reason: "stop" };
+        },
+      };
+
+      const { session, manager } = await createAgentSession({
+        cwd: root,
+        storageRoot: join(root, "sessions"),
+        loadResources: false,
+        enableCompaction: false,
+        enableConnects: false,
+        model,
+        subagentsOptions: {
+          userAgentsDir: join(root, "user-agents"),
+          userAgentsJsonPath: join(root, "user-agents.json"),
+          trustFilePath: join(root, "agent-trust.json"),
+        },
+      });
+
+      // Zero default bloat
+      expect(session.subagents?.listStatuses()).toEqual([]);
+      expect(session.toolNames()).not.toContain("delegate");
+
+      // Opt-in explorer added dynamically
+      await session.subagents!.addSubagent(
+        {
+          name: "explorer",
+          description: "Read-only file investigator",
+          mode: "readonly",
+          tools: ["read"],
+        },
+        { scope: "user" },
+      );
+      expect(session.toolNames()).toContain("delegate");
+
+      await session.prompt("Find the value in secret-note.txt via explorer.");
+      const msgs = manager.getActiveMessages();
+      const last = msgs[msgs.length - 1];
+      const finalText = last?.message.content.find((b) => b.type === "text");
+      expect(finalText?.type === "text" ? finalText.text : "").toContain("team-delegation-token-99");
+      expect(session.budgetUsage().cost).toBeCloseTo(0.003, 5);
+
+      await session.subagents!.dispose();
+      session.dispose();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows root orchestrator to propose and run a new specialist via create-subagent after explicit user approval", async () => {
+    const root = mkdtempSync(join(tmpdir(), "kern-e2e-create-sub-"));
+    try {
+      writeFileSync(join(root, "architecture.txt"), "dynamic-specialist-verified-77\n");
+
+      let rootTurns = 0;
+      let childTurns = 0;
+      const approvalRequests: string[] = [];
+
+      const model: ModelAdapter = {
+        info: {
+          provider: "mock",
+          modelId: "orch-dyn",
+          contextWindow: 32_000,
+          maxOutputTokens: 1000,
+        },
+        async *stream(req: ModelRequest): AsyncIterable<ModelStreamEvent> {
+          const isChild = req.systemPrompt.includes('You are "arch-auditor"');
+          if (isChild) {
+            childTurns += 1;
+            if (childTurns === 1) {
+              yield {
+                type: "tool_call_complete",
+                call: { type: "tool_call", id: "c1", name: "read", arguments: { path: "architecture.txt" } },
+              };
+              yield { type: "finished", reason: "tool_use" };
+              return;
+            }
+            const toolMsg = req.messages.find((m) => m.role === "tool");
+            const txt = toolMsg?.content[0]?.type === "tool_result" ? toolMsg.content[0].content[0]?.text ?? "" : "";
+            yield { type: "text_delta", delta: `Child audited: ${txt.trim()}` };
+            yield { type: "finished", reason: "stop" };
+            return;
+          }
+
+          rootTurns += 1;
+          if (rootTurns === 1) {
+            yield {
+              type: "tool_call_complete",
+              call: {
+                type: "tool_call",
+                id: "cs1",
+                name: "create-subagent",
+                arguments: {
+                  name: "arch-auditor",
+                  description: "Inspects architecture documents",
+                  instruction: "Read architecture.txt and report exact values.",
+                  mode: "readonly",
+                  tools: ["read"],
+                  scope: "memory",
+                  reason: "Dedicated context for complex architecture check",
+                  task: "Read architecture.txt and confirm verification token",
+                },
+              },
+            };
+            yield { type: "finished", reason: "tool_use" };
+            return;
+          }
+          const toolMsg = req.messages.find((m) => m.role === "tool");
+          const out = toolMsg?.content[0]?.type === "tool_result" ? toolMsg.content[0].content[0]?.text ?? "" : "";
+          yield { type: "text_delta", delta: `Final synthesis -> ${out}` };
+          yield { type: "finished", reason: "stop" };
+        },
+      };
+
+      const { session, manager } = await createAgentSession({
+        cwd: root,
+        storageRoot: join(root, "sessions"),
+        loadResources: false,
+        enableCompaction: false,
+        enableConnects: false,
+        safetyMode: "autonomous",
+        policy: { approvalMode: "never" },
+        model,
+        requestApproval: async (prompt) => {
+          approvalRequests.push(prompt);
+          return true;
+        },
+        subagentsOptions: {
+          userAgentsDir: join(root, "user-agents"),
+          userAgentsJsonPath: join(root, "user-agents.json"),
+          trustFilePath: join(root, "agent-trust.json"),
+        },
+      });
+
+      await session.prompt("Solve this complex architecture check by spinning up a specialist if helpful.");
+
+      expect(approvalRequests.length).toBe(1);
+      expect(approvalRequests[0]).toContain("arch-auditor");
+      const msgs = manager.getActiveMessages();
+      const last = msgs[msgs.length - 1];
+      const finalText = last?.message.content.find((b) => b.type === "text");
+      expect(finalText?.type === "text" ? finalText.text : "").toContain("dynamic-specialist-verified-77");
+      expect(session.subagents?.getStatus("arch-auditor")?.state).toBe("ready");
+
+      await session.subagents!.dispose();
       session.dispose();
     } finally {
       rmSync(root, { recursive: true, force: true });

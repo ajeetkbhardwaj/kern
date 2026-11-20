@@ -42,6 +42,8 @@ export interface AgentRuntimeOptions {
   retry?: RetryConfig;
   defaultThinkingLevel?: ThinkingLevel;
   hookExecutor?: HookExecutor;
+  /** Optional parent budget tracker so subagent token/cost usage shares the root wallet. */
+  parentBudgetTracker?: BudgetTracker;
   /** Called when policy demands approval. Absent = deny. */
   requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
 }
@@ -84,13 +86,17 @@ export class AgentRuntime {
     this.contextBuilder = options.contextBuilder;
     this.events = options.events;
     this.logger = options.logger ?? nullLogger;
-    this.budgets = new BudgetTracker(options.budgets ?? {}, (event) => this.events.emit(event));
+    this.budgets = new BudgetTracker(options.budgets ?? {}, (event) => this.events.emit(event), options.parentBudgetTracker);
     this.budgets.restoreUsage(this.sessions.getUsageTotals());
     this.compactor = options.compactor === undefined ? new Compactor({ logger: this.logger }) : options.compactor;
     this.retry = options.retry ?? DEFAULT_RETRY_CONFIG;
     this.hookExecutor = options.hookExecutor;
     this.thinkingLevel = options.defaultThinkingLevel ?? "medium";
     if (options.requestApproval !== undefined) this.requestApproval = options.requestApproval;
+  }
+
+  budgetTracker(): BudgetTracker {
+    return this.budgets;
   }
 
   budgetUsage() {

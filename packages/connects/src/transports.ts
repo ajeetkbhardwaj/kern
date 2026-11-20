@@ -56,6 +56,12 @@ export interface McpServerMeta {
   capabilities?: Record<string, unknown>;
 }
 
+export type McpListChangedKind = "tools" | "resources" | "prompts";
+
+export interface McpTransportHooks {
+  onListChanged?: (kind: McpListChangedKind) => void;
+}
+
 export interface McpTransportClient {
   connect(): Promise<McpServerMeta>;
   listTools(): Promise<RawMcpTool[]>;
@@ -80,6 +86,29 @@ function isMethodNotFound(err: unknown): boolean {
   return /method not found|-32601|not implemented|unsupported/i.test(msg);
 }
 
+function listChangedKindForMethod(method: unknown): McpListChangedKind | null {
+  if (method === "notifications/tools/list_changed") return "tools";
+  if (method === "notifications/resources/list_changed") return "resources";
+  if (method === "notifications/prompts/list_changed") return "prompts";
+  return null;
+}
+
+function formatHttpAuthError(status: number, context: string, res: Response, errBody: string): Error {
+  if (status === 401 || status === 403) {
+    const wwwAuth = res.headers?.get?.("www-authenticate")?.trim();
+    const hint = `Authentication required (HTTP ${status}) on ${context}. Configure an Authorization Bearer token header via /mcp, \`kern mcp add --header "Authorization=Bearer $TOKEN"\`, or ~/.kern/mcp.json.`;
+    const extra = [wwwAuth ? `WWW-Authenticate: ${wwwAuth.slice(0, 160)}` : "", errBody ? errBody.slice(0, 160) : ""]
+      .filter(Boolean)
+      .join(" | ");
+    const err = new Error(extra ? `${hint} (${extra})` : hint);
+    (err as { status?: number }).status = status;
+    return err;
+  }
+  const err = new Error(`MCP HTTP ${status} on ${context}${errBody ? `: ${errBody.slice(0, 200)}` : ""}`);
+  (err as { status?: number }).status = status;
+  return err;
+}
+
 /**
  * Persistent stdio MCP JSON-RPC 2.0 client.
  * Keeps child process alive across calls for stateful servers and disposes cleanly.
@@ -94,7 +123,10 @@ export class StdioMcpClient implements McpTransportClient {
   private stderrTail = "";
   private exitHandler: (() => void) | null = null;
 
-  constructor(private readonly def: ResolvedMcpServerDef) {}
+  constructor(
+    private readonly def: ResolvedMcpServerDef,
+    private readonly hooks: McpTransportHooks = {},
+  ) {}
 
   isConnected(): boolean {
     return this.connected && this.proc !== null && !this.proc.killed && this.proc.exitCode === null;
@@ -194,13 +226,17 @@ export class StdioMcpClient implements McpTransportClient {
   private handleLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed || !trimmed.startsWith("{")) return;
-    let msg: { id?: unknown; result?: unknown; error?: { message?: string; code?: number } };
+    let msg: { id?: unknown; method?: unknown; result?: unknown; error?: { message?: string; code?: number } };
     try {
       msg = JSON.parse(trimmed) as typeof msg;
     } catch {
       return;
     }
-    if (typeof msg.id !== "number") return;
+    if (typeof msg.id !== "number") {
+      const changed = listChangedKindForMethod(msg.method);
+      if (changed) this.hooks.onListChanged?.(changed);
+      return;
+    }
     const pending = this.pending.get(msg.id);
     if (!pending) return;
     this.pending.delete(msg.id);
@@ -478,7 +514,10 @@ export class HttpMcpClient implements McpTransportClient {
   private sseAbort: AbortController | null = null;
   private ssePending = new Map<number, PendingRpc>();
 
-  constructor(private readonly def: ResolvedMcpServerDef) {}
+  constructor(
+    private readonly def: ResolvedMcpServerDef,
+    private readonly hooks: McpTransportHooks = {},
+  ) {}
 
   isConnected(): boolean {
     return this.connected;
@@ -544,7 +583,8 @@ export class HttpMcpClient implements McpTransportClient {
     });
     if (!response.ok || !response.body) {
       clearTimeout(timeoutTimer);
-      throw new Error(`MCP SSE connect failed: HTTP ${response.status}`);
+      const errBody = await response.text().catch(() => "");
+      throw formatHttpAuthError(response.status, "SSE connect", response, errBody);
     }
 
     const reader = response.body.getReader();
@@ -628,8 +668,12 @@ export class HttpMcpClient implements McpTransportClient {
     }
 
     try {
-      const msg = JSON.parse(data) as { id?: unknown; result?: unknown; error?: { message?: string; code?: number } };
-      if (typeof msg.id !== "number") return;
+      const msg = JSON.parse(data) as { id?: unknown; method?: unknown; result?: unknown; error?: { message?: string; code?: number } };
+      if (typeof msg.id !== "number") {
+        const changed = listChangedKindForMethod(msg.method);
+        if (changed) this.hooks.onListChanged?.(changed);
+        return;
+      }
       const pending = this.ssePending.get(msg.id);
       if (!pending) return;
       this.ssePending.delete(msg.id);
@@ -800,9 +844,7 @@ export class HttpMcpClient implements McpTransportClient {
       if (sid) this.sessionId = sid;
       if (!res.ok) {
         const errBody = await res.text().catch(() => "");
-        const err = new Error(`MCP HTTP ${res.status} on ${method}${errBody ? `: ${errBody.slice(0, 200)}` : ""}`);
-        (err as { status?: number }).status = res.status;
-        throw err;
+        throw formatHttpAuthError(res.status, method, res, errBody);
       }
       const parsed = parseHttpJsonOrSse(await res.text(), id);
       if (parsed.error) throw new Error(parsed.error.message ?? `MCP ${method} error`);
@@ -927,6 +969,6 @@ export class HttpMcpClient implements McpTransportClient {
   }
 }
 
-export function createMcpClient(def: ResolvedMcpServerDef): McpTransportClient {
-  return def.transport === "stdio" ? new StdioMcpClient(def) : new HttpMcpClient(def);
+export function createMcpClient(def: ResolvedMcpServerDef, hooks: McpTransportHooks = {}): McpTransportClient {
+  return def.transport === "stdio" ? new StdioMcpClient(def, hooks) : new HttpMcpClient(def, hooks);
 }

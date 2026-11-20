@@ -16,7 +16,7 @@ import {
   mcpToolToToolDefinition,
   normalizeMcpInputSchema,
 } from "./adapter.js";
-import { createMcpClient, type McpTransportClient, type RawMcpTool } from "./transports.js";
+import { createMcpClient, type McpListChangedKind, type McpTransportClient, type RawMcpTool } from "./transports.js";
 import type {
   McpPromptInfo,
   McpResourceInfo,
@@ -100,8 +100,10 @@ export class ConnectManager {
     this.auxiliaryToolNames = [];
 
     // Register per-server tools
-    const hasAnyResources = this.listStatuses().some((s) => s.resources.length > 0);
-    const hasAnyPrompts = this.listStatuses().some((s) => s.prompts.length > 0);
+    const connectedStatuses = this.listStatuses().filter((s) => s.state === "connected");
+    const hasAnyResources = connectedStatuses.some((s) => s.resources.length > 0);
+    const hasAnyPrompts = connectedStatuses.some((s) => s.prompts.length > 0);
+    const hasDeferredTools = connectedStatuses.some((s) => s.deferred === true && s.tools.length > 0);
 
     for (const managed of this.servers.values()) {
       for (const prevName of managed.registeredToolNames) {
@@ -132,6 +134,10 @@ export class ConnectManager {
       }
     }
 
+    if (hasDeferredTools && !reg.has("mcp_tool_search")) {
+      reg.register(this.createToolSearchTool());
+      this.auxiliaryToolNames.push("mcp_tool_search");
+    }
     if (hasAnyResources && !reg.has("mcp_resources")) {
       reg.register(this.createResourcesTool());
       this.auxiliaryToolNames.push("mcp_resources");
@@ -140,6 +146,71 @@ export class ConnectManager {
       reg.register(this.createPromptsTool());
       this.auxiliaryToolNames.push("mcp_prompts");
     }
+  }
+
+  private createToolSearchTool(): ToolDefinition<{ query?: string; server?: string; activate?: boolean }> {
+    return {
+      name: "mcp_tool_search",
+      description:
+        "Search deferred MCP tools by keyword or server and activate matching tool schemas so they can be called directly.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Keyword filter matching tool name or description (optional)" },
+          server: { type: "string", description: "Filter to a specific deferred MCP server name (optional)" },
+          activate: { type: "boolean", description: "Activate matched tools in the registry (default true)" },
+        },
+      },
+      sideEffect: "read",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      allowRepeatedCalls: true,
+      execute: async (args): Promise<ToolResult> => {
+        const query = typeof args.query === "string" ? args.query.trim().toLowerCase() : "";
+        const serverFilter = typeof args.server === "string" ? args.server.trim() : "";
+        const shouldActivate = args.activate !== false;
+
+        const matches: Array<{ server: string; tool: McpToolInfo }> = [];
+        for (const managed of this.servers.values()) {
+          if (managed.status.state !== "connected" || !managed.def.deferred) continue;
+          if (serverFilter && managed.def.name !== serverFilter) continue;
+          for (const t of managed.status.tools) {
+            if (query) {
+              const haystack = `${managed.def.name} ${t.name} ${t.registeredName} ${t.description ?? ""}`.toLowerCase();
+              if (!haystack.includes(query)) continue;
+            }
+            matches.push({ server: managed.def.name, tool: t });
+          }
+        }
+
+        if (matches.length === 0) {
+          return {
+            content: [{ type: "text", text: "No matching deferred MCP tools found." }],
+            isError: false,
+          };
+        }
+
+        const slice = matches.slice(0, 15);
+        let activatedCount = 0;
+        const lines: string[] = [];
+        for (const { server, tool } of slice) {
+          const ok = shouldActivate ? (this.registry?.activateTool?.(tool.registeredName) ?? false) : false;
+          if (ok) activatedCount += 1;
+          const active = this.registry?.isToolActive?.(tool.registeredName) ?? ok;
+          const paramKeys = Object.keys(tool.inputSchema?.properties ?? {});
+          const paramsHint = paramKeys.length > 0 ? ` args=[${paramKeys.join(", ")}]` : "";
+          lines.push(
+            `- ${tool.registeredName} (${server}, ${active ? "active" : "deferred"})${paramsHint}${tool.description ? `: ${tool.description}` : ""}`,
+          );
+        }
+        if (matches.length > slice.length) {
+          lines.push(`... and ${matches.length - slice.length} more match(es). Refine query to activate specific tools.`);
+        }
+        if (shouldActivate && activatedCount > 0) {
+          lines.push(`\nActivated ${activatedCount} tool(s); schemas are now available.`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }], isError: false };
+      },
+    };
   }
 
   private createResourcesTool(): ToolDefinition<{ action: "list" | "read"; server?: string; uri?: string }> {
@@ -231,6 +302,7 @@ export class ConnectManager {
       state: "disconnected",
       trusted: def.trusted,
       disabled: def.disabled,
+      ...(def.deferred ? { deferred: true } : {}),
       tools: [],
       resources: [],
       prompts: [],
@@ -249,7 +321,11 @@ export class ConnectManager {
       return baseStatus;
     }
 
-    const client = createMcpClient(def);
+    const client = createMcpClient(def, {
+      onListChanged: (kind) => {
+        void this.refreshServerCapabilities(def.name, kind);
+      },
+    });
     const managed: ManagedServer = {
       def,
       client,
@@ -261,29 +337,8 @@ export class ConnectManager {
 
     try {
       const meta = await client.connect();
-      let rawTools = await client.listTools();
-
-      if (def.includeTools && def.includeTools.length > 0) {
-        const allow = new Set(def.includeTools);
-        rawTools = rawTools.filter((t) => allow.has(t.name));
-      }
-      if (def.excludeTools && def.excludeTools.length > 0) {
-        const deny = new Set(def.excludeTools);
-        rawTools = rawTools.filter((t) => !deny.has(t.name));
-      }
-
-      const [resources, prompts] = await Promise.all([
-        client.listResources().catch((): McpResourceInfo[] => []),
-        client.listPrompts().catch((): McpPromptInfo[] => []),
-      ]);
-
-      const tools: McpToolInfo[] = rawTools.map((t) => ({
-        name: t.name,
-        registeredName: makeMcpToolName(def.name, t.name),
-        ...(t.description ? { description: t.description } : {}),
-        inputSchema: normalizeMcpInputSchema(t.inputSchema),
-        ...(t.annotations ? { annotations: t.annotations } : {}),
-      }));
+      const [rawTools, resources, prompts] = await this.fetchServerCapabilities(client, def);
+      const tools = this.buildToolInfos(def.name, rawTools);
 
       managed.rawTools = rawTools;
       managed.status = {
@@ -313,6 +368,78 @@ export class ConnectManager {
     }
 
     return managed.status;
+  }
+
+  private async fetchServerCapabilities(
+    client: McpTransportClient,
+    def: ResolvedMcpServerDef,
+  ): Promise<[RawMcpTool[], McpResourceInfo[], McpPromptInfo[]]> {
+    let rawTools = await client.listTools();
+    if (def.includeTools && def.includeTools.length > 0) {
+      const allow = new Set(def.includeTools);
+      rawTools = rawTools.filter((t) => allow.has(t.name));
+    }
+    if (def.excludeTools && def.excludeTools.length > 0) {
+      const deny = new Set(def.excludeTools);
+      rawTools = rawTools.filter((t) => !deny.has(t.name));
+    }
+    const [resources, prompts] = await Promise.all([
+      client.listResources().catch((): McpResourceInfo[] => []),
+      client.listPrompts().catch((): McpPromptInfo[] => []),
+    ]);
+    return [rawTools, resources, prompts];
+  }
+
+  private buildToolInfos(serverName: string, rawTools: RawMcpTool[]): McpToolInfo[] {
+    return rawTools.map((t) => ({
+      name: t.name,
+      registeredName: makeMcpToolName(serverName, t.name),
+      ...(t.description ? { description: t.description } : {}),
+      inputSchema: normalizeMcpInputSchema(t.inputSchema),
+      ...(t.annotations ? { annotations: t.annotations } : {}),
+    }));
+  }
+
+  private async refreshServerCapabilities(serverName: string, kind: McpListChangedKind): Promise<void> {
+    const managed = this.servers.get(serverName);
+    if (!managed || !managed.client || managed.status.state !== "connected") return;
+    const client = managed.client;
+    try {
+      if (kind === "tools") {
+        let rawTools = await client.listTools();
+        if (managed.def.includeTools && managed.def.includeTools.length > 0) {
+          const allow = new Set(managed.def.includeTools);
+          rawTools = rawTools.filter((t) => allow.has(t.name));
+        }
+        if (managed.def.excludeTools && managed.def.excludeTools.length > 0) {
+          const deny = new Set(managed.def.excludeTools);
+          rawTools = rawTools.filter((t) => !deny.has(t.name));
+        }
+        if (this.servers.get(serverName)?.client !== client) return;
+        managed.rawTools = rawTools;
+        managed.status = {
+          ...managed.status,
+          tools: this.buildToolInfos(serverName, rawTools),
+        };
+        this.syncRegistry();
+      } else if (kind === "resources") {
+        const resources = await client.listResources().catch((): McpResourceInfo[] => []);
+        if (this.servers.get(serverName)?.client !== client) return;
+        managed.status = { ...managed.status, resources };
+        this.syncRegistry();
+      } else if (kind === "prompts") {
+        const prompts = await client.listPrompts().catch((): McpPromptInfo[] => []);
+        if (this.servers.get(serverName)?.client !== client) return;
+        managed.status = { ...managed.status, prompts };
+        this.syncRegistry();
+      }
+    } catch (err) {
+      this.logger.warn("mcp_list_changed_refresh_failed", {
+        server: serverName,
+        kind,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /** Add/update a server (optionally persisting to ~/.kern/mcp.json or .mcp.json) and connect immediately. */
@@ -430,6 +557,36 @@ export class ConnectManager {
 
   getServerStatus(name: string): McpServerStatus | undefined {
     return this.servers.get(name)?.status;
+  }
+
+  /**
+   * Build ToolDefinitions backed by existing live MCP transports without
+   * spawning duplicate servers. Used by subagents when `mcpServers` are allowlisted.
+   */
+  getToolDefinitions(opts: { serverNames?: string[]; readOnlyOnly?: boolean } = {}): ToolDefinition[] {
+    const allowServers = opts.serverNames ? new Set(opts.serverNames) : null;
+    const includeAll = allowServers?.has("*") ?? false;
+    const out: ToolDefinition[] = [];
+    for (const managed of this.servers.values()) {
+      if (managed.status.state !== "connected" || !managed.client) continue;
+      if (allowServers && !includeAll && !allowServers.has(managed.def.name)) continue;
+      const client = managed.client;
+      for (const t of managed.rawTools) {
+        const meta = managed.status.tools.find((mt) => mt.name === t.name);
+        const toolName = meta?.registeredName ?? makeMcpToolName(managed.def.name, t.name);
+        const def = mcpToolToToolDefinition({
+          serverName: managed.def.name,
+          transport: managed.def.transport,
+          tool: t,
+          registeredName: toolName,
+          deferred: false,
+          invoke: (args, signal) => client.callTool(t.name, args, signal),
+        });
+        if (opts.readOnlyOnly && def.sideEffect !== "read") continue;
+        out.push(def);
+      }
+    }
+    return out;
   }
 
   async callTool(serverName: string, toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {

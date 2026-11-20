@@ -97,6 +97,7 @@ export interface McpServerStatus {
   state: McpConnectionState;
   trusted: boolean;
   disabled: boolean;
+  deferred?: boolean;
   error?: string;
   warning?: string;
   serverInfo?: { name?: string; version?: string };
@@ -130,4 +131,6 @@ export interface ToolRegistryLike {
   unregister(name: string): void;
   has(name: string): boolean;
   toolNames(): string[];
+  activateTool?(name: string): boolean;
+  isToolActive?(name: string): boolean;
 }

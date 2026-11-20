@@ -1,5 +1,16 @@
 import { createAgentSession, resolveSkillInvocation } from "@kern/coding-agent";
-import { CONNECTOR_PRESETS, ConnectManager, type McpServerConfigEntry, type McpTransportType } from "@kern/connects";
+import { CONNECTOR_PRESETS, ConnectManager, findConnectorPreset, type McpServerConfigEntry, type McpTransportType } from "@kern/connects";
+import {
+  SUBAGENT_FORMAT_GUIDE,
+  SUBAGENT_PRESETS,
+  SubagentManager,
+  findSubagentPreset,
+  parseSubagentFile,
+  type SubagentConfigEntry,
+  type SubagentFileFormat,
+  type SubagentIsolation,
+  type SubagentMode,
+} from "@kern/subagents";
 import { createLogger, type AskUserRequest } from "@kern/protocol";
 import {
   clearAuthKey,
@@ -37,6 +48,7 @@ export interface CliFlags {
   noResources: boolean;
   noCompaction: boolean;
   noMcp: boolean;
+  noAgents: boolean;
   resume: boolean;
   resumeSession?: string;
   listModels: boolean;
@@ -69,6 +81,7 @@ function parseArgs(argv: string[]): CliFlags {
     noResources: false,
     noCompaction: false,
     noMcp: false,
+    noAgents: false,
     resume: false,
     listModels: false,
     interactive: false,
@@ -84,6 +97,7 @@ function parseArgs(argv: string[]): CliFlags {
     else if (arg === "--no-resources") flags.noResources = true;
     else if (arg === "--no-compaction") flags.noCompaction = true;
     else if (arg === "--no-mcp") flags.noMcp = true;
+    else if (arg === "--no-agents") flags.noAgents = true;
     else if (arg === "--resume") flags.resume = true;
     else if (arg === "--session") {
       const next = argv[++i];
@@ -196,7 +210,7 @@ function buildBudgets(flags: CliFlags) {
 
 function printHelp(): void {
   process.stdout.write(
-    `kern v${KERN_VERSION} — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n  kern login [provider] [--base-url URL] [--model ID] [--api-key KEY] [--default] [--list]\n  kern logout [provider] [--all]\n  kern mcp <list|presets|add|remove|test|trust> [options]\n\nFlags:\n  --read-only                   Only allow read-only tools (read, grep, find, git-status/diff/log)\n  --max-cost N                  Cap session cost in USD\n  --max-input-tokens N          Cap input tokens for the session\n  --max-output-tokens N         Cap output tokens for the session\n  --max-total-tokens N          Cap total tokens for the session\n  --max-turns N                 Cap model turns per user run\n  --max-wall-time-ms N          Cap wall-clock duration (ms) per user run\n  --max-tool-calls-per-turn N   Cap tool calls in a single turn\n  --max-total-tool-calls N      Cap total tool calls in a user run\n  --cwd DIR                     Workspace root (default: cwd)\n  --no-resources                Skip AGENTS.md / skill discovery\n  --no-compaction               Disable automatic compaction\n  --no-mcp                      Disable automatic MCP connector discovery\n  --resume                      Resume the most recent session\n  --session ID|PATH             Resume a specific session by ID or JSONL file path\n  --interactive, -i             Start interactive TUI\n  --print                       Force single-prompt print mode (no TUI)\n  --json                        Emit NDJSON agent events in non-interactive mode (implies --print)\n  --list-models                 List available models (configured + live) and exit\n  --provider NAME               Provider from models.json (or KERN_PROVIDER)\n  --model ID                    Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL                Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY                 Override API key (or KERN_API_KEY)\n  --safety MODE                 Safety mode: strict, balanced, restricted, autonomous (default: balanced)\n  --rpc                         JSON-RPC mode (stdin/stdout)\n  --validate-config             Validate config files and exit\n  --config PATH                 Config file path (default: ~/.kern/models.json)\n  --version, -v                 Show version and exit\n  --help, -h                    This message\n\nAuth Commands:\n  kern login [provider]         Log in to an LLM provider (saves key to ~/.kern/auth.json)\n  kern login --list             Show saved & configured provider credentials\n  kern logout [provider|--all]  Remove saved provider credentials from ~/.kern/auth.json\n\nMCP Commands:\n  kern mcp list                 Discover & test configured MCP servers (~/.kern/mcp.json, .mcp.json)\n  kern mcp presets              List built-in connector presets\n  kern mcp add <name> <target>  Add remote HTTP/SSE URL or stdio command [args...]\n  kern mcp remove <name>        Remove server from user/project config\n  kern mcp test [name]          Connect & verify tools/resources/prompts\n  kern mcp trust <name>         Approve an untrusted project stdio server\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
+    `kern v${KERN_VERSION} — minimal coding agent kernel\n\nUsage:\n  kern [flags] [prompt]\n  kern login [provider] [--base-url URL] [--model ID] [--api-key KEY] [--default] [--list]\n  kern logout [provider] [--all]\n  kern mcp <list|presets|add|remove|test|trust> [options]\n  kern agents <list|presets|add|remove|enable|disable|trust> [options]\n\nFlags:\n  --read-only                   Only allow read-only tools (read, grep, find, git-status/diff/log)\n  --max-cost N                  Cap session cost in USD\n  --max-input-tokens N          Cap input tokens for the session\n  --max-output-tokens N         Cap output tokens for the session\n  --max-total-tokens N          Cap total tokens for the session\n  --max-turns N                 Cap model turns per user run\n  --max-wall-time-ms N          Cap wall-clock duration (ms) per user run\n  --max-tool-calls-per-turn N   Cap tool calls in a single turn\n  --max-total-tool-calls N      Cap total tool calls in a user run\n  --cwd DIR                     Workspace root (default: cwd)\n  --no-resources                Skip AGENTS.md / skill discovery\n  --no-compaction               Disable automatic compaction\n  --no-mcp                      Disable automatic MCP connector discovery\n  --no-agents                   Disable specialist subagent & A2A discovery\n  --resume                      Resume the most recent session\n  --session ID|PATH             Resume a specific session by ID or JSONL file path\n  --interactive, -i             Start interactive TUI\n  --print                       Force single-prompt print mode (no TUI)\n  --json                        Emit NDJSON agent events in non-interactive mode (implies --print)\n  --list-models                 List available models (configured + live) and exit\n  --provider NAME               Provider from models.json (or KERN_PROVIDER)\n  --model ID                    Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL                Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY                 Override API key (or KERN_API_KEY)\n  --safety MODE                 Safety mode: strict, balanced, restricted, autonomous (default: balanced)\n  --rpc                         JSON-RPC mode (stdin/stdout)\n  --validate-config             Validate config files and exit\n  --config PATH                 Config file path (default: ~/.kern/models.json)\n  --version, -v                 Show version and exit\n  --help, -h                    This message\n\nAuth Commands:\n  kern login [provider]         Log in to an LLM provider (saves key to ~/.kern/auth.json)\n  kern login --list             Show saved & configured provider credentials\n  kern logout [provider|--all]  Remove saved provider credentials from ~/.kern/auth.json\n\nMCP Commands:\n  kern mcp list                 Discover & test configured MCP servers (~/.kern/mcp.json, .mcp.json)\n  kern mcp presets              List built-in connector presets\n  kern mcp add <name> <target>  Add remote HTTP/SSE URL or stdio command [args...]\n  kern mcp remove <name>        Remove server from user/project config\n  kern mcp test [name]          Connect & verify tools/resources/prompts\n  kern mcp trust <name>         Approve an untrusted project stdio server\n\nSubagent & A2A Commands:\n  kern agents list              Discover configured specialists & remote A2A agents\n  kern agents presets           List opt-in specialist templates (none active by default)\n  kern agents add <name>        Add a local specialist or remote A2A agent (--preset, --a2a, --mode...)\n  kern agents remove <name>     Remove specialist from user/project config\n  kern agents enable|disable    Enable or disable a specialist without deleting config\n  kern agents trust <name>      Approve an untrusted project specialist (.kern/agents)\n\nBehavior:\n  On a TTY, Kern starts the TUI by default. Use --print for non-interactive output.\n  If a prompt is provided with the TUI, it is sent as the first message.\n`,
   );
 }
 
@@ -502,7 +516,7 @@ function parseKeyValuePair(raw: string): [string, string] {
 
 function printMcpHelp(): void {
   process.stdout.write(
-    `kern mcp — manage MCP servers & external tool connectors\n\nUsage:\n  kern mcp list [--cwd DIR]\n  kern mcp presets\n  kern mcp add <name> <url-or-command> [args...] [--project] [--transport stdio|http|sse] [--env KEY=VAL] [--header KEY=VAL] [--cwd DIR]\n  kern mcp remove <name> [--user|--project] [--cwd DIR]\n  kern mcp test [name] [--cwd DIR]\n  kern mcp trust <name> [--cwd DIR]\n`,
+    `kern mcp — manage MCP servers & external tool connectors\n\nUsage:\n  kern mcp list [--cwd DIR]\n  kern mcp presets\n  kern mcp add <name> <url-or-command> [args...] [--project] [--transport stdio|http|sse] [--deferred] [--env KEY=VAL] [--header KEY=VAL] [--cwd DIR]\n  kern mcp add --preset <id> [name] [--project] [--deferred] [--env KEY=VAL] [--header KEY=VAL] [--cwd DIR]\n  kern mcp remove <name> [--user|--project] [--cwd DIR]\n  kern mcp enable <name> [--cwd DIR]\n  kern mcp disable <name> [--cwd DIR]\n  kern mcp test [name] [--cwd DIR]\n  kern mcp trust <name> [--cwd DIR]\n`,
   );
 }
 
@@ -548,10 +562,15 @@ async function runMcpCli(argv: string[], logger: ReturnType<typeof createLogger>
         process.stdout.write("No MCP servers configured. Use `kern mcp add <name> <url-or-cmd>` or `kern mcp presets`.\n");
         return;
       }
+      let hasFailure = false;
       for (const s of filtered) {
+        if (sub === "test" && (s.state === "error" || s.state === "untrusted")) {
+          hasFailure = true;
+        }
+        const deferredTag = s.deferred ? " [deferred]" : "";
         const badge =
           s.state === "connected"
-            ? `${s.tools.length} tool(s)`
+            ? `${s.tools.length} tool(s)${deferredTag}`
             : s.state === "error"
               ? `error: ${s.error ?? "failed"}`
               : s.state;
@@ -569,12 +588,17 @@ async function runMcpCli(argv: string[], logger: ReturnType<typeof createLogger>
           process.stdout.write(`  warning: ${s.warning}\n`);
         }
       }
+      if (hasFailure) {
+        process.exitCode = 1;
+      }
       return;
     }
 
     if (sub === "add") {
       let scope: "user" | "project" = "user";
       let transport: McpTransportType | undefined;
+      let presetId: string | undefined;
+      let deferred = false;
       const env: Record<string, string> = {};
       const headers: Record<string, string> = {};
       const pos: string[] = [];
@@ -583,7 +607,12 @@ async function runMcpCli(argv: string[], logger: ReturnType<typeof createLogger>
         const a = rest[i]!;
         if (a === "--project") scope = "project";
         else if (a === "--user") scope = "user";
-        else if (a === "--transport") {
+        else if (a === "--deferred") deferred = true;
+        else if (a === "--preset") {
+          const next = rest[++i];
+          if (!next) throw new Error("--preset requires a preset id (see `kern mcp presets`)");
+          presetId = next;
+        } else if (a === "--transport") {
           const next = rest[++i];
           if (next !== "stdio" && next !== "http" && next !== "sse") {
             throw new Error("--transport must be stdio, http, or sse");
@@ -604,33 +633,75 @@ async function runMcpCli(argv: string[], logger: ReturnType<typeof createLogger>
         }
       }
 
-      const name = pos[0];
-      const target = pos[1];
-      if (!name || !target) {
-        throw new Error("Usage: kern mcp add <name> <url-or-command> [args...] [--project] [--transport stdio|http|sse] [--env KEY=VAL] [--header KEY=VAL]");
+      let name: string;
+      let entry: McpServerConfigEntry;
+      if (presetId) {
+        const preset = findConnectorPreset(presetId);
+        if (!preset) {
+          throw new Error(`Unknown MCP preset "${presetId}". Run \`kern mcp presets\` to list available presets.`);
+        }
+        name = pos[0] || preset.id;
+        entry = {
+          ...preset.entry,
+          ...(preset.entry.args ? { args: [...preset.entry.args] } : {}),
+          ...(preset.entry.env ? { env: { ...preset.entry.env, ...env } } : Object.keys(env).length > 0 ? { env } : {}),
+          ...(preset.entry.headers
+            ? { headers: { ...preset.entry.headers, ...headers } }
+            : Object.keys(headers).length > 0
+              ? { headers }
+              : {}),
+          ...(deferred ? { deferred: true } : {}),
+        };
+      } else {
+        name = pos[0] ?? "";
+        const target = pos[1];
+        if (!name || !target) {
+          throw new Error(
+            "Usage: kern mcp add <name> <url-or-command> [args...] [--project] [--transport stdio|http|sse] [--deferred] [--env KEY=VAL] [--header KEY=VAL]",
+          );
+        }
+        const args = pos.slice(2);
+        const isRemote = /^https?:\/\//i.test(target) || transport === "http" || transport === "sse";
+        entry = isRemote
+          ? {
+              transport: transport ?? (/\/sse(?:[/?#]|$)/i.test(target) ? "sse" : "http"),
+              url: target,
+              ...(Object.keys(headers).length > 0 ? { headers } : {}),
+              ...(deferred ? { deferred: true } : {}),
+            }
+          : {
+              transport: "stdio",
+              command: target,
+              ...(args.length > 0 ? { args } : {}),
+              ...(Object.keys(env).length > 0 ? { env } : {}),
+              ...(deferred ? { deferred: true } : {}),
+            };
       }
-      const args = pos.slice(2);
-      const isRemote = /^https?:\/\//i.test(target) || transport === "http" || transport === "sse";
-      const entry: McpServerConfigEntry = isRemote
-        ? {
-            transport: transport ?? (/\/sse(?:[/?#]|$)/i.test(target) ? "sse" : "http"),
-            url: target,
-            ...(Object.keys(headers).length > 0 ? { headers } : {}),
-          }
-        : {
-            transport: "stdio",
-            command: target,
-            ...(args.length > 0 ? { args } : {}),
-            ...(Object.keys(env).length > 0 ? { env } : {}),
-          };
 
       const status = await mgr.addServer(name, entry, { scope });
       process.stdout.write(
-        `${status.name} (${status.transport}, ${scope}): ${status.state} — ${status.tools.length} tool(s)\n`,
+        `${status.name} (${status.transport}, ${scope}): ${status.state} — ${status.tools.length} tool(s)${status.deferred ? " [deferred]" : ""}\n`,
       );
-      if (status.error) process.stderr.write(`[mcp error] ${status.error}\n`);
+      if (status.warning) process.stderr.write(`[mcp notice] ${status.warning}\n`);
+      if (status.error) {
+        process.stderr.write(`[mcp error] ${status.error}\n`);
+        process.exitCode = 1;
+      }
       if (status.tools.length > 0) {
         process.stdout.write(`Tools: ${status.tools.map((t) => t.registeredName).join(", ")}\n`);
+      }
+      return;
+    }
+
+    if (sub === "enable" || sub === "disable") {
+      const name = rest[0];
+      if (!name) throw new Error(`Usage: kern mcp ${sub} <name>`);
+      await mgr.discoverAndConnect();
+      const status = await mgr.toggleServer(name, sub === "disable");
+      process.stdout.write(`${status.name}: ${status.state} (${status.tools.length} tool(s))\n`);
+      if (status.error) {
+        process.stderr.write(`[mcp error] ${status.error}\n`);
+        process.exitCode = 1;
       }
       return;
     }
@@ -657,11 +728,275 @@ async function runMcpCli(argv: string[], logger: ReturnType<typeof createLogger>
       await mgr.discoverAndConnect();
       const status = await mgr.trustServer(name);
       process.stdout.write(`Trusted "${name}": ${status.state} (${status.tools.length} tool(s))\n`);
-      if (status.error) process.stderr.write(`[mcp error] ${status.error}\n`);
+      if (status.error) {
+        process.stderr.write(`[mcp error] ${status.error}\n`);
+        process.exitCode = 1;
+      }
       return;
     }
 
     throw new Error(`Unknown mcp subcommand: ${sub}. Run \`kern mcp --help\` for usage.`);
+  } finally {
+    await mgr.dispose();
+  }
+}
+
+function printAgentsHelp(): void {
+  process.stdout.write(
+    `kern agents — manage opt-in team specialists & remote A2A agents\n\nUsage:\n  kern agents list [--cwd DIR]\n  kern agents presets\n  kern agents format\n  kern agents init <name> [--preset <id>] [--format md|yaml|json] [--project|--user] [--cwd DIR]\n  kern agents add <name> [options]\n  kern agents add --preset <id> [name] [--project] [--model provider/id] [--cwd DIR]\n  kern agents remove <name> [--user|--project] [--cwd DIR]\n  kern agents enable <name> [--cwd DIR]\n  kern agents disable <name> [--cwd DIR]\n  kern agents trust <name> [--cwd DIR]\n\nAdd / Init Options:\n  --preset <id>                  Use built-in template (explorer, reviewer, coder, researcher)\n  --format md|yaml|json          File format when saving (default: md)\n  --project                      Save to .kern/agents/ in current workspace (auto-trusted)\n  --user                         Save to ~/.kern/agents/ (default)\n  --mode readonly|write          Specialist tool capability mode (default: readonly)\n  --isolation readonly|exclusive|worktree  Workspace isolation policy\n  --model <provider/id>          Pin specialist model (falls back to parent unless --strict-model)\n  --strict-model                 Fail instead of falling back to parent model\n  --tools <t1,t2,...>            Restrict built-in tools (or shorthand: readonly|coding|research)\n  --mcp <s1,s2,...>              Allowlist parent MCP server names to share with specialist\n  --a2a <url>                    Register a remote A2A agent endpoint URL\n  --header KEY=VAL               HTTP header for remote A2A calls (supports \${ENV_VAR})\n  --description TEXT             Routing summary visible to root orchestrator\n  --instruction TEXT             Specialist system instruction\n  --max-turns N                  Cap specialist turns per delegation\n  --max-cost N                   Cap specialist USD cost per delegation\n  --allow-delegation             Allow specialist to sub-delegate (depth <= 2)\n`,
+  );
+}
+
+async function runAgentsCli(argv: string[], logger: ReturnType<typeof createLogger>): Promise<void> {
+  const sub = (argv[0] ?? "list").toLowerCase();
+  if (sub === "--help" || sub === "-h" || sub === "help") {
+    printAgentsHelp();
+    return;
+  }
+
+  if (sub === "format" || sub === "formats" || sub === "guide") {
+    process.stdout.write(`${SUBAGENT_FORMAT_GUIDE}\n`);
+    return;
+  }
+
+  if (sub === "presets") {
+    for (const p of SUBAGENT_PRESETS) {
+      const mode = p.entry.mode ?? "readonly";
+      const iso = p.entry.isolation ?? "readonly";
+      process.stdout.write(`${p.id.padEnd(14)} ${mode.padEnd(9)} ${iso.padEnd(10)} ${p.name} — ${p.description}\n`);
+    }
+    return;
+  }
+
+  let cwd = process.cwd();
+  const rest: string[] = [];
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--cwd") {
+      const next = argv[++i];
+      if (!next) throw new Error("--cwd requires a directory");
+      cwd = next;
+    } else {
+      rest.push(a);
+    }
+  }
+
+  const mgr = new SubagentManager({ cwd, logger });
+  try {
+    if (sub === "list" || sub === "ls" || sub === "status") {
+      const { agents, warnings } = await mgr.discover();
+      for (const w of warnings) process.stderr.write(`[agents notice] ${w}\n`);
+      if (agents.length === 0) {
+        process.stdout.write(
+          "No subagents or A2A agents configured (core loop runs solo with zero delegation overhead).\n" +
+            "Use `kern agents presets` or `kern agents add --preset explorer` to add opt-in specialists.\n",
+        );
+        return;
+      }
+      for (const a of agents) {
+        const cap = a.type === "a2a" ? `a2a(${a.url ?? ""})` : `${a.mode}/${a.isolation}`;
+        const modelTag = a.model ? ` model=${a.model}` : "";
+        process.stdout.write(`${a.name}\t${a.type}\t${a.origin}\t${a.state}\t${cap}${modelTag}\t${a.description}\n`);
+        if (a.skills?.length) {
+          process.stdout.write(`  skills: ${a.skills.map((sk) => sk.name).join(", ")}\n`);
+        }
+        if (a.warning) {
+          process.stdout.write(`  warning: ${a.warning}\n`);
+        }
+      }
+      return;
+    }
+
+    if (sub === "add" || sub === "init" || sub === "new") {
+      const isInit = sub === "init" || sub === "new";
+      let scope: "user" | "project" = isInit ? "project" : "user";
+      let format: SubagentFileFormat | undefined = isInit ? "md" : undefined;
+      let presetId: string | undefined;
+      let mode: SubagentMode | undefined;
+      let isolation: SubagentIsolation | undefined;
+      let model: string | undefined;
+      let strictModel = false;
+      let tools: string[] | undefined;
+      let mcpServers: string[] | undefined;
+      let a2aUrl: string | undefined;
+      let description: string | undefined;
+      let instruction: string | undefined;
+      let maxTurns: number | undefined;
+      let maxCost: number | undefined;
+      let allowDelegation = false;
+      const headers: Record<string, string> = {};
+      const pos: string[] = [];
+
+      for (let i = 0; i < rest.length; i++) {
+        const a = rest[i]!;
+        if (a === "--project") scope = "project";
+        else if (a === "--user") scope = "user";
+        else if (a === "--strict-model") strictModel = true;
+        else if (a === "--allow-delegation") allowDelegation = true;
+        else if (a === "--format") {
+          const next = rest[++i]?.toLowerCase();
+          if (next !== "md" && next !== "yaml" && next !== "json") {
+            throw new Error("--format must be md, yaml, or json");
+          }
+          format = next;
+        } else if (a === "--preset") {
+          const next = rest[++i];
+          if (!next) throw new Error("--preset requires a preset id (see `kern agents presets`)");
+          presetId = next;
+        } else if (a === "--mode") {
+          const next = rest[++i];
+          if (next !== "readonly" && next !== "write") throw new Error("--mode must be readonly or write");
+          mode = next;
+        } else if (a === "--isolation") {
+          const next = rest[++i];
+          if (next !== "readonly" && next !== "exclusive" && next !== "worktree") {
+            throw new Error("--isolation must be readonly, exclusive, or worktree");
+          }
+          isolation = next;
+        } else if (a === "--model") {
+          const next = rest[++i];
+          if (!next) throw new Error("--model requires provider/id or id");
+          model = next;
+        } else if (a === "--tools") {
+          const next = rest[++i];
+          if (!next) throw new Error("--tools requires comma-separated tool names");
+          tools = next.split(",").map((s) => s.trim()).filter(Boolean);
+        } else if (a === "--mcp") {
+          const next = rest[++i];
+          if (!next) throw new Error("--mcp requires comma-separated MCP server names");
+          mcpServers = next.split(",").map((s) => s.trim()).filter(Boolean);
+        } else if (a === "--a2a" || a === "--url") {
+          const next = rest[++i];
+          if (!next) throw new Error(`${a} requires an http(s) URL`);
+          a2aUrl = next;
+        } else if (a === "--header") {
+          const next = rest[++i];
+          if (!next) throw new Error("--header requires KEY=VALUE");
+          const [k, v] = parseKeyValuePair(next);
+          headers[k] = v;
+        } else if (a === "--description") {
+          const next = rest[++i];
+          if (!next) throw new Error("--description requires text");
+          description = next;
+        } else if (a === "--instruction") {
+          const next = rest[++i];
+          if (!next) throw new Error("--instruction requires text");
+          instruction = next;
+        } else if (a === "--max-turns") {
+          const res = parsePositiveInt(rest, i, "--max-turns");
+          maxTurns = res.value;
+          i = res.nextIndex;
+        } else if (a === "--max-cost") {
+          const next = rest[++i];
+          const n = next !== undefined ? Number(next) : NaN;
+          if (!Number.isFinite(n) || n <= 0) throw new Error("--max-cost requires a positive number");
+          maxCost = n;
+        } else if (a.startsWith("--")) {
+          throw new Error(`Unknown agents add flag: ${a}`);
+        } else {
+          pos.push(a);
+        }
+      }
+
+      let entry: SubagentConfigEntry;
+      if (presetId) {
+        const preset = findSubagentPreset(presetId);
+        if (!preset) {
+          throw new Error(`Unknown subagent preset "${presetId}". Run \`kern agents presets\` to list available presets.`);
+        }
+        entry = {
+          ...preset.entry,
+          ...(pos[0] ? { name: pos[0] } : {}),
+          ...(mode ? { mode } : {}),
+          ...(isolation ? { isolation } : {}),
+          ...(model ? { model } : {}),
+          ...(strictModel ? { strictModel: true } : {}),
+          ...(tools ? { tools } : {}),
+          ...(mcpServers ? { mcpServers } : {}),
+          ...(description ? { description } : {}),
+          ...(instruction ? { instruction } : {}),
+          ...(maxTurns !== undefined ? { maxTurns } : {}),
+          ...(maxCost !== undefined ? { maxCost } : {}),
+          ...(allowDelegation ? { allowDelegation: true } : {}),
+        };
+      } else {
+        const name = pos[0] ?? "";
+        if (!name) {
+          throw new Error("Usage: kern agents add <name> [--a2a URL | --description TEXT] [--mode readonly|write]");
+        }
+        if (a2aUrl) {
+          entry = {
+            name,
+            type: "a2a",
+            url: a2aUrl,
+            description: description || `Remote A2A agent at ${a2aUrl}`,
+            ...(Object.keys(headers).length > 0 ? { headers } : {}),
+          };
+        } else {
+          entry = {
+            name,
+            type: "local",
+            description: description || `${name} specialist agent`,
+            ...(instruction ? { instruction } : {}),
+            ...(mode ? { mode } : {}),
+            ...(isolation ? { isolation } : {}),
+            ...(model ? { model } : {}),
+            ...(strictModel ? { strictModel: true } : {}),
+            ...(tools ? { tools } : {}),
+            ...(mcpServers ? { mcpServers } : {}),
+            ...(maxTurns !== undefined ? { maxTurns } : {}),
+            ...(maxCost !== undefined ? { maxCost } : {}),
+            ...(allowDelegation ? { allowDelegation: true } : {}),
+          };
+        }
+      }
+
+      const status = await mgr.addSubagent(entry, { scope, format, templateComments: isInit });
+      process.stdout.write(
+        `${status.name} (${status.type}, ${scope}): ${status.state}${status.sourcePath ? ` -> ${status.sourcePath}` : ""}\n`,
+      );
+      if (isInit && status.sourcePath) {
+        process.stdout.write(`Edit ${status.sourcePath} to customize prompt, tools, or model, then run \`kern agents list\` or \`/agents reload\`.\n`);
+      }
+      if (status.warning) process.stderr.write(`[agents notice] ${status.warning}\n`);
+      return;
+    }
+
+    if (sub === "enable" || sub === "disable") {
+      const name = rest[0];
+      if (!name) throw new Error(`Usage: kern agents ${sub} <name>`);
+      await mgr.discover();
+      const status = await mgr.toggleSubagent(name, sub === "disable");
+      process.stdout.write(`${status.name}: ${status.state}\n`);
+      return;
+    }
+
+    if (sub === "remove" || sub === "rm") {
+      let scope: "user" | "project" | "both" = "both";
+      const pos: string[] = [];
+      for (const a of rest) {
+        if (a === "--user") scope = "user";
+        else if (a === "--project") scope = "project";
+        else pos.push(a);
+      }
+      const name = pos[0];
+      if (!name) throw new Error("Usage: kern agents remove <name> [--user|--project]");
+      await mgr.discover();
+      const removed = await mgr.removeSubagent(name, { scope });
+      process.stdout.write(removed ? `Removed subagent "${name}".\n` : `Subagent "${name}" was not configured.\n`);
+      return;
+    }
+
+    if (sub === "trust") {
+      const name = rest[0];
+      if (!name) throw new Error("Usage: kern agents trust <name>");
+      await mgr.discover();
+      const status = await mgr.trustSubagent(name);
+      process.stdout.write(`Trusted "${name}": ${status.state}\n`);
+      return;
+    }
+
+    throw new Error(`Unknown agents subcommand: ${sub}. Run \`kern agents --help\` for usage.`);
   } finally {
     await mgr.dispose();
   }
@@ -817,6 +1152,7 @@ async function runRpcMode(
     loadResources: !flags.noResources,
     enableCompaction: !flags.noCompaction,
     enableConnects: !flags.noMcp,
+    enableSubagents: !flags.noAgents,
     resume: flags.resume,
     ...(flags.resumeSession ? { resumeSession: flags.resumeSession } : {}),
     policy: flags.readOnly ? { allowlistTools: READ_ONLY_TOOLS } : undefined,
@@ -841,6 +1177,7 @@ async function runRpcMode(
   const shutdownRpc = async () => {
     if (closed) return;
     closed = true;
+    await session.subagents?.dispose().catch(() => {});
     await session.connects?.dispose().catch(() => {});
     session.dispose();
     resolveDone?.();
@@ -955,6 +1292,73 @@ async function runRpcMode(
           if (!name) throw new Error("name is required");
           const server = await session.connects.trustServer(name);
           result = { server, tools: session.toolNames() };
+          break;
+        }
+        case "agents_list": {
+          result = {
+            agents: session.subagents?.listStatuses() ?? [],
+            backgroundJobs: session.subagents?.listBackgroundJobs() ?? [],
+            warnings: session.subagents?.getWarnings() ?? [],
+            presets: SUBAGENT_PRESETS,
+            formatGuide: SUBAGENT_FORMAT_GUIDE,
+          };
+          break;
+        }
+        case "agents_add": {
+          if (!session.subagents) throw new Error("Subagent manager unavailable");
+          const scope = (params.scope === "project" || params.scope === "memory" ? params.scope : "user") as "user" | "project" | "memory";
+          const format =
+            params.format === "yaml" || params.format === "json" || params.format === "md"
+              ? (params.format as SubagentFileFormat)
+              : undefined;
+          let entry = params.entry as SubagentConfigEntry | undefined;
+          if (typeof params.rawContent === "string" && params.rawContent.trim()) {
+            const parsed = parseSubagentFile(
+              params.rawContent,
+              format ? `.${format}` : "",
+              typeof params.name === "string" ? params.name.trim() : "custom-agent",
+            );
+            if (!parsed) {
+              throw new Error("Could not parse subagent definition (expected name & description in .md, .yaml, or .json format)");
+            }
+            entry = parsed;
+          }
+          if (!entry || typeof entry !== "object" || !entry.name) {
+            throw new Error("entry with name (or rawContent) is required");
+          }
+          const agent = await session.subagents.addSubagent(entry, { scope, ...(format ? { format } : {}) });
+          result = { ok: true, agent, tools: session.toolNames() };
+          break;
+        }
+        case "agents_remove": {
+          if (!session.subagents) throw new Error("Subagent manager unavailable");
+          const name = typeof params.name === "string" ? params.name.trim() : "";
+          if (!name) throw new Error("name is required");
+          const scope = (params.scope === "user" || params.scope === "project" ? params.scope : "both") as "user" | "project" | "both";
+          const removed = await session.subagents.removeSubagent(name, { scope });
+          result = { removed, tools: session.toolNames() };
+          break;
+        }
+        case "agents_toggle": {
+          if (!session.subagents) throw new Error("Subagent manager unavailable");
+          const name = typeof params.name === "string" ? params.name.trim() : "";
+          if (!name) throw new Error("name is required");
+          const agent = await session.subagents.toggleSubagent(name, Boolean(params.disabled));
+          result = { agent, tools: session.toolNames() };
+          break;
+        }
+        case "agents_trust": {
+          if (!session.subagents) throw new Error("Subagent manager unavailable");
+          const name = typeof params.name === "string" ? params.name.trim() : "";
+          if (!name) throw new Error("name is required");
+          const agent = await session.subagents.trustSubagent(name);
+          result = { agent, tools: session.toolNames() };
+          break;
+        }
+        case "agents_reload": {
+          if (!session.subagents) throw new Error("Subagent manager unavailable");
+          const res = await session.subagents.discover();
+          result = { ...res, tools: session.toolNames() };
           break;
         }
         case "auth_status": {
@@ -1073,6 +1477,10 @@ export async function main() {
     await runMcpCli(process.argv.slice(3), logger);
     return;
   }
+  if (process.argv[2] === "agents") {
+    await runAgentsCli(process.argv.slice(3), logger);
+    return;
+  }
   const flags = parseArgs(process.argv.slice(2));
   const provider = flags.provider ?? process.env["KERN_PROVIDER"];
   let model = flags.model ?? process.env["KERN_MODEL"];
@@ -1127,6 +1535,7 @@ export async function main() {
     loadResources: !flags.noResources,
     enableCompaction: !flags.noCompaction,
     enableConnects: !flags.noMcp,
+    enableSubagents: !flags.noAgents,
     resume: flags.resume,
     ...(flags.resumeSession ? { resumeSession: flags.resumeSession } : {}),
     policy: flags.readOnly ? { allowlistTools: READ_ONLY_TOOLS } : undefined,
@@ -1148,6 +1557,16 @@ export async function main() {
         process.stderr.write(`[mcp ${s.name}: ${s.tools.length} tool(s)]\n`);
       } else if (s.state === "untrusted" || s.state === "error") {
         process.stderr.write(`[mcp ${s.name}: ${s.state}${s.error ? ` (${s.error})` : s.warning ? ` (${s.warning})` : ""}]\n`);
+      }
+    }
+  }
+  if (!flags.noAgents && !flags.json && session.subagents) {
+    const agents = session.subagents.listStatuses();
+    for (const a of agents) {
+      if (a.state === "ready") {
+        process.stderr.write(`[agent ${a.name}: ${a.type === "a2a" ? "a2a" : a.mode}]\n`);
+      } else if (a.state === "untrusted" || a.state === "error") {
+        process.stderr.write(`[agent ${a.name}: ${a.state}${a.warning ? ` (${a.warning})` : ""}]\n`);
       }
     }
   }
@@ -1231,6 +1650,7 @@ export async function main() {
   try {
     await session.prompt(prompt);
   } finally {
+    await session.subagents?.dispose().catch(() => {});
     await session.connects?.dispose().catch(() => {});
     session.dispose();
   }

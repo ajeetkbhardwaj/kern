@@ -1,0 +1,19 @@
+{
+  "name": "@kern/subagents",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Opt-in orchestrator-specialist subagent and A2A team delegation for Kern.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@kern/protocol": "*",
+    "@kern/tools": "*",
+    "@kern/session-store": "*",
+    "@kern/agent-core": "*",
+    "@kern/model": "*",
+    "@kern/connects": "*"
+  }
+}
