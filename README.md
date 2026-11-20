@@ -59,9 +59,8 @@ The design goal is to keep behavior understandable and recoverable: durable stat
   - OpenAI-compatible endpoints (cloud/local)
   - Model discovery/config/auth helpers
   - In-TUI model/provider flows (`/model`, `/connect`, `/keys`)
-- **Extensible monorepo architecture**
+- **Minimal monorepo architecture**
   - Separate packages for protocol, session store, tools, agent core, model layer, coding-agent facade, CLI, and TUI
-  - Additional repo-aware packages for indexing/symbols/semantic search/project memory
 
 ## Architecture
 
@@ -85,7 +84,7 @@ flowchart TB
       STORE["@kern/session-store\nSessionManager + JSONL tree"]
       TOOLS["@kern/tools\nToolRegistry + policy + built-ins"]
       MODEL["@kern/model\nOpenAI-compatible adapter + discovery/auth"]
-      RES["Resources & repo context\nAGENTS.md/skills, repo-index,\nsymbol-store, semantic-search,\nproject-memory (best-effort)"]
+      RES["Resources\nAGENTS.md and skills catalog"]
     end
 
     subgraph External["External systems"]
@@ -160,7 +159,6 @@ sequenceDiagram
 - **`@kern/coding-agent`**: session composition/facade (`createAgentSession`, runtime/session operations exposed to UIs)
 - **`@kern/cli`**: CLI entrypoint, argument parsing, print mode, TUI bootstrap
 - **`@kern/tui`**: interactive terminal UI (layout, rendering, commands, dialogs, approvals, session UX)
-- **Repo-aware packages**: `@kern/repo-index`, `@kern/symbol-store`, `@kern/semantic-search`, `@kern/project-memory` (best-effort context/retrieval support)
 
 > Design principle: runtime/core logic stays UI-agnostic; presentations (CLI/TUI) observe events and act through the session API.
 
@@ -173,12 +171,8 @@ sequenceDiagram
 │   ├── cli/                # CLI entrypoint and mode selection
 │   ├── coding-agent/       # Session facade/composition
 │   ├── model/              # Model adapter, discovery, auth/config helpers
-│   ├── project-memory/     # Project memory utilities (best-effort)
 │   ├── protocol/           # Shared types/contracts/schemas
-│   ├── repo-index/         # Workspace/repo indexing
-│   ├── semantic-search/    # Retrieval/ranking helpers
 │   ├── session-store/      # JSONL session persistence/tree
-│   ├── symbol-store/       # Symbol extraction/lookup
 │   ├── tools/              # Tool registry, policy, built-in tools
 │   └── tui/                # Interactive terminal UI
 ├── docs/                   # Additional docs/specs (project-specific)

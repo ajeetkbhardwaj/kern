@@ -17,12 +17,20 @@ export type PolicyDecision =
   | { decision: "deny"; reason: string }
   | { decision: "require_approval"; prompt: string };
 
+export interface AskUserRequest {
+  question: string;
+  options?: string[];
+  allowCustom?: boolean;
+}
+
 export interface ToolContext {
   cwd: string;
   workspaceRoot: string;
   signal: AbortSignal;
   /** Approval request sink. Absent in fully headless/read-only deployments. */
   requestApproval?: (prompt: string, meta?: { toolName: string; origin: string }) => Promise<boolean | "session">;
+  /** Interactive user-question sink for ask-user tool. Absent in headless deployments. */
+  askUser?: (request: AskUserRequest) => Promise<string | null>;
   emitProgress: (delta: string) => void;
 }
 

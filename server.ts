@@ -1,19 +1,37 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { createAgentSession, type AgentSession } from "./packages/coding-agent/src/index.js";
+import { createAgentSession, CONNECTOR_PRESETS, type AgentSession, type McpServerConfigEntry } from "./packages/coding-agent/src/index.js";
 import type { SessionManager } from "./packages/session-store/src/index.js";
 import { createLogger, type AgentEvent, type ThinkingLevel } from "./packages/protocol/src/index.js";
 import {
   PROVIDER_PRESETS,
+  clearAuthKey,
+  createAdapterFor,
   createModelRuntime,
   createOpenAIAdapter,
   discoverModels,
+  loadAuth,
   loadModelsFile,
+  maskKey,
   resolveFallbackAdapters,
+  saveAuthKey,
+  saveProviderToUserFile,
   type ModelsFile,
+  type ProviderConfig,
 } from "./packages/model/src/index.js";
 
-const PORT = Number(process.env["PORT"] ?? 3000);
+function resolveListenPort(): number {
+  const explicit = process.env["KERN_PORT"];
+  if (explicit) return Number(explicit);
+  const envPort = process.env["PORT"];
+  const nginxPort = process.env["NGINX_PORT"];
+  if (envPort && nginxPort && envPort === nginxPort) {
+    return Number(process.env["DEFAULT_APP_PORT"] ?? 3000);
+  }
+  return Number(envPort ?? process.env["DEFAULT_APP_PORT"] ?? 3000);
+}
+
+const PORT = resolveListenPort();
 const HOST = "0.0.0.0";
 const WORKSPACE_CWD = process.cwd();
 const logger = createLogger(process.env["KERN_LOG"] === "debug" ? "debug" : "warn");
@@ -88,7 +106,14 @@ function attachSessionEvents(session: AgentSession): void {
 }
 
 async function initSession(): Promise<void> {
-  cachedModelsFile = await loadModelsFile(WORKSPACE_CWD);
+  try {
+    cachedModelsFile = await loadModelsFile(WORKSPACE_CWD);
+  } catch (err) {
+    logger.warn("models_file_load_failed", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    cachedModelsFile = {};
+  }
   const provider = process.env["KERN_PROVIDER"] || cachedModelsFile.defaultProvider;
   let model = process.env["KERN_MODEL"] || cachedModelsFile.defaultModel;
   const baseUrl = process.env["KERN_BASE_URL"];
@@ -161,6 +186,7 @@ function sessionSnapshot() {
     budgetLimits: activeSession.budgetLimits?.() ?? null,
     contextUsage: activeSession.contextUsage(),
     tools: activeSession.toolNames(),
+    connects: activeSession.connects?.listStatuses() ?? [],
     messages,
   };
 }
@@ -426,13 +452,54 @@ const INDEX_HTML = `<!doctype html>
       cursor: pointer;
     }
     .tool-chip:hover { color: var(--accent); border-color: var(--accent); }
+    .mcp-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .mcp-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+    }
+    .mcp-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin-bottom: 4px;
+    }
+    .mcp-dot {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      margin-right: 5px;
+      background: var(--muted);
+    }
+    .mcp-dot.connected { background: var(--ok); }
+    .mcp-dot.error { background: var(--err); }
+    .mcp-dot.untrusted { background: var(--warn); }
+    .mcp-actions {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+    .mcp-actions button {
+      font-size: 11px;
+      padding: 2px 6px;
+    }
     dialog {
       background: var(--panel);
       color: var(--text);
       border: 1px solid var(--border);
       border-radius: 10px;
       padding: 18px;
-      width: min(440px, 92vw);
+      width: min(460px, 92vw);
     }
     dialog::backdrop { background: rgba(0, 0, 0, 0.65); }
     .form-row {
@@ -454,7 +521,9 @@ const INDEX_HTML = `<!doctype html>
     </div>
     <div class="header-actions">
       <span class="badge" id="session-badge">session: <strong>…</strong></span>
-      <button id="btn-connect">Connect Model</button>
+      <button id="btn-mcp">+ MCP</button>
+      <button id="btn-login">Login</button>
+      <button id="btn-logout">Logout</button>
       <button id="btn-compact">Compact</button>
       <button id="btn-new-session">New Session</button>
     </div>
@@ -526,15 +595,24 @@ const INDEX_HTML = `<!doctype html>
       </div>
 
       <div class="panel-section">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+          <h3 style="margin:0;">Connectors (MCP)</h3>
+          <button type="button" id="btn-mcp-side" style="font-size:11px; padding:2px 7px;">+ Add</button>
+        </div>
+        <div class="mcp-list" id="mcp-list"></div>
+      </div>
+
+      <div class="panel-section">
         <h3>Tools (click to insert)</h3>
         <div class="tools-grid" id="tools-list"></div>
       </div>
     </aside>
   </main>
 
-  <dialog id="connect-dialog">
-    <h3 style="margin-top:0; font-family: var(--mono);">Connect OpenAI-Compatible Provider</h3>
-    <form method="dialog" id="connect-form">
+  <dialog id="login-dialog">
+    <h3 style="margin-top:0; font-family: var(--mono);">Provider Login</h3>
+    <div id="auth-saved-box" style="margin-bottom:12px;"></div>
+    <form method="dialog" id="login-form">
       <div class="form-row">
         <label>Preset</label>
         <select id="cfg-preset"></select>
@@ -552,12 +630,70 @@ const INDEX_HTML = `<!doctype html>
         <input id="cfg-model" required placeholder="gpt-4o-mini" />
       </div>
       <div class="form-row">
-        <label>API Key (optional for local loopback)</label>
+        <label>API Key (optional for local loopback; saved to ~/.kern/auth.json)</label>
         <input id="cfg-apikey" type="password" placeholder="sk-..." />
       </div>
       <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
-        <button type="button" id="btn-connect-cancel">Cancel</button>
-        <button type="submit" class="primary">Connect</button>
+        <button type="button" id="btn-login-cancel">Cancel</button>
+        <button type="submit" class="primary">Log In</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="mcp-dialog">
+    <h3 style="margin-top:0; font-family: var(--mono);">Connect MCP Server</h3>
+    <form method="dialog" id="mcp-form">
+      <div class="form-row">
+        <label>Preset</label>
+        <select id="mcp-preset"></select>
+      </div>
+      <div class="form-row">
+        <label>Server Name</label>
+        <input id="mcp-name" required placeholder="context7" />
+      </div>
+      <div class="form-row">
+        <label>Transport</label>
+        <select id="mcp-transport">
+          <option value="http">Streamable HTTP</option>
+          <option value="sse">Legacy HTTP + SSE</option>
+          <option value="stdio">Local Stdio Process</option>
+        </select>
+      </div>
+      <div id="mcp-remote-fields">
+        <div class="form-row">
+          <label>Server URL</label>
+          <input id="mcp-url" placeholder="https://mcp.context7.com/mcp" />
+        </div>
+        <div class="form-row">
+          <label>Authorization / Bearer Token (optional)</label>
+          <input id="mcp-auth" type="password" placeholder="Bearer ... or raw token" />
+        </div>
+      </div>
+      <div id="mcp-stdio-fields" style="display:none;">
+        <div class="form-row">
+          <label>Command</label>
+          <input id="mcp-command" placeholder="npx" />
+        </div>
+        <div class="form-row">
+          <label>Args (space-separated)</label>
+          <input id="mcp-args" placeholder="-y @modelcontextprotocol/server-memory" />
+        </div>
+        <div class="form-row">
+          <label>Env Vars (KEY=VAL per line, supports \${VAR})</label>
+          <textarea id="mcp-env" style="min-height:54px;" placeholder="GITHUB_PERSONAL_ACCESS_TOKEN=\${GITHUB_PERSONAL_ACCESS_TOKEN}"></textarea>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Config Scope</label>
+        <select id="mcp-scope">
+          <option value="user">User (~/.kern/mcp.json)</option>
+          <option value="project">Project (.mcp.json)</option>
+          <option value="memory">Session only (in-memory)</option>
+        </select>
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
+        <button type="button" id="btn-mcp-cancel">Cancel</button>
+        <button type="submit" class="primary">Connect Server</button>
       </div>
     </form>
   </dialog>
@@ -568,7 +704,7 @@ const INDEX_HTML = `<!doctype html>
     const promptInput = document.getElementById("prompt-input");
     const approvalBar = document.getElementById("approval-bar");
     const approvalText = document.getElementById("approval-text");
-    const connectDialog = document.getElementById("connect-dialog");
+    const loginDialog = document.getElementById("login-dialog");
 
     let activeApprovalId = null;
     let streamingEl = null;
@@ -627,6 +763,90 @@ const INDEX_HTML = `<!doctype html>
         ? snap.contextUsage.totalTokens + " / " + snap.model.contextWindow
         : "-";
 
+      const mcpListEl = document.getElementById("mcp-list");
+      mcpListEl.innerHTML = "";
+      const servers = snap.connects || [];
+      if (servers.length === 0) {
+        const empty = document.createElement("div");
+        empty.style.cssText = "color: var(--muted); font-family: var(--mono); font-size: 11.5px;";
+        empty.textContent = "No MCP servers configured.";
+        mcpListEl.appendChild(empty);
+      } else {
+        for (const s of servers) {
+          const card = document.createElement("div");
+          card.className = "mcp-card";
+          const head = document.createElement("div");
+          head.className = "mcp-card-head";
+          const title = document.createElement("span");
+          const dot = document.createElement("span");
+          dot.className = "mcp-dot " + s.state;
+          title.appendChild(dot);
+          const strong = document.createElement("strong");
+          strong.textContent = s.name;
+          title.appendChild(strong);
+          const badge = document.createElement("span");
+          badge.style.color = "var(--muted)";
+          badge.textContent = s.state === "connected" ? s.tools.length + " tools" : s.state;
+          head.appendChild(title);
+          head.appendChild(badge);
+          card.appendChild(head);
+
+          const meta = document.createElement("div");
+          meta.style.cssText = "color: var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
+          meta.textContent = s.transport + " (" + s.origin + ") · " + (s.error || s.warning || s.target);
+          card.appendChild(meta);
+
+          const actions = document.createElement("div");
+          actions.className = "mcp-actions";
+          const mkBtn = (label, onClick, danger = false) => {
+            const b = document.createElement("button");
+            b.type = "button";
+            if (danger) b.className = "danger";
+            b.textContent = label;
+            b.onclick = onClick;
+            actions.appendChild(b);
+          };
+          mkBtn("Reconnect", async () => {
+            const r = await fetch("/api/connects/reconnect", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ name: s.name }),
+            });
+            const d = await r.json();
+            if (d.snapshot) renderSnapshot(d.snapshot);
+            addEntry("system", "mcp", "Reconnected " + s.name + ": " + (d.server?.state || "done"));
+          });
+          if (s.state === "untrusted") {
+            mkBtn("Trust", async () => {
+              const r = await fetch("/api/connects/trust", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ name: s.name }),
+              });
+              const d = await r.json();
+              if (d.snapshot) renderSnapshot(d.snapshot);
+            });
+          }
+          mkBtn(s.disabled ? "Enable" : "Disable", async () => {
+            const r = await fetch("/api/connects/toggle", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ name: s.name, disabled: !s.disabled }),
+            });
+            const d = await r.json();
+            if (d.snapshot) renderSnapshot(d.snapshot);
+          });
+          mkBtn("Remove", async () => {
+            const r = await fetch("/api/connects?name=" + encodeURIComponent(s.name), { method: "DELETE" });
+            const d = await r.json();
+            if (d.snapshot) renderSnapshot(d.snapshot);
+            addEntry("system", "mcp", "Removed " + s.name);
+          }, true);
+          card.appendChild(actions);
+          mcpListEl.appendChild(card);
+        }
+      }
+
       const toolsEl = document.getElementById("tools-list");
       toolsEl.innerHTML = "";
       for (const t of snap.tools) {
@@ -656,12 +876,34 @@ const INDEX_HTML = `<!doctype html>
         addEntry("system", "help",
           "Commands:\\n" +
           "  /help                     Show this help\\n" +
-          "  /tools                    List registered kernel tools\\n" +
+          "  /login                    Open provider login dialog\\n" +
+          "  /logout [provider|--all]  Clear saved provider credentials\\n" +
+          "  /tools                    List registered kernel & MCP tools\\n" +
+          "  /mcp                      Show connected MCP servers & status\\n" +
           "  /tool <name> [json-args]  Invoke a kernel tool directly (e.g. /tool read {\\"path\\":\\"README.md\\"})\\n" +
           "  /compact [instructions]   Compact session context\\n" +
           "  /new                      Start a new session\\n" +
           "  <any text>                Send prompt to active model adapter"
         );
+        return;
+      }
+      if (trimmed === "/login") {
+        await openLoginDialog();
+        return;
+      }
+      if (trimmed === "/logout" || trimmed.startsWith("/logout ")) {
+        const arg = trimmed.slice(7).trim();
+        await performLogout(arg === "--all" || arg === "all" ? { all: true } : arg ? { provider: arg } : undefined);
+        return;
+      }
+      if (trimmed === "/mcp") {
+        const snap = await refreshSession();
+        const lines = (snap.connects || []).map((s) =>
+          s.name + " [" + s.transport + ", " + s.origin + "]: " + s.state +
+          (s.tools?.length ? " (" + s.tools.map((t) => t.registeredName).join(", ") + ")" : "") +
+          (s.error ? " — " + s.error : "")
+        );
+        addEntry("system", "mcp", lines.join("\\n") || "No MCP servers configured. Click '+ MCP' to add one.");
         return;
       }
       if (trimmed === "/tools") {
@@ -792,9 +1034,70 @@ const INDEX_HTML = `<!doctype html>
     document.getElementById("btn-new-session").onclick = () => runCommandOrPrompt("/new");
     document.getElementById("btn-compact").onclick = () => runCommandOrPrompt("/compact");
 
-    document.getElementById("btn-connect").onclick = async () => {
-      const res = await fetch("/api/models");
+    async function renderSavedAuthList() {
+      const box = document.getElementById("auth-saved-box");
+      const res = await fetch("/api/auth");
+      const auth = await res.json();
+      box.innerHTML = "";
+      const list = auth.loggedInProviders || [];
+      if (list.length === 0) return;
+      const title = document.createElement("div");
+      title.style.cssText = "font-family: var(--mono); font-size: 11px; color: var(--muted); margin-bottom: 6px;";
+      title.textContent = "LOGGED-IN PROVIDERS (~/.kern/auth.json)";
+      box.appendChild(title);
+      for (const item of list) {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:8px; padding:4px 8px; margin-bottom:4px; background:var(--bg); border:1px solid var(--border); border-radius:6px; font-family:var(--mono); font-size:12px;";
+        const label = document.createElement("span");
+        label.textContent = item.provider + " (" + item.maskedKey + ")";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "danger";
+        btn.style.cssText = "font-size:11px; padding:2px 6px;";
+        btn.textContent = "Logout";
+        btn.onclick = async () => {
+          await performLogout({ provider: item.provider });
+          await renderSavedAuthList();
+        };
+        row.appendChild(label);
+        row.appendChild(btn);
+        box.appendChild(row);
+      }
+    }
+
+    async function performLogout(opts) {
+      let body = opts;
+      if (!body) {
+        const authRes = await fetch("/api/auth");
+        const auth = await authRes.json();
+        const list = auth.loggedInProviders || [];
+        if (list.length === 0) {
+          addEntry("system", "auth", "No saved provider credentials in ~/.kern/auth.json.");
+          return;
+        }
+        const active = auth.activeProvider;
+        const target = list.find((i) => i.provider === active)?.provider || list[0].provider;
+        body = { provider: target };
+      }
+      const res = await fetch("/api/logout", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
       const data = await res.json();
+      if (!res.ok) {
+        addEntry("error", "logout", data.error || "Logout failed");
+      } else if (data.loggedOut?.length) {
+        addEntry("system", "auth", "Logged out of " + data.loggedOut.join(", ") + " (removed from ~/.kern/auth.json).");
+      } else {
+        addEntry("system", "auth", "No saved credentials removed.");
+      }
+      await refreshSession();
+    }
+
+    async function openLoginDialog() {
+      const [modelsRes] = await Promise.all([fetch("/api/models"), renderSavedAuthList()]);
+      const data = await modelsRes.json();
       const presetSel = document.getElementById("cfg-preset");
       presetSel.innerHTML = "<option value=''>custom</option>";
       for (const p of data.presets || []) {
@@ -811,30 +1114,114 @@ const INDEX_HTML = `<!doctype html>
           document.getElementById("cfg-baseurl").value = sel.dataset.baseUrl || "";
         }
       };
-      connectDialog.showModal();
-    };
+      loginDialog.showModal();
+    }
 
-    document.getElementById("btn-connect-cancel").onclick = () => connectDialog.close();
-    document.getElementById("connect-form").onsubmit = async (e) => {
+    document.getElementById("btn-login").onclick = openLoginDialog;
+    document.getElementById("btn-logout").onclick = () => performLogout();
+    document.getElementById("btn-login-cancel").onclick = () => loginDialog.close();
+    document.getElementById("login-form").onsubmit = async (e) => {
       e.preventDefault();
       const body = {
         provider: document.getElementById("cfg-provider").value.trim(),
         baseUrl: document.getElementById("cfg-baseurl").value.trim(),
         modelId: document.getElementById("cfg-model").value.trim(),
         apiKey: document.getElementById("cfg-apikey").value.trim() || undefined,
+        save: true,
       };
-      const res = await fetch("/api/connect", {
+      const res = await fetch("/api/login", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
       const data = await res.json();
       if (!res.ok) {
-        addEntry("error", "connect", data.error || "Failed to connect model");
+        addEntry("error", "login", data.error || "Failed to log in");
       } else {
-        addEntry("system", "model", "Connected " + data.model.provider + "/" + data.model.modelId);
+        addEntry("system", "auth", "Logged in: " + data.model.provider + "/" + data.model.modelId);
       }
-      connectDialog.close();
+      loginDialog.close();
+      await refreshSession();
+    };
+
+    const mcpDialog = document.getElementById("mcp-dialog");
+    const syncMcpTransportFields = () => {
+      const tr = document.getElementById("mcp-transport").value;
+      document.getElementById("mcp-remote-fields").style.display = tr === "stdio" ? "none" : "block";
+      document.getElementById("mcp-stdio-fields").style.display = tr === "stdio" ? "block" : "none";
+    };
+    document.getElementById("mcp-transport").onchange = syncMcpTransportFields;
+
+    async function openMcpDialog() {
+      const res = await fetch("/api/connects");
+      const data = await res.json();
+      const presetSel = document.getElementById("mcp-preset");
+      presetSel.innerHTML = "<option value=''>custom</option>";
+      for (const p of data.presets || []) {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = p.name + " (" + p.transport + ")";
+        opt.dataset.preset = JSON.stringify(p);
+        presetSel.appendChild(opt);
+      }
+      presetSel.onchange = () => {
+        const sel = presetSel.selectedOptions[0];
+        if (!sel || !sel.dataset.preset) return;
+        const p = JSON.parse(sel.dataset.preset);
+        document.getElementById("mcp-name").value = p.id;
+        document.getElementById("mcp-transport").value = p.transport;
+        syncMcpTransportFields();
+        document.getElementById("mcp-url").value = p.entry.url || "";
+        document.getElementById("mcp-auth").value = p.entry.headers?.Authorization || "";
+        document.getElementById("mcp-command").value = p.entry.command || "";
+        document.getElementById("mcp-args").value = (p.entry.args || []).join(" ");
+        document.getElementById("mcp-env").value = Object.entries(p.entry.env || {}).map(([k, v]) => k + "=" + v).join("\\n");
+      };
+      syncMcpTransportFields();
+      mcpDialog.showModal();
+    }
+
+    document.getElementById("btn-mcp").onclick = openMcpDialog;
+    document.getElementById("btn-mcp-side").onclick = openMcpDialog;
+    document.getElementById("btn-mcp-cancel").onclick = () => mcpDialog.close();
+    document.getElementById("mcp-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const name = document.getElementById("mcp-name").value.trim();
+      const transport = document.getElementById("mcp-transport").value;
+      const scope = document.getElementById("mcp-scope").value;
+      const body = { name, transport, scope };
+      if (transport === "stdio") {
+        body.command = document.getElementById("mcp-command").value.trim();
+        const argsRaw = document.getElementById("mcp-args").value.trim();
+        body.args = argsRaw ? argsRaw.split(/\\s+/).filter(Boolean) : [];
+        const envLines = document.getElementById("mcp-env").value.split("\\n").map((s) => s.trim()).filter(Boolean);
+        const env = {};
+        for (const line of envLines) {
+          const eq = line.indexOf("=");
+          if (eq > 0) env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+        }
+        if (Object.keys(env).length > 0) body.env = env;
+      } else {
+        body.url = document.getElementById("mcp-url").value.trim();
+        const auth = document.getElementById("mcp-auth").value.trim();
+        if (auth) {
+          body.headers = { Authorization: /^bearer\\s+/i.test(auth) || auth.startsWith("$") ? auth : "Bearer " + auth };
+        }
+      }
+      const res = await fetch("/api/connects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        addEntry("error", "mcp", data.error || "Failed to connect MCP server");
+      } else {
+        const s = data.server;
+        addEntry(s.state === "error" ? "error" : "system", "mcp",
+          s.name + ": " + s.state + (s.error ? " — " + s.error : " (" + (s.tools?.length || 0) + " tool(s))"));
+      }
+      mcpDialog.close();
       await refreshSession();
     };
 
@@ -867,6 +1254,22 @@ const INDEX_HTML = `<!doctype html>
           break;
         case "tool_execution_start":
           addEntry("tool", "tool start: " + ev.toolName, JSON.stringify(ev.arguments ?? {}, null, 2));
+          break;
+        case "tool_execution_update":
+          if (typeof ev.delta === "string" && ev.delta.trim()) {
+            const entries = transcriptEl.querySelectorAll(".entry.tool");
+            const lastTool = entries[entries.length - 1];
+            const lastTitle = lastTool?.querySelector(".role")?.textContent || "";
+            if (lastTool && lastTitle.includes("tool output: " + ev.toolName)) {
+              const bodyEl = lastTool.querySelector(".body");
+              if (bodyEl) {
+                bodyEl.textContent += ev.delta;
+                transcriptEl.scrollTop = transcriptEl.scrollHeight;
+                break;
+              }
+            }
+            addEntry("tool", "tool output: " + ev.toolName, ev.delta);
+          }
           break;
         case "tool_input_repaired":
           addEntry("system", "arg repair (" + ev.toolName + ")", ev.repairs.join(", "));
@@ -975,26 +1378,191 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     });
   }
 
-  if (method === "POST" && url.pathname === "/api/connect") {
+  if (method === "GET" && url.pathname === "/api/connects") {
+    return sendJson(res, 200, {
+      servers: activeSession.connects?.listStatuses() ?? [],
+      warnings: activeSession.connects?.getWarnings() ?? [],
+      presets: CONNECTOR_PRESETS,
+    });
+  }
+
+  if (method === "POST" && url.pathname === "/api/connects") {
+    if (!activeSession.connects) {
+      return sendJson(res, 501, { error: "Connects manager unavailable" });
+    }
     const body = await readJsonBody(req);
-    const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const scope =
+      body.scope === "project" || body.scope === "memory" ? body.scope : "user";
+    if (!name) {
+      return sendJson(res, 400, { error: "Server name is required" });
+    }
+    const transport =
+      body.transport === "stdio" || body.transport === "http" || body.transport === "sse"
+        ? body.transport
+        : body.type === "sse"
+          ? "sse"
+          : body.command
+            ? "stdio"
+            : "http";
+
+    const entry: McpServerConfigEntry = { transport };
+    if (transport === "stdio") {
+      const command = typeof body.command === "string" ? body.command.trim() : "";
+      if (!command) {
+        return sendJson(res, 400, { error: "command is required for stdio MCP servers" });
+      }
+      entry.command = command;
+      if (Array.isArray(body.args)) {
+        entry.args = body.args.map((a) => String(a));
+      }
+      if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
+        entry.env = Object.fromEntries(
+          Object.entries(body.env as Record<string, unknown>)
+            .filter(([, v]) => typeof v === "string")
+            .map(([k, v]) => [k, v as string]),
+        );
+      }
+    } else {
+      const targetUrl = typeof body.url === "string" ? body.url.trim() : "";
+      if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+        return sendJson(res, 400, { error: "Valid http(s) url is required for HTTP/SSE MCP servers" });
+      }
+      entry.url = targetUrl;
+      if (body.headers && typeof body.headers === "object" && !Array.isArray(body.headers)) {
+        entry.headers = Object.fromEntries(
+          Object.entries(body.headers as Record<string, unknown>)
+            .filter(([, v]) => typeof v === "string")
+            .map(([k, v]) => [k, v as string]),
+        );
+      }
+    }
+
+    const server = await activeSession.connects.addServer(name, entry, { scope });
+    return sendJson(res, 200, { ok: true, server, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "POST" && url.pathname === "/api/connects/reconnect") {
+    if (!activeSession.connects) {
+      return sendJson(res, 501, { error: "Connects manager unavailable" });
+    }
+    const body = await readJsonBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return sendJson(res, 400, { error: "name is required" });
+    const server = await activeSession.connects.reconnectServer(name);
+    return sendJson(res, 200, { ok: true, server, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "POST" && url.pathname === "/api/connects/toggle") {
+    if (!activeSession.connects) {
+      return sendJson(res, 501, { error: "Connects manager unavailable" });
+    }
+    const body = await readJsonBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return sendJson(res, 400, { error: "name is required" });
+    const server = await activeSession.connects.toggleServer(name, Boolean(body.disabled));
+    return sendJson(res, 200, { ok: true, server, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "POST" && url.pathname === "/api/connects/trust") {
+    if (!activeSession.connects) {
+      return sendJson(res, 501, { error: "Connects manager unavailable" });
+    }
+    const body = await readJsonBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return sendJson(res, 400, { error: "name is required" });
+    const server = await activeSession.connects.trustServer(name);
+    return sendJson(res, 200, { ok: true, server, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "DELETE" && url.pathname === "/api/connects") {
+    if (!activeSession.connects) {
+      return sendJson(res, 501, { error: "Connects manager unavailable" });
+    }
+    const name = url.searchParams.get("name")?.trim() ?? "";
+    if (!name) return sendJson(res, 400, { error: "name query parameter is required" });
+    const removed = await activeSession.connects.removeServer(name);
+    return sendJson(res, 200, { ok: true, removed, snapshot: sessionSnapshot() });
+  }
+
+  if (method === "GET" && url.pathname === "/api/auth") {
+    const auth = await loadAuth();
+    return sendJson(res, 200, {
+      activeProvider: activeSession.modelInfo().provider,
+      loggedInProviders: Object.entries(auth).map(([provider, entry]) => ({
+        provider,
+        maskedKey: maskKey(entry.apiKey ?? ""),
+      })),
+    });
+  }
+
+  if (method === "POST" && (url.pathname === "/api/login" || url.pathname === "/api/connect")) {
+    const body = await readJsonBody(req);
+    const provider = typeof body.provider === "string" ? body.provider.trim().toLowerCase() : "";
     const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
     const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
     const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : undefined;
     if (!provider || !baseUrl || !modelId) {
       return sendJson(res, 400, { error: "provider, baseUrl, and modelId are required" });
     }
-    const adapter = createOpenAIAdapter({
-      provider,
-      modelId,
-      baseUrl,
-      apiKey,
-      contextWindow: 128_000,
-      maxOutputTokens: 4_000,
-      logger,
-    });
+    if (body.save !== false) {
+      if (apiKey && !apiKey.startsWith("$") && !apiKey.startsWith("!")) {
+        await saveAuthKey(provider, apiKey);
+      }
+      const preset = PROVIDER_PRESETS.find((p) => p.name === provider);
+      const envMatch = apiKey?.match(/^\$([A-Za-z_][A-Za-z0-9_]*)$/);
+      const apiKeyEnvOut = envMatch?.[1] ?? preset?.apiKeyEnv;
+      const cfg: ProviderConfig = {
+        baseUrl,
+        ...(apiKey ? { apiKey } : {}),
+        ...(apiKeyEnvOut ? { apiKeyEnv: apiKeyEnvOut } : {}),
+        models: [{ id: modelId }],
+      };
+      await saveProviderToUserFile(provider, cfg, { makeDefault: Boolean(body.makeDefault) });
+      cachedModelsFile = await loadModelsFile(WORKSPACE_CWD).catch(() => cachedModelsFile);
+    }
+    const adapter = cachedModelsFile.providers?.[provider]
+      ? await createAdapterFor(cachedModelsFile, provider, modelId, { baseUrl, apiKey }, logger)
+      : createOpenAIAdapter({
+          provider,
+          modelId,
+          baseUrl,
+          apiKey,
+          contextWindow: 128_000,
+          maxOutputTokens: 4_000,
+          logger,
+        });
     await activeSession.setModel(adapter);
-    return sendJson(res, 200, { ok: true, model: activeSession.modelInfo() });
+    const auth = await loadAuth();
+    return sendJson(res, 200, {
+      ok: true,
+      model: activeSession.modelInfo(),
+      loggedInProviders: Object.keys(auth),
+    });
+  }
+
+  if (method === "POST" && url.pathname === "/api/logout") {
+    const body = await readJsonBody(req);
+    const auth = await loadAuth();
+    const all = Boolean(body.all);
+    const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+    if (!all && !provider) {
+      return sendJson(res, 400, { error: "provider or all=true is required" });
+    }
+    const targets = all ? Object.keys(auth) : [provider];
+    const loggedOut: string[] = [];
+    for (const p of targets) {
+      if (auth[p]) {
+        await clearAuthKey(p);
+        loggedOut.push(p);
+      }
+    }
+    const remaining = await loadAuth();
+    return sendJson(res, 200, {
+      ok: true,
+      loggedOut,
+      loggedInProviders: Object.keys(remaining),
+    });
   }
 
   if (method === "POST" && url.pathname === "/api/prompt") {
@@ -1098,6 +1666,27 @@ const server = createServer((req, res) => {
   });
 });
 
+server.on("error", (err) => {
+  logger.error("http_server_error", {
+    port: PORT,
+    message: err instanceof Error ? err.message : String(err),
+  });
+  process.stderr.write(`Kern web server failed on ${HOST}:${PORT}: ${err instanceof Error ? err.message : String(err)}\n`);
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
   process.stdout.write(`Kern web workbench listening on http://${HOST}:${PORT}\n`);
 });
+
+let shuttingDown = false;
+async function shutdownServer() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await activeSession?.connects?.dispose().catch(() => {});
+  activeSession?.dispose();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1500).unref();
+}
+process.once("SIGINT", () => { void shutdownServer(); });
+process.once("SIGTERM", () => { void shutdownServer(); });

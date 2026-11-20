@@ -92,30 +92,26 @@ describe("AgentRuntime v1.0 features", () => {
     }
   });
 
-  it("refreshes ContextBuilder repoResolver when the query changes", async () => {
+  it("keeps ContextBuilder systemPrompt stable across user turns and appends systemExtra", async () => {
     const root = mkdtempSync(join(tmpdir(), "kern-ctx-"));
     try {
       const store = new SessionStore({ storageRoot: join(root, "sessions") });
       const manager = await SessionManager.create(store, root);
       const tools = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy() });
-      const queries: string[] = [];
       const builder = new ContextBuilder({
         baseSystemPrompt: "base",
         toolRegistry: tools,
-        repoResolver: async (q) => {
-          queries.push(q);
-          return { query: q, likelyFiles: [`${q}.ts`] };
-        },
+        systemExtra: "[AGENTS.md]\nFollow workspace conventions.",
       });
 
       await manager.appendUserMessage("alpha");
       const snap1 = await builder.build(manager);
-      expect(snap1.systemPrompt).toContain("alpha.ts");
-
       await manager.appendUserMessage("beta");
       const snap2 = await builder.build(manager);
-      expect(snap2.systemPrompt).toContain("beta.ts");
-      expect(queries).toEqual(["alpha", "beta"]);
+
+      expect(snap1.systemPrompt).toBe("base\n\n[AGENTS.md]\nFollow workspace conventions.");
+      expect(snap2.systemPrompt).toBe(snap1.systemPrompt);
+      expect(snap2.messages).toHaveLength(2);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -386,6 +382,55 @@ describe("AgentRuntime v1.0 features", () => {
       expect(manager.getActivePath().some((e) => e.type === "model_change" && e.model === "backup-2")).toBe(true);
       const last = manager.getActiveMessages().at(-1);
       expect(last?.message.content[0]).toEqual({ type: "text", text: "from-backup" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("streams tool_execution_update events when a tool emits progress and respects compaction abort", async () => {
+    const root = mkdtempSync(join(tmpdir(), "kern-progress-"));
+    try {
+      const store = new SessionStore({ storageRoot: join(root, "sessions") });
+      const manager = await SessionManager.create(store, root);
+      const events = new EventBus();
+      const deltas: string[] = [];
+      events.subscribe((e) => {
+        if (e.type === "tool_execution_update") deltas.push(e.delta);
+      });
+
+      const tools = new ToolRegistry({ workspaceRoot: root, policy: new AllowAllPolicy() });
+      tools.register({
+        name: "stream-tool",
+        description: "emits progress",
+        inputSchema: { type: "object", properties: {} },
+        sideEffect: "read",
+        async execute(_args, ctx) {
+          ctx.emitProgress?.("line-1\n");
+          ctx.emitProgress?.("line-2\n");
+          return { content: [{ type: "text", text: "done" }], isError: false };
+        },
+      });
+
+      let turn = 0;
+      const model: ModelAdapter = {
+        info: { provider: "test", modelId: "test-1", contextWindow: 32000, maxOutputTokens: 2000 },
+        async *stream(): AsyncIterable<ModelStreamEvent> {
+          turn++;
+          if (turn === 1) {
+            yield { type: "tool_call_complete", call: { type: "tool_call", id: "st_1", name: "stream-tool", arguments: {} } };
+            yield { type: "finished", reason: "tool_use" };
+          } else {
+            yield { type: "text_delta", delta: "all done" };
+            yield { type: "finished", reason: "stop" };
+          }
+        },
+      };
+
+      const contextBuilder = new ContextBuilder({ baseSystemPrompt: "test", toolRegistry: tools });
+      const runtime = new AgentRuntime({ model, tools, sessions: manager, contextBuilder, events, compactor: null });
+
+      await runtime.runUserTurn("run streaming tool");
+      expect(deltas).toEqual(["line-1\n", "line-2\n"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

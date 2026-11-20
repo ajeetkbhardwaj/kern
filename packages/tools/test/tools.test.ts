@@ -223,6 +223,30 @@ describe("BashTool", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text).toContain("timeout");
   });
+
+  it("aborts unsandboxed bash commands immediately with E_CANCELLED and streams progress chunks", async () => {
+    const registry = new ToolRegistry({ workspaceRoot: testRoot, policy: new AllowAllPolicy() });
+    registry.register(createBashTool({ root: testRoot, timeoutMs: 30_000, sandbox: false }));
+
+    const progressChunks: string[] = [];
+    const progressResult = await registry.execute(
+      "bash",
+      { command: "echo step1 && echo step2" },
+      new AbortController().signal,
+      { onProgress: (delta) => progressChunks.push(delta) },
+    );
+    expect(progressResult.isError).toBe(false);
+    expect(progressChunks.join("")).toContain("step1");
+
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 80);
+    const started = Date.now();
+    const aborted = await registry.callTool("bash", { command: "sleep 30" }, { signal: ac.signal });
+    const elapsed = Date.now() - started;
+    expect(aborted.isError).toBe(true);
+    expect(aborted.details?.code).toBe("E_CANCELLED");
+    expect(elapsed).toBeLessThan(2000);
+  });
 });
 
 describe("DefaultPolicy", () => {

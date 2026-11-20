@@ -1,305 +1,308 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { readFile, writeFile, unlink } from "node:fs/promises";
+import { describe, it, expect, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
-
-const STATE_FILE = join(homedir(), ".tui-state.json");
+import { tmpdir } from "node:os";
+import { findAltScreenSearchMatches } from "@earendil-works/pi-tui/dist/alt-screen-search.js";
+import { KillRing } from "@earendil-works/pi-tui/dist/kill-ring.js";
+import type { SessionEntry } from "@kern/protocol";
+import {
+  resolveTuiStateFile,
+  loadTuiState,
+  saveTuiState,
+  summarizeArgs,
+  getOverlayOpts,
+  INVISIBLE_RE,
+  DESTRUCTIVE_PATTERNS,
+  isDestructiveApproval,
+  parseBudgetArgs,
+  resolveExportPath,
+  buildSessionExportMarkdown,
+  collectReplayItems,
+  formatReasoningSteps,
+  ToolCard,
+  CollapsibleText,
+  SidebarPanel,
+  StatusBar,
+  TUI_COMMANDS,
+} from "../src/index.js";
 
 describe("tui state persistence", () => {
-  beforeEach(async () => {
-    try { await unlink(STATE_FILE); } catch {}
-  });
+  const dirs: string[] = [];
 
-  afterEach(async () => {
-    try { await unlink(STATE_FILE); } catch {}
-  });
-
-  it("saves and loads draft text", async () => {
-    const draftText = "test draft";
-    await writeFile(STATE_FILE, JSON.stringify({
-      draftText,
-      recentPrompts: [],
-      stash: "",
-      queue: [],
-      lastUserPrompt: "",
-    }), "utf8");
-
-    const raw = await readFile(STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    expect(data.draftText).toBe(draftText);
-  });
-
-  it("saves and loads recent prompts", async () => {
-    const recentPrompts = ["prompt1", "prompt2"];
-    await writeFile(STATE_FILE, JSON.stringify({
-      draftText: "",
-      recentPrompts,
-      stash: "",
-      queue: [],
-      lastUserPrompt: "",
-    }), "utf8");
-
-    const raw = await readFile(STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    expect(data.recentPrompts).toEqual(recentPrompts);
-  });
-
-  it("saves and loads stash", async () => {
-    const stash = "stashed text";
-    await writeFile(STATE_FILE, JSON.stringify({
-      draftText: "",
-      recentPrompts: [],
-      stash,
-      queue: [],
-      lastUserPrompt: "",
-    }), "utf8");
-
-    const raw = await readFile(STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    expect(data.stash).toBe(stash);
-  });
-
-  it("saves and loads queue", async () => {
-    const queue = ["queued1", "queued2"];
-    await writeFile(STATE_FILE, JSON.stringify({
-      draftText: "",
-      recentPrompts: [],
-      stash: "",
-      queue,
-      lastUserPrompt: "",
-    }), "utf8");
-
-    const raw = await readFile(STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    expect(data.queue).toEqual(queue);
-  });
-
-  it("saves and loads last user prompt", async () => {
-    const lastUserPrompt = "last prompt";
-    await writeFile(STATE_FILE, JSON.stringify({
-      draftText: "",
-      recentPrompts: [],
-      stash: "",
-      queue: [],
-      lastUserPrompt,
-    }), "utf8");
-
-    const raw = await readFile(STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    expect(data.lastUserPrompt).toBe(lastUserPrompt);
-  });
-
-  it("handles missing file gracefully", async () => {
-    try { await unlink(STATE_FILE); } catch {}
-    try {
-      await readFile(STATE_FILE, "utf8");
-      throw new Error("should have failed");
-    } catch (e) {
-      expect(e instanceof Error).toBe(true);
+  afterEach(() => {
+    while (dirs.length > 0) {
+      const dir = dirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("handles corrupt JSON gracefully", async () => {
-    await writeFile(STATE_FILE, "not json", "utf8");
-    try {
-      const raw = await readFile(STATE_FILE, "utf8");
-      JSON.parse(raw);
-      throw new Error("should have failed");
-    } catch (e) {
-      expect(e instanceof Error).toBe(true);
-    }
+  function makeStatePath(): string {
+    const dir = mkdtempSync(join(tmpdir(), "kern-tui-state-"));
+    dirs.push(dir);
+    return resolveTuiStateFile(dir);
+  }
+
+  it("resolves state path under ~/.kern/tui-state.json", () => {
+    expect(resolveTuiStateFile("/tmp/fake-home")).toBe(join("/tmp/fake-home", ".kern", "tui-state.json"));
+  });
+
+  it("saves and loads draft, prompts, stash, queue, and lastUserPrompt", async () => {
+    const file = makeStatePath();
+    await saveTuiState(
+      {
+        draftText: "test draft",
+        recentPrompts: ["prompt1", "prompt2"],
+        stash: "stashed text",
+        queue: ["queued1", "queued2"],
+        lastUserPrompt: "last prompt",
+      },
+      file,
+    );
+
+    const loaded = await loadTuiState(file);
+    expect(loaded.draftText).toBe("test draft");
+    expect(loaded.recentPrompts).toEqual(["prompt1", "prompt2"]);
+    expect(loaded.stash).toBe("stashed text");
+    expect(loaded.queue).toEqual(["queued1", "queued2"]);
+    expect(loaded.lastUserPrompt).toBe("last prompt");
+  });
+
+  it("handles missing or corrupt state file gracefully", async () => {
+    const file = makeStatePath();
+    expect(await loadTuiState(file)).toEqual({});
+
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const { dirname } = await import("node:path");
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, "not valid json", "utf8");
+    expect(await loadTuiState(file)).toEqual({});
   });
 });
 
 describe("summarizeArgs", () => {
-  function summarizeArgs(args: unknown): string {
-    if (typeof args !== "object" || args === null) return "";
-    const record = args as Record<string, unknown>;
-    const first =
-      typeof record["path"] === "string"
-        ? record["path"]
-        : typeof record["command"] === "string"
-          ? record["command"]
-          : Object.entries(record)
-              .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-              .join(" ");
-    const text = String(first);
-    return text.length > 100 ? text.slice(0, 100) + "…" : text;
-  }
-
-  it("returns path for path arg", () => {
+  it("returns path or command first and truncates long values", () => {
     expect(summarizeArgs({ path: "/foo/bar.ts" })).toBe("/foo/bar.ts");
-  });
-
-  it("returns command for command arg", () => {
     expect(summarizeArgs({ command: "ls -la" })).toBe("ls -la");
-  });
-
-  it("truncates long text", () => {
-    const long = "a".repeat(150);
-    const result = summarizeArgs({ path: long });
+    const result = summarizeArgs({ path: "a".repeat(150) });
     expect(result).toHaveLength(101);
     expect(result.endsWith("…")).toBe(true);
   });
 
-  it("returns empty for null", () => {
+  it("handles null, undefined, and generic key/value args", () => {
     expect(summarizeArgs(null)).toBe("");
-  });
-
-  it("returns empty for undefined", () => {
     expect(summarizeArgs(undefined)).toBe("");
-  });
-
-  it("formats other args as key=value", () => {
     expect(summarizeArgs({ foo: "bar", baz: 123 })).toBe('foo="bar" baz=123');
   });
 });
 
-describe("adaptive overlay options", () => {
-  const originalColumns = process.stdout.columns;
-
-  afterEach(() => {
-    process.stdout.columns = originalColumns;
-  });
-
-  function getOverlayOpts(): { anchor: "center"; width: "80%" | "90%" | "95%"; maxHeight: "80%" | "85%" | "90%" } {
-    const cols = process.stdout.columns ?? 80;
-    if (cols < 80) return { anchor: "center", width: "95%", maxHeight: "90%" };
-    if (cols < 120) return { anchor: "center", width: "90%", maxHeight: "85%" };
-    return { anchor: "center", width: "80%", maxHeight: "80%" };
-  }
-
-  it("returns 95% width for very narrow terminals", () => {
-    process.stdout.columns = 60;
-    const opts = getOverlayOpts();
-    expect(opts.width).toBe("95%");
-    expect(opts.maxHeight).toBe("90%");
-  });
-
-  it("returns 90% width for narrow terminals", () => {
-    process.stdout.columns = 100;
-    const opts = getOverlayOpts();
-    expect(opts.width).toBe("90%");
-    expect(opts.maxHeight).toBe("85%");
-  });
-
-  it("returns 80% width for wide terminals", () => {
-    process.stdout.columns = 150;
-    const opts = getOverlayOpts();
-    expect(opts.width).toBe("80%");
-    expect(opts.maxHeight).toBe("80%");
+describe("getOverlayOpts", () => {
+  it("adapts width and height across terminal column thresholds", () => {
+    expect(getOverlayOpts(60)).toEqual({ anchor: "center", width: "95%", maxHeight: "90%" });
+    expect(getOverlayOpts(100)).toEqual({ anchor: "center", width: "90%", maxHeight: "85%" });
+    expect(getOverlayOpts(150)).toEqual({ anchor: "center", width: "80%", maxHeight: "80%" });
   });
 });
 
 describe("kill ring", () => {
-  class KillRing {
-    private ring: string[] = [];
-    push(text: string, opts: { prepend: boolean; accumulate?: boolean }): void {
-      if (opts.accumulate && this.ring.length > 0) {
-        if (opts.prepend) this.ring[0] = text + this.ring[0];
-        else this.ring[0] = this.ring[0] + text;
-      } else {
-        this.ring.unshift(text);
-      }
-    }
-    peek(): string | undefined {
-      return this.ring[0];
-    }
-    rotate(): void {
-      if (this.ring.length > 1) this.ring.push(this.ring.shift()!);
-    }
-    get length(): number { return this.ring.length; }
-  }
-
-  it("pushes and peeks single entry", () => {
-    const kr = new KillRing();
-    kr.push("hello", { prepend: false });
-    expect(kr.peek()).toBe("hello");
-    expect(kr.length).toBe(1);
-  });
-
-  it("accumulates forward when accumulate=true", () => {
-    const kr = new KillRing();
-    kr.push("hello", { prepend: false });
-    kr.push(" world", { prepend: false, accumulate: true });
-    expect(kr.peek()).toBe("hello world");
-  });
-
-  it("accumulates backward when prepend=true", () => {
+  it("pushes, accumulates, and rotates entries", () => {
     const kr = new KillRing();
     kr.push("world", { prepend: false });
     kr.push("hello ", { prepend: true, accumulate: true });
     expect(kr.peek()).toBe("hello world");
-  });
-
-  it("rotates entries", () => {
-    const kr = new KillRing();
-    kr.push("first", { prepend: false });
-    kr.push("second", { prepend: false });
-    kr.push("third", { prepend: false });
-    expect(kr.peek()).toBe("third");
+    kr.push("next", { prepend: false });
+    expect(kr.peek()).toBe("next");
     kr.rotate();
-    expect(kr.peek()).toBe("second");
-    kr.rotate();
-    expect(kr.peek()).toBe("first");
+    expect(kr.peek()).toBe("hello world");
   });
 });
 
-describe("INVISIBLE_RE", () => {
-  const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
-
-  it("detects zero-width spaces", () => {
-    const text = "hello\u200bworld";
-    const matches = [...text.matchAll(INVISIBLE_RE)];
-    expect(matches.length).toBe(1);
+describe("INVISIBLE_RE & DESTRUCTIVE_PATTERNS", () => {
+  it("detects zero-width and bidi invisible characters without false positives", () => {
+    expect([...("hello\u200bworld").matchAll(INVISIBLE_RE)].length).toBe(1);
+    expect([...("hello\u200eworld").matchAll(INVISIBLE_RE)].length).toBe(1);
+    expect([...("hello world").matchAll(INVISIBLE_RE)].length).toBe(0);
   });
 
-  it("detects bidi controls", () => {
-    const text = "hello\u200eworld";
-    const matches = [...text.matchAll(INVISIBLE_RE)];
-    expect(matches.length).toBe(1);
-  });
-
-  it("returns no matches for clean text", () => {
-    const text = "hello world";
-    const matches = [...text.matchAll(INVISIBLE_RE)];
-    expect(matches.length).toBe(0);
+  it("matches destructive patterns in prompts and serialized tool args", () => {
+    expect(DESTRUCTIVE_PATTERNS.length).toBeGreaterThanOrEqual(10);
+    expect(isDestructiveApproval("Run bash", JSON.stringify({ command: "rm -rf /tmp/x" }))).toBe(true);
+    expect(isDestructiveApproval("Run bash: git reset --hard")).toBe(true);
+    expect(isDestructiveApproval("Run bash: DROP TABLE users")).toBe(true);
+    expect(isDestructiveApproval("Run bash: git status")).toBe(false);
   });
 });
 
-describe("DESTRUCTIVE_PATTERNS", () => {
-  const DESTRUCTIVE_PATTERNS: RegExp[] = [
-    /\brm\s+.*-[a-z]*r[a-z]*f\b/i,
-    /\brm\s+-rf?\b/,
-    /\bgit\s+reset\s+--hard\b/,
-    /\bgit\s+clean\s+-[a-z]*f\b/,
-    /:\(\)\s*\{[^}]*\}\s*;/,
-    /\bmkfs\b/,
-    /\bdd\b.*\bof=\/dev\//,
-    />\s*\/dev\/[a-z]/,
-    /\b(shutdown|reboot|halt|poweroff)\b/i,
-    /\bDROP\s+(TABLE|DATABASE)\b/i,
-  ];
-
-  const testCases = [
-    { input: "rm -rf /", shouldMatch: true },
-    { input: "rm -rf /home/user", shouldMatch: true },
-    { input: "git reset --hard", shouldMatch: true },
-    { input: "git clean -f", shouldMatch: true },
-    { input: "mkfs.ext4 /dev/sda1", shouldMatch: true },
-    { input: "dd if=/dev/zero of=/dev/sda", shouldMatch: true },
-    { input: "> /dev/sda", shouldMatch: true },
-    { input: "shutdown -h now", shouldMatch: true },
-    { input: "DROP TABLE users", shouldMatch: true },
-    { input: "ls -la", shouldMatch: false },
-    { input: "git status", shouldMatch: false },
-    { input: "echo hello", shouldMatch: false },
-  ];
-
-  for (const tc of testCases) {
-    it(`detects "${tc.input}" as ${tc.shouldMatch ? "destructive" : "safe"}`, () => {
-      const matches = DESTRUCTIVE_PATTERNS.some((re) => re.test(tc.input));
-      expect(matches).toBe(tc.shouldMatch);
+describe("parseBudgetArgs & export helpers", () => {
+  it("parses valid budget limits and rejects unknown or invalid values", () => {
+    expect(parseBudgetArgs("")).toEqual({ ok: true, limits: {} });
+    expect(parseBudgetArgs("maxCost=0.05 maxTurns=10")).toEqual({
+      ok: true,
+      limits: { maxCost: 0.05, maxTurns: 10 },
     });
-  }
+    expect(parseBudgetArgs("maxCost=0")).toEqual({ ok: true, limits: { maxCost: 0 } });
+    expect(parseBudgetArgs("maxTurns=1.5").ok).toBe(false);
+    expect(parseBudgetArgs("unknown=5").ok).toBe(false);
+    expect(parseBudgetArgs("badpair").ok).toBe(false);
+  });
+
+  it("confines export paths to the workspace", () => {
+    const okRes = resolveExportPath("/tmp/work", "out/notes.md", "s1");
+    expect(okRes.ok).toBe(true);
+    if (okRes.ok) expect(okRes.path).toBe(join("/tmp/work", "out/notes.md"));
+
+    const escapeRes = resolveExportPath("/tmp/work", "../outside.md", "s1");
+    expect(escapeRes.ok).toBe(false);
+
+    const absEscapeRes = resolveExportPath("/tmp/work", "/etc/passwd", "s1");
+    expect(absEscapeRes.ok).toBe(false);
+  });
+
+  it("formats reasoning steps and builds session export markdown", () => {
+    expect(formatReasoningSteps("First look.\n\nSecond check.")).toBe("Step 1: First look.\n\nStep 2: Second check.");
+    expect(formatReasoningSteps("1. First\n\n2. Second")).toBe("1. First\n\n2. Second");
+
+    const ts = new Date().toISOString();
+    const entries: SessionEntry[] = [
+      {
+        type: "message",
+        id: "m1",
+        parentId: null,
+        timestamp: ts,
+        message: { role: "user", timestamp: ts, content: [{ type: "text", text: "Hello" }] },
+      },
+      {
+        type: "message",
+        id: "m2",
+        parentId: "m1",
+        timestamp: ts,
+        message: { role: "assistant", timestamp: ts, content: [{ type: "text", text: "Hi there" }] },
+      },
+    ];
+    const md = buildSessionExportMarkdown(entries, { provider: "openai", modelId: "gpt-4o", cwd: "/tmp/work" });
+    expect(md).toContain("- model: openai/gpt-4o");
+    expect(md).toContain("## user");
+    expect(md).toContain("Hi there");
+  });
+});
+
+describe("collectReplayItems", () => {
+  it("pairs tool calls with tool results and preserves user/reasoning/assistant/checkpoints", () => {
+    const ts = new Date().toISOString();
+    const entries: SessionEntry[] = [
+      {
+        type: "message",
+        id: "u1",
+        parentId: null,
+        timestamp: ts,
+        message: { role: "user", timestamp: ts, content: [{ type: "text", text: "Inspect README" }] },
+      },
+      {
+        type: "message",
+        id: "a1",
+        parentId: "u1",
+        timestamp: ts,
+        message: {
+          role: "assistant",
+          timestamp: ts,
+          content: [
+            { type: "reasoning", text: "Checking README first." },
+            { type: "tool_call", id: "tc1", name: "read", arguments: { path: "README.md" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        id: "t1",
+        parentId: "a1",
+        timestamp: ts,
+        message: {
+          role: "tool",
+          timestamp: ts,
+          content: [{ type: "tool_result", toolCallId: "tc1", content: [{ type: "text", text: "# Kern" }], isError: false }],
+        },
+      },
+      {
+        type: "compaction",
+        id: "c1",
+        parentId: "t1",
+        timestamp: ts,
+        summary: "Earlier turns summarized",
+        replacesThroughId: "u1",
+        tokensBefore: { input: 1200, output: 0 },
+      },
+      {
+        type: "message",
+        id: "a2",
+        parentId: "c1",
+        timestamp: ts,
+        message: { role: "assistant", timestamp: ts, content: [{ type: "text", text: "Done." }] },
+      },
+    ];
+
+    const res = collectReplayItems(entries);
+    expect(res.userTurns).toBe(1);
+    expect(res.items.map((i) => i.kind)).toEqual(["user", "reasoning", "tool", "checkpoint", "assistant"]);
+    const toolItem = res.items[2];
+    expect(toolItem?.kind).toBe("tool");
+    if (toolItem?.kind === "tool") {
+      expect(toolItem.toolName).toBe("read");
+      expect(toolItem.argsSummary).toBe("README.md");
+      expect(toolItem.output).toBe("# Kern");
+      expect(toolItem.done).toBe(true);
+      expect(toolItem.isError).toBe(false);
+    }
+  });
+});
+
+describe("TUI components, command catalog & live search integration", () => {
+  it("exposes search, palette, thinking, fork, expand/collapse, login/logout, and mcp commands", () => {
+    const names = new Set(TUI_COMMANDS.map((c) => c.name));
+    for (const expected of ["search", "find", "palette", "thinking", "fork", "expand", "collapse", "budget", "session", "login", "logout", "mcp", "connects"]) {
+      expect(names.has(expected)).toBe(true);
+    }
+    expect(names.has("connect")).toBe(false);
+  });
+
+  it("toggles ToolCard and CollapsibleText expansion via mouse click and API", () => {
+    const card = new ToolCard("read", "src/index.ts");
+    expect(card.render(80).join("\n")).toContain("tool running…");
+    card.appendOutput("line 1\nline 2");
+    const runningOut = card.render(80).join("\n");
+    expect(runningOut).toContain("line 1");
+    expect(runningOut).toContain("line 2");
+    card.finish(false);
+    expect(card.isExpanded()).toBe(false);
+    expect(card.render(80).join("\n")).toContain("click header to expand");
+
+    card.handleMouse({ type: "click", x: 0, y: 0, button: "left" } as any);
+    expect(card.isExpanded()).toBe(true);
+    expect(card.render(80).join("\n")).toContain("line 1");
+
+    const thinking = new CollapsibleText("thinking");
+    thinking.setText("analyzing types");
+    expect(thinking.isExpanded()).toBe(false);
+    thinking.setExpanded(true);
+    expect(thinking.render(80).join("\n")).toContain("analyzing types");
+  });
+
+  it("renders StatusBar and toggles SidebarPanel sections", () => {
+    const bar = new StatusBar();
+    bar.setSegments(["openai/gpt-4o", "think: medium", "↑ scrolled"]);
+    const barLines = bar.render(80);
+    expect(barLines[0]).toContain("openai/gpt-4o");
+    expect(barLines[0]).toContain("↑ scrolled");
+
+    const sidebar = new SidebarPanel({ leftBorder: true });
+    sidebar.setSections([{ key: "s", title: "Session", lines: ["Model: gpt-4o"], collapsible: true }]);
+    expect(sidebar.render(40).join("\n")).toContain("Model: gpt-4o");
+    sidebar.handleMouse({ type: "click", x: 2, y: 0, button: "left" } as any);
+    expect(sidebar.render(40).join("\n")).not.toContain("Model: gpt-4o");
+  });
+
+  it("finds live search matches across rendered transcript lines via pi-tui matcher", () => {
+    const matches = findAltScreenSearchMatches(["hello kern", "error in kern/tui", "done"], "kern");
+    expect(matches).toHaveLength(2);
+    expect(matches[0]?.segments[0]?.row).toBe(0);
+    expect(matches[1]?.segments[0]?.row).toBe(1);
+  });
 });

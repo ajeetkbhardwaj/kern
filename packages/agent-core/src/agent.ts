@@ -101,6 +101,10 @@ export class AgentRuntime {
     return this.budgets.limitsSnapshot;
   }
 
+  setBudgetLimits(limits: Partial<BudgetLimits>): BudgetLimits {
+    return this.budgets.updateLimits(limits);
+  }
+
   /** Token usage of the most recent context build (null before first turn). */
   contextUsage(): ContextUsage | null {
     return this.lastUsage;
@@ -464,7 +468,7 @@ export class AgentRuntime {
     this.events.emit({ type: "auto_compaction_start", phase });
     try {
       const tokensBefore: TokenCounts = { input: snapshot.usage.totalTokens, output: 0 };
-      const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model);
+      const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model, undefined, signal);
       this.throwIfAborted(signal);
       await this.sessions.appendCompaction(summary, replacesThroughId, { tokensBefore });
       this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
@@ -476,6 +480,7 @@ export class AgentRuntime {
         });
       }
     } catch (error) {
+      if (isCancelled(error, signal)) throw error;
       const serialized = serializeError(error);
       await this.sessions.appendDiagnostic({
         severity: "error",
@@ -494,7 +499,7 @@ export class AgentRuntime {
     this.events.emit({ type: "auto_compaction_start", phase: "before_prompt" });
     try {
       const tokensBefore: TokenCounts = { input: totalTokens, output: 0 };
-      const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model);
+      const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model, undefined, signal);
       this.throwIfAborted(signal);
       await this.sessions.appendCompaction(summary, replacesThroughId, { tokensBefore });
       this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
@@ -507,6 +512,7 @@ export class AgentRuntime {
       }
       return true;
     } catch (error) {
+      if (isCancelled(error, signal)) throw error;
       const serialized = serializeError(error);
       this.logger.warn("overflow_compaction_failed", { error: serialized.message });
       return false;
@@ -694,6 +700,14 @@ export class AgentRuntime {
           toolCallId: call.id,
           toolName: call.name,
           repairs,
+        });
+      },
+      onProgress: (delta) => {
+        this.events.emit({
+          type: "tool_execution_update",
+          toolCallId: call.id,
+          toolName: call.name,
+          delta: redact(delta),
         });
       },
     });

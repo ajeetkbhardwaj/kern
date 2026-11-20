@@ -13,6 +13,7 @@
     "@kern/coding-agent": "*",
     "@kern/model": "*",
     "@kern/tools": "*",
+    "@kern/connects": "*",
     "@kern/tui": "*"
   }
 }

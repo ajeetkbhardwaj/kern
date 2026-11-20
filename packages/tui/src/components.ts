@@ -141,6 +141,10 @@ export class ToolCard implements Component {
 		this.expanded = expanded;
 	}
 
+	isExpanded(): boolean {
+		return this.expanded;
+	}
+
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.y !== 0) return undefined;
 		if (event.type !== "click") return undefined;
@@ -178,13 +182,20 @@ export class ToolCard implements Component {
 		const toggle = canToggle ? (this.expanded ? theme.muted("[-] ") : theme.muted("[+] ")) : "    ";
 		let header: string;
 		if (!this.done) {
-			const runningLabel = this.toolName === "write" || this.toolName === "edit" ? summary : summary;
-			header = `${theme.accent("◈")} ${theme.muted(runningLabel)} ${theme.muted("running…")}`;
+			header = `${theme.accent("◈")} ${theme.muted(summary)} ${theme.muted("running…")}`;
 		} else if (this.failed) header = `${toggle}${theme.error("✖")} ${theme.bold(summary)}`;
 		else header = `${toggle}${theme.success("✔")} ${theme.bold(summary)}`;
 		const rows = [truncateToWidth(header, w, "")];
 		if (!this.done) {
-			rows.push(truncateToWidth(theme.muted("    tool running…"), w, ""));
+			const nonEmpty = this.outputs.map((l) => l.trimEnd()).filter((l) => l.trim() !== "");
+			if (nonEmpty.length > 0) {
+				const liveTail = nonEmpty.slice(-6);
+				for (const line of liveTail) {
+					rows.push(truncateToWidth(this.formatOutputLine(line), w, ""));
+				}
+			} else {
+				rows.push(truncateToWidth(theme.muted("    tool running…"), w, ""));
+			}
 			return rows;
 		}
 		if (!hasOutput) return rows;
@@ -238,6 +249,10 @@ export class CollapsibleText implements Component {
 
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
+	}
+
+	isExpanded(): boolean {
+		return this.expanded;
 	}
 
 	setStreaming(streaming: boolean): void {
@@ -303,23 +318,6 @@ export class Rule implements Component {
 			guard += 1;
 		}
 		return [theme.muted(truncateToWidth(s, w, ""))];
-	}
-}
-
-export class VerticalRule implements Component {
-	private readonly char: string;
-
-	constructor(char = "│") {
-		this.char = char === "" ? "│" : char;
-	}
-
-	invalidate(): void {}
-
-	render(width: number): string[] {
-		const w = Math.max(1, width);
-		const line = theme.muted(truncateToWidth(this.char, w, ""));
-		// HStack stacks children to the tallest column; provide enough rows for typical viewports.
-		return Array.from({ length: 400 }, () => line);
 	}
 }
 

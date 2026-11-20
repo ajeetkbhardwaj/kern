@@ -66,4 +66,32 @@ describe("Compactor", () => {
     const decision = compactor.evaluate(snapshot(0), 0);
     expect(decision.shouldCompact).toBe(false);
   });
+
+  it("propagates AbortSignal and rejects when compaction is aborted", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { SessionStore, SessionManager } = await import("@kern/session-store");
+    const root = mkdtempSync(join(tmpdir(), "kern-compact-abort-"));
+    try {
+      const store = new SessionStore({ storageRoot: join(root, "sessions") });
+      const mgr = await SessionManager.create(store, root);
+      await mgr.appendUserMessage("hello");
+      const ac = new AbortController();
+      let receivedSignal: AbortSignal | undefined;
+      const model = {
+        info: { provider: "t", modelId: "m", contextWindow: 8000, maxOutputTokens: 1000 },
+        async *stream(req: { signal?: AbortSignal }) {
+          receivedSignal = req.signal;
+          ac.abort();
+          yield { type: "text_delta" as const, delta: "partial" };
+        },
+      };
+      const compactor = new Compactor();
+      await expect(compactor.compact(mgr, model as any, undefined, ac.signal)).rejects.toThrow(/aborted/i);
+      expect(receivedSignal).toBe(ac.signal);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

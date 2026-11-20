@@ -1,4 +1,5 @@
 import type {
+  AskUserRequest,
   JsonSchema,
   ToolContext,
   ToolDefinition,
@@ -20,6 +21,7 @@ import { spawnSandboxed, sanitizeEnv, type SandboxOptions, DEFAULT_SANDBOX_OPTIO
 import { createAuditLogger, type AuditLogger, type ToolAuditEntry } from "./audit-logger.js";
 import { HookExecutor } from "./hooks/executor.js";
 import type { HookContext, ToolInputTransformParams, ToolResponseTransformParams, PostToolUseParams, PreToolUseParams, ToolGuardParams } from "./hooks/events/contracts.js";
+import type { BackgroundJobManager } from "./tools/builtin/background.js";
 
 export { AllowAllPolicy } from "./policy.js";
 
@@ -35,6 +37,8 @@ export interface ToolRegistryOptions {
   maxToolMs?: number;
   /** Fallback approval handler when policy demands approval. */
   requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
+  /** Interactive user-question handler for the ask-user tool. */
+  askUser?: (request: AskUserRequest) => Promise<string | null>;
   /** Optional audit logger for tool execution tracking. */
   auditLogger?: AuditLogger;
   /** Session ID for audit context. */
@@ -54,6 +58,7 @@ export interface ExecuteOptions {
   origin?: PolicyInput["origin"];
   requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
   onArgRepair?: (repairs: string[]) => void;
+  onProgress?: (delta: string) => void;
 }
 
 export class ToolRegistry {
@@ -64,6 +69,7 @@ export class ToolRegistry {
   private workspaceRoot: string;
   private maxToolMs: number;
   private requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
+  private askUser?: (request: AskUserRequest) => Promise<string | null>;
   private auditLogger?: AuditLogger;
   private sessionId?: string;
   private userId?: string;
@@ -74,6 +80,7 @@ export class ToolRegistry {
     this.workspaceRoot = resolve(options.workspaceRoot);
     this.maxToolMs = options.maxToolMs ?? 120_000;
     if (options.requestApproval !== undefined) this.requestApproval = options.requestApproval;
+    if (options.askUser !== undefined) this.askUser = options.askUser;
     if (options.auditLogger !== undefined) this.auditLogger = options.auditLogger;
     if (options.sessionId !== undefined) this.sessionId = options.sessionId;
     if (options.userId !== undefined) this.userId = options.userId;
@@ -298,10 +305,13 @@ export class ToolRegistry {
       cwd: this.workspaceRoot,
       workspaceRoot: this.workspaceRoot,
       signal: ctrl.signal,
-      emitProgress: () => {},
+      emitProgress: (delta) => opts.onProgress?.(delta),
     };
     if (opts.requestApproval ?? this.requestApproval) {
       ctx.requestApproval = opts.requestApproval ?? this.requestApproval;
+    }
+    if (this.askUser) {
+      ctx.askUser = this.askUser;
     }
 
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -441,10 +451,21 @@ export function createReadTool(root: string): ToolDefinition<{ path: string; off
         const end = Math.min(lines.length, start + limit);
         const sliced = lines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`).join("\n");
         const bounded = boundText(sliced.length ? sliced : "");
+        const isPartial = start > 0 || end < lines.length;
+        const footer = isPartial
+          ? `\n\n[Lines ${start + 1}-${end} of ${lines.length}${end < lines.length ? ` — use offset=${end + 1} to read more` : ""}]`
+          : "";
+        const details: Record<string, unknown> = {};
+        if (bounded.truncated) details.truncated = true;
+        if (isPartial) {
+          details.totalLines = lines.length;
+          details.startLine = start + 1;
+          details.endLine = end;
+        }
         return {
-          content: [{ type: "text", text: bounded.text }],
+          content: [{ type: "text", text: `${bounded.text}${footer}` }],
           isError: false,
-          details: bounded.truncated ? { truncated: true } : undefined,
+          details: Object.keys(details).length > 0 ? details : undefined,
         };
       } catch (error) {
         return textResult(String(error), true, { code: "E_TOOL_FAILED" });
@@ -498,12 +519,44 @@ export function createWriteTool(root: string): ToolDefinition<{ path: string; co
   };
 }
 
+export interface EditHunk {
+  oldText: string;
+  newText: string;
+  replaceAll?: boolean;
+}
+
+function diagnoseMissingOldText(fileText: string, oldText: string): string {
+  const fileLines = fileText.split("\n");
+  const needleLines = oldText.split("\n");
+  const trimmedNeedle = needleLines.map((l) => l.trim());
+  const firstMeaningful = trimmedNeedle.find((l) => l.length > 0);
+  if (firstMeaningful) {
+    for (let i = 0; i <= fileLines.length - needleLines.length; i++) {
+      let matched = true;
+      for (let j = 0; j < needleLines.length; j++) {
+        if ((fileLines[i + j] ?? "").trim() !== trimmedNeedle[j]) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) {
+        return `oldText not found — found matching lines with different indentation/whitespace near line ${i + 1} (of ${fileLines.length}). Read that range and match exact leading whitespace.`;
+      }
+    }
+    const anchorIdx = fileLines.findIndex((l) => l.trim() === firstMeaningful);
+    if (anchorIdx !== -1) {
+      return `oldText not found — closest matching line is near line ${anchorIdx + 1} (of ${fileLines.length}); verify surrounding lines and indentation.`;
+    }
+  }
+  return `oldText not found in ${fileLines.length} lines (check exact characters, line endings, or indentation).`;
+}
+
 export function createEditTool(
   root: string,
-): ToolDefinition<{ path: string; oldText: string; newText: string; replaceAll?: boolean }> {
+): ToolDefinition<{ path: string; oldText?: string; newText?: string; replaceAll?: boolean; edits?: EditHunk[] }> {
   return {
     name: "edit",
-    description: "Replace exact text in a file",
+    description: "Replace exact text in a file (supports single edit or atomic multi-hunk edits array)",
     inputSchema: {
       type: "object",
       properties: {
@@ -511,8 +564,21 @@ export function createEditTool(
         oldText: { type: "string" },
         newText: { type: "string" },
         replaceAll: { type: "boolean" },
+        edits: {
+          type: "array",
+          description: "Optional sequential list of edits applied atomically in a single write",
+          items: {
+            type: "object",
+            properties: {
+              oldText: { type: "string" },
+              newText: { type: "string" },
+              replaceAll: { type: "boolean" },
+            },
+            required: ["oldText", "newText"],
+          },
+        },
       },
-      required: ["path", "oldText", "newText"],
+      required: ["path"],
     },
     sideEffect: "write",
     annotations: { destructiveHint: false },
@@ -523,22 +589,48 @@ export function createEditTool(
       } catch (error) {
         return textResult(String(error), true, { code: "E_TOOL_DENIED" });
       }
+      let hunks: EditHunk[];
+      if (args.edits !== undefined) {
+        if (!Array.isArray(args.edits) || args.edits.length === 0) {
+          return textResult("edits must be a non-empty array", true, { code: "E_TOOL_INVALID_ARGS" });
+        }
+        if (args.oldText !== undefined || args.newText !== undefined) {
+          return textResult("Specify either oldText/newText or edits, not both", true, { code: "E_TOOL_INVALID_ARGS" });
+        }
+        hunks = args.edits;
+      } else if (args.oldText !== undefined && args.newText !== undefined) {
+        hunks = [{ oldText: args.oldText, newText: args.newText, replaceAll: args.replaceAll }];
+      } else {
+        return textResult("Specify either oldText+newText or non-empty edits array", true, { code: "E_TOOL_INVALID_ARGS" });
+      }
+      for (let i = 0; i < hunks.length; i++) {
+        if (!hunks[i]!.oldText) {
+          return textResult(`${args.edits ? `edits[${i}].` : ""}oldText must be non-empty`, true, { code: "E_TOOL_INVALID_ARGS" });
+        }
+      }
       try {
         const text = await readFile(target, "utf8");
-        if (!text.includes(args.oldText)) return textResult("oldText not found", true);
-        let next: string;
-        let count: number;
-        if (args.replaceAll) {
-          next = text.replaceAll(args.oldText, args.newText);
-          const escaped = args.oldText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          count = (text.match(new RegExp(escaped, "g")) || []).length;
-        } else {
-          const idx = text.indexOf(args.oldText);
-          if (idx === -1) return textResult("oldText not found", true);
-          const after = text.indexOf(args.oldText, idx + 1);
-          if (after !== -1) return textResult("oldText not unique; add context or set replaceAll", true);
-          next = text.replace(args.oldText, args.newText);
-          count = 1;
+        let next = text;
+        let count = 0;
+        for (let i = 0; i < hunks.length; i++) {
+          const hunk = hunks[i]!;
+          const prefix = args.edits ? `edits[${i}]: ` : "";
+          if (!next.includes(hunk.oldText)) {
+            return textResult(`${prefix}${diagnoseMissingOldText(next, hunk.oldText)}`, true);
+          }
+          if (hunk.replaceAll) {
+            const occurrences = next.split(hunk.oldText).length - 1;
+            next = next.split(hunk.oldText).join(hunk.newText);
+            count += occurrences;
+          } else {
+            const idx = next.indexOf(hunk.oldText);
+            const after = next.indexOf(hunk.oldText, idx + 1);
+            if (after !== -1) {
+              return textResult(`${prefix}oldText not unique; add context or set replaceAll`, true);
+            }
+            next = next.slice(0, idx) + hunk.newText + next.slice(idx + hunk.oldText.length);
+            count += 1;
+          }
         }
         await writeFile(target, next, "utf8");
         const diff = unifiedHunk(text, next, 3, args.path);
@@ -553,6 +645,7 @@ export function createEditTool(
           details: {
             changedPaths: [args.path],
             replacements: count,
+            hunks: hunks.length,
             beforeLines,
             afterLines,
             lineDelta: delta,
@@ -625,23 +718,28 @@ export interface CreateBashToolOptions {
   root: string;
   timeoutMs?: number;
   sandbox?: SandboxOptions | false;
+  backgroundManager?: BackgroundJobManager;
 }
 
 export function createBashTool(
   options: CreateBashToolOptions | string,
   timeoutMs?: number,
-): ToolDefinition<{ command: string; timeoutMs?: number }> {
+): ToolDefinition<{ command: string; timeoutMs?: number; background?: boolean }> {
   const normalized: CreateBashToolOptions =
     typeof options === "string"
       ? { root: options, ...(timeoutMs !== undefined ? { timeoutMs } : {}) }
       : options;
-  const { timeoutMs: defaultTimeoutMs = 120000, sandbox = false } = normalized;
+  const { timeoutMs: defaultTimeoutMs = 120000, sandbox = false, backgroundManager } = normalized;
   return {
     name: "bash",
-    description: "Execute a shell command in the workspace",
+    description: "Execute a shell command in the workspace (set background=true for dev servers or long-running processes)",
     inputSchema: {
       type: "object",
-      properties: { command: { type: "string" }, timeoutMs: { type: "integer" } },
+      properties: {
+        command: { type: "string" },
+        timeoutMs: { type: "integer" },
+        background: { type: "boolean", description: "Run command in the background and return a jobId immediately for bash-status/bash-stop" },
+      },
       required: ["command"],
     },
     sideEffect: "execute",
@@ -652,6 +750,13 @@ export function createBashTool(
       const useSandbox = sandbox !== false;
       const sandboxOpts = useSandbox ? { ...sandbox, maxCpuTimeMs: t } : false;
 
+      if (args.background === true) {
+        if (!backgroundManager) {
+          return textResult("Background bash execution requires a session backgroundManager", true, { code: "E_TOOL_FAILED" });
+        }
+        return await backgroundManager.start(cmd, ctx.workspaceRoot, sandboxOpts);
+      }
+
       return await new Promise<ToolResult>((resolvePromise) => {
         let settled = false;
         let sandboxResult: Awaited<ReturnType<typeof spawnSandboxed>> | null = null;
@@ -659,13 +764,42 @@ export function createBashTool(
         let killTimer: ReturnType<typeof setTimeout> | undefined;
         let onAbort: (() => void) | undefined;
 
+        const spawnUnsandboxed = () => {
+          const proc = spawn("bash", ["-c", cmd], {
+            cwd: ctx.workspaceRoot,
+            env: sanitizeEnv(process.env),
+            stdio: "pipe",
+            detached: process.platform !== "win32",
+            windowsHide: true,
+          });
+          let cleaned = false;
+          return {
+            process: proc,
+            cleanup: async () => {
+              if (cleaned) return;
+              cleaned = true;
+              killTree(proc, "SIGTERM");
+            },
+            active: false,
+          };
+        };
+
+        const terminateProcess = (proc: ChildProcess) => {
+          if (sandboxResult) void sandboxResult.cleanup();
+          else killTree(proc, "SIGTERM");
+          if (!killTimer) {
+            killTimer = setTimeout(() => {
+              killTree(proc, "SIGKILL");
+            }, 500);
+            if (typeof killTimer.unref === "function") killTimer.unref();
+          }
+        };
+
         const finish = (result: ToolResult) => {
           if (settled) return;
           settled = true;
           if (timer) clearTimeout(timer);
-          if (killTimer) clearTimeout(killTimer);
           if (onAbort) ctx.signal.removeEventListener("abort", onAbort);
-          if (sandboxResult) sandboxResult.cleanup();
           resolvePromise(result);
         };
 
@@ -676,6 +810,11 @@ export function createBashTool(
         let stderrCapped = false;
 
         const run = async () => {
+          if (ctx.signal.aborted) {
+            finish(textResult("Command aborted", true, { code: "E_CANCELLED", exitCode: -1, durationMs: 0 }));
+            return;
+          }
+
           if (sandboxOpts) {
             try {
               sandboxResult = await spawnSandboxed("bash", ["-c", cmd], {
@@ -686,97 +825,101 @@ export function createBashTool(
             } catch {
               // Namespace isolation unavailable (e.g. no unshare support);
               // fall back to plain spawn without sandboxing.
-              sandboxResult = {
-                process: spawn("bash", ["-c", cmd], {
-                  cwd: ctx.workspaceRoot,
-                  env: sanitizeEnv(process.env),
-                  stdio: "pipe",
-                  detached: process.platform !== "win32",
-                  windowsHide: true,
-                }),
-                cleanup: async () => {},
-                active: false,
-              };
+              sandboxResult = spawnUnsandboxed();
             }
           } else {
-              sandboxResult = {
-                process: spawn("bash", ["-c", cmd], {
-                  cwd: ctx.workspaceRoot,
-                  env: sanitizeEnv(process.env),
-                  stdio: "pipe",
-                  detached: process.platform !== "win32",
-                  windowsHide: true,
-                }),
-                cleanup: async () => {},
-                active: false,
-              };
+            sandboxResult = spawnUnsandboxed();
+          }
+
+          const proc = sandboxResult.process;
+
+          timer = setTimeout(() => {
+            terminateProcess(proc);
+            const durationMs = Date.now() - startedAt;
+            const out = boundText(stdout);
+            const err = boundText(stderr);
+            let text = `Exit code: 124 (timeout after ${t}ms)\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
+            if (out.text) text += `\nstdout:\n${out.text}`;
+            if (err.text) text += `\nstderr:\n${err.text}`;
+            finish({
+              content: [{ type: "text", text }],
+              isError: true,
+              details: { code: "E_TOOL_TIMEOUT", exitCode: 124, durationMs, timeoutMs: t, sandboxed: sandboxResult?.active ?? false },
+            });
+          }, t);
+          if (typeof timer.unref === "function") timer.unref();
+
+          onAbort = () => {
+            terminateProcess(proc);
+            const durationMs = Date.now() - startedAt;
+            const out = boundText(stdout);
+            const err = boundText(stderr);
+            let text = `Command aborted\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
+            if (out.text) text += `\nstdout:\n${out.text}`;
+            if (err.text) text += `\nstderr:\n${err.text}`;
+            finish({
+              content: [{ type: "text", text }],
+              isError: true,
+              details: {
+                code: "E_CANCELLED",
+                exitCode: -1,
+                durationMs,
+                timeoutMs: t,
+                sandboxed: sandboxResult?.active ?? false,
+              },
+            });
+          };
+          if (ctx.signal.aborted) onAbort();
+          else ctx.signal.addEventListener("abort", onAbort, { once: true });
+
+          if (proc.stdout) {
+            proc.stdout.on("data", (d: Buffer) => {
+              const chunk = d.toString();
+              if (stdout.length < MAX_CAPTURE_BYTES) stdout += chunk;
+              else stdoutCapped = true;
+              ctx.emitProgress?.(chunk);
+            });
+          }
+          if (proc.stderr) {
+            proc.stderr.on("data", (d: Buffer) => {
+              const chunk = d.toString();
+              if (stderr.length < MAX_CAPTURE_BYTES) stderr += chunk;
+              else stderrCapped = true;
+              ctx.emitProgress?.(chunk);
+            });
+          }
+          proc.on("close", (code, signal) => {
+            if (killTimer) {
+              clearTimeout(killTimer);
+              killTimer = undefined;
             }
-
-            const proc = sandboxResult.process;
-
-            timer = setTimeout(() => {
-              if (sandboxResult) sandboxResult.cleanup();
-              killTimer = setTimeout(() => {
-                if (sandboxResult) sandboxResult.cleanup();
-              }, 2000);
-              const durationMs = Date.now() - startedAt;
-              const out = boundText(stdout);
-              const err = boundText(stderr);
-              let text = `Exit code: 124 (timeout after ${t}ms)\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
-              if (out.text) text += `\nstdout:\n${out.text}`;
-              if (err.text) text += `\nstderr:\n${err.text}`;
-              finish({
-                content: [{ type: "text", text }],
-                isError: true,
-                details: { code: "E_TOOL_TIMEOUT", exitCode: 124, durationMs, timeoutMs: t, sandboxed: sandboxResult?.active ?? false },
-              });
-            }, t);
-
-            onAbort = () => {
-              if (sandboxResult) sandboxResult.cleanup();
-              killTimer = setTimeout(() => {
-                if (sandboxResult) sandboxResult.cleanup();
-              }, 2000);
-            };
-            if (ctx.signal.aborted) onAbort();
-            else ctx.signal.addEventListener("abort", onAbort, { once: true });
-
-            if (proc.stdout) {
-              proc.stdout.on("data", (d: Buffer) => {
-                if (stdout.length < MAX_CAPTURE_BYTES) stdout += d.toString();
-                else stdoutCapped = true;
-              });
+            const durationMs = Date.now() - startedAt;
+            const out = boundText(stdout);
+            const err = boundText(stderr);
+            let text = `Exit code: ${code ?? -1}${signal ? ` (signal ${signal})` : ""}\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
+            if (out.text) text += `\nstdout:\n${out.text}`;
+            if (err.text) text += `\nstderr:\n${err.text}`;
+            finish({
+              content: [{ type: "text", text }],
+              isError: code !== 0,
+              details: {
+                exitCode: code ?? -1,
+                durationMs,
+                stdoutTruncated: out.truncated || stdoutCapped,
+                stderrTruncated: err.truncated || stderrCapped,
+                timeoutMs: t,
+                sandboxed: sandboxResult?.active ?? false,
+              },
+            });
+          });
+          proc.on("error", (e) => {
+            if (killTimer) {
+              clearTimeout(killTimer);
+              killTimer = undefined;
             }
-            if (proc.stderr) {
-              proc.stderr.on("data", (d: Buffer) => {
-                if (stderr.length < MAX_CAPTURE_BYTES) stderr += d.toString();
-                else stderrCapped = true;
-              });
-            }
-            proc.on("close", (code, signal) => {
-              const durationMs = Date.now() - startedAt;
-              const out = boundText(stdout);
-              const err = boundText(stderr);
-              let text = `Exit code: ${code ?? -1}${signal ? ` (signal ${signal})` : ""}\nDuration: ${(durationMs / 1000).toFixed(1)}s\n`;
-              if (out.text) text += `\nstdout:\n${out.text}`;
-              if (err.text) text += `\nstderr:\n${err.text}`;
-              finish({
-                content: [{ type: "text", text }],
-                isError: code !== 0,
-                details: {
-                  exitCode: code ?? -1,
-                  durationMs,
-                  stdoutTruncated: out.truncated || stdoutCapped,
-                  stderrTruncated: err.truncated || stderrCapped,
-                  timeoutMs: t,
-                  sandboxed: sandboxResult?.active ?? false,
-                },
-              });
-        });
-        proc.on("error", (e) => {
-          finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
-        });
-    };
+            finish(textResult(String(e), true, { code: "E_TOOL_FAILED" }));
+          });
+        };
 
         run();
       });

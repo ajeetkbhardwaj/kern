@@ -4,7 +4,6 @@ export * from "./policy.js";
 export * from "./path-safety.js";
 export * from "./agentignore.js";
 export * from "./validate-args.js";
-export * from "./mcp-bridge.js";
 export * from "./bash-sandbox.js";
 export * from "./audit-logger.js";
 export * from "./hooks/index.js";

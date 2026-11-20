@@ -95,3 +95,69 @@ export function createTodoTool(_root: string): ToolDefinition<{
     },
   };
 }
+
+export function createAskUserTool(): ToolDefinition<{
+  question: string;
+  options?: string[];
+  allowCustom?: boolean;
+}> {
+  return {
+    name: "ask-user",
+    description: "Ask the user a clarifying question mid-turn and wait for their answer (interactive TTY/TUI only)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "Clear, concise question for the user" },
+        options: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional list of choices to present to the user",
+        },
+        allowCustom: {
+          type: "boolean",
+          default: true,
+          description: "When options are provided, also let the user type a custom response",
+        },
+      },
+      required: ["question"],
+    },
+    sideEffect: "read",
+    annotations: { readOnlyHint: true },
+    async execute(args, ctx): Promise<ToolResult> {
+      const q = args.question.trim();
+      if (!q) return textResult("question must be non-empty", true, { code: "E_TOOL_INVALID_ARGS" });
+      if (!ctx.askUser) {
+        return textResult("Interactive user input is unavailable in headless/non-TTY mode.", true, {
+          code: "E_TOOL_DENIED",
+          reason: "no_ask_user_handler",
+        });
+      }
+      if (ctx.signal.aborted) {
+        return textResult("ask-user aborted", true, { code: "E_CANCELLED" });
+      }
+      try {
+        const answer = await ctx.askUser({
+          question: q,
+          ...(args.options && args.options.length > 0 ? { options: args.options } : {}),
+          ...(args.allowCustom !== undefined ? { allowCustom: args.allowCustom } : {}),
+        });
+        if (answer === null) {
+          return {
+            content: [{ type: "text", text: "User cancelled the prompt without answering." }],
+            isError: false,
+            details: { cancelled: true },
+          };
+        }
+        return {
+          content: [{ type: "text", text: `User answered: ${answer}` }],
+          isError: false,
+          details: { answer },
+        };
+      } catch (error) {
+        return textResult(`ask-user failed: ${error instanceof Error ? error.message : String(error)}`, true, {
+          code: "E_TOOL_FAILED",
+        });
+      }
+    },
+  };
+}

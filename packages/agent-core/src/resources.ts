@@ -162,3 +162,39 @@ export function buildResourceSection(ctx: ProjectContext): string {
   }
   return sections.join("\n\n");
 }
+
+/**
+ * Expand a `/skill:<name> [prompt]` invocation against discovered project skills.
+ * Returns null if the input is not a `/skill:...` invocation.
+ */
+export async function resolveSkillInvocation(
+  input: string,
+  cwd: string,
+  loader: ResourceLoader = new ResourceLoader(),
+): Promise<{ matched: boolean; skill?: SkillMeta; expandedPrompt?: string; error?: string }> {
+  const m = input.trim().match(/^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/i);
+  if (!m) return { matched: false };
+  const targetName = (m[1] ?? "").trim();
+  const remainder = (m[2] ?? "").trim();
+  const project = await loader.load(cwd);
+  const skill = project.skills.find((s) => s.name.toLowerCase() === targetName.toLowerCase());
+  if (!skill) {
+    const available = project.skills.map((s) => s.name).join(", ");
+    return {
+      matched: true,
+      error: available
+        ? `Unknown skill "${targetName}". Available skills: ${available}`
+        : `Unknown skill "${targetName}" (no skills found in .agents/skills or .pi/skills).`,
+    };
+  }
+  let body = "";
+  try {
+    body = (await readFile(skill.path, "utf8")).slice(0, 40_000);
+  } catch (err) {
+    return { matched: true, skill, error: `Failed to read skill "${skill.name}": ${String(err)}` };
+  }
+  const task = remainder || `Follow the instructions in skill "${skill.name}".`;
+  const expandedPrompt = `<skill name="${skill.name}" path="${skill.path}">\n${body}\n</skill>\n\n${task}`;
+  return { matched: true, skill, expandedPrompt };
+}
+

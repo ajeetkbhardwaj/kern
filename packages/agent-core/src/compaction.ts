@@ -132,7 +132,13 @@ export class Compactor {
    * If a previous checkpoint exists, it is fed back in so the new
    * summary is an update, not a lossy rewrite from scratch.
    */
-  async compact(sessions: SessionManager, model: ModelAdapter, instructions?: string): Promise<{ summary: string; replacesThroughId: string }> {
+  async compact(
+    sessions: SessionManager,
+    model: ModelAdapter,
+    instructions?: string,
+    signal?: AbortSignal,
+  ): Promise<{ summary: string; replacesThroughId: string }> {
+    if (signal?.aborted) throw new Error("Compaction aborted");
     const path = sessions.getActivePath();
     const messageEntries = path.filter((e) => e.type === "message");
     if (messageEntries.length === 0) {
@@ -163,7 +169,9 @@ export class Compactor {
       messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: new Date().toISOString() }],
       tools: [],
       maxOutputTokens: this.outputReserve,
+      ...(signal ? { signal } : {}),
     })) {
+      if (signal?.aborted) throw new Error("Compaction aborted");
       assembler.apply(event);
     }
     const message = assembler.finalize();

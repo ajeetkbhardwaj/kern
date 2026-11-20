@@ -56,4 +56,30 @@ describe("session invariants", () => {
     expect(result.valid).toBe(false);
     expect(result.errors.some((e) => e.includes("seq decreased"))).toBe(true);
   });
+
+  it("preserves monotonic seq across SessionStore write and SessionManager.resume", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { SessionStore } = await import("../src/jsonl-store.js");
+    const { SessionManager } = await import("../src/session-manager.js");
+    const root = mkdtempSync(join(tmpdir(), "kern-seq-"));
+    try {
+      const store = new SessionStore({ storageRoot: join(root, "sessions") });
+      const created = await SessionManager.create(store, root);
+      const u1 = await created.appendUserMessage("one");
+      const u2 = await created.appendUserMessage("two");
+      expect(u1.seq).toBe(1);
+      expect(u2.seq).toBe(2);
+
+      const resumed = await SessionManager.resume(store, root, created.sessionFile!);
+      const entries = resumed.getActivePath();
+      expect(entries.find((e) => e.id === u1.id)?.seq).toBe(1);
+      expect(entries.find((e) => e.id === u2.id)?.seq).toBe(2);
+      const u3 = await resumed.appendUserMessage("three");
+      expect(u3.seq).toBe(3);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

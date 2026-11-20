@@ -13,10 +13,7 @@
     "@kern/model": "*",
     "@kern/session-store": "*",
     "@kern/tools": "*",
-    "@kern/agent-core": "*",
-    "@kern/repo-index": "*",
-    "@kern/symbol-store": "*",
-    "@kern/semantic-search": "*",
-    "@kern/project-memory": "*"
+    "@kern/connects": "*",
+    "@kern/agent-core": "*"
   }
 }

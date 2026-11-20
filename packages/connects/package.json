@@ -1,9 +1,9 @@
 {
-  "name": "@kern/repo-index",
+  "name": "@kern/connects",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Workspace indexing for repo-aware context selection.",
+  "description": "External MCP and tool connector hub for Kern (stdio, Streamable HTTP, SSE, presets, live registry sync).",
   "exports": {
     ".": "./src/index.ts"
   },

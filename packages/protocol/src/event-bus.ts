@@ -1,4 +1,4 @@
-import { newId, now, type Logger, createLogger, type AgentEvent, type AgentEventListener, type Unsubscribe } from "@kern/protocol";
+import { type Logger, createLogger, type AgentEvent, type AgentEventListener, type Unsubscribe } from "@kern/protocol";
 
 export class AgentEventBus {
   private listeners = new Set<AgentEventListener>();

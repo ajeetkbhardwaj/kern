@@ -1,17 +1,22 @@
 import { AgentRuntime, ContextBuilder, EventBus, Compactor, ResourceLoader, buildResourceSection } from "@kern/agent-core";
 import { SessionManager, SessionStore } from "@kern/session-store";
 import {
+  BackgroundJobManager,
   ToolRegistry,
   createReadTool,
   createWriteTool,
   createEditTool,
   createBashTool,
+  createBashStatusTool,
+  createBashStopTool,
   createGitStatusTool,
   createGitDiffTool,
   createGitLogTool,
   createGrepTool,
   createFindTool,
   createTodoTool,
+  createWebFetchTool,
+  createAskUserTool,
   DefaultPolicy,
   DEFAULT_POLICY_CONFIG,
   DEFAULT_SAFETY_POLICY_CONFIG,
@@ -20,14 +25,12 @@ import {
   getDefaultSessionHooks,
   registerDefaultBuiltinHandlers,
   loadDefaultHookConfigs,
+  type AuditLogger,
   type PolicyConfig,
 } from "@kern/tools";
-import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition, type CostSnapshot } from "@kern/protocol";
+import { createLogger, type AskUserRequest, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition, type CostSnapshot } from "@kern/protocol";
+import { ConnectManager, type LoadMcpConfigsOptions } from "@kern/connects";
 import type { BudgetLimits, BudgetUsage, ContextUsage } from "@kern/agent-core";
-import { RepoIndex } from "@kern/repo-index";
-import { SymbolStore } from "@kern/symbol-store";
-import { SemanticSearch } from "@kern/semantic-search";
-import { ProjectMemory, ProjectMemoryStore } from "@kern/project-memory";
 import { SettingsManager, type PermissionRulesSettings } from "./settings.js";
 
 export interface CreateAgentSessionOptions {
@@ -44,6 +47,8 @@ export interface CreateAgentSessionOptions {
   budgets?: Partial<BudgetLimits>;
   /** Approval callback for write/exec/destructive ops. Absent = deny. */
   requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
+  /** Interactive user-question callback for ask-user tool. Absent = unavailable. */
+  askUser?: (request: AskUserRequest) => Promise<string | null>;
   /** Load AGENTS.md + skill catalog into the system prompt. Default true. */
   loadResources?: boolean;
   /** Compact automatically at safe boundaries. Default true. */
@@ -52,14 +57,22 @@ export interface CreateAgentSessionOptions {
   model?: ModelAdapter;
   /** Ordered fallback adapters to use if the primary model fails on a turn. */
   fallbackModels?: ModelAdapter[];
-  /** Opt-in extra tools (e.g. MCP bridge). Registered after built-ins; name collisions are refused. */
+  /** Opt-in extra tools. Registered after built-ins; name collisions are refused. */
   extraTools?: ToolDefinition[];
+  /** Auto-discover and connect MCP servers from mcp.json / env. Default true. */
+  enableConnects?: boolean;
+  /** Optional MCP config options (extraConfigPaths, allowProjectStdio, etc.). */
+  connectsOptions?: LoadMcpConfigsOptions;
+  /** Optional pre-created ConnectManager instance. */
+  connectManager?: ConnectManager;
   /** Default reasoning mode for the active model. */
   thinkingLevel?: ThinkingLevel;
   /** Resume the most recent session instead of creating a new one. */
   resume?: boolean;
   /** Resume a specific session by session ID or file path. */
   resumeSession?: string;
+  /** Optional audit logger for tool executions. */
+  auditLogger?: AuditLogger;
 }
 
 export interface AgentSession {
@@ -67,6 +80,7 @@ export interface AgentSession {
   subscribe(listener: AgentEventListener): () => void;
   budgetUsage(): BudgetUsage;
   budgetLimits?(): BudgetLimits;
+  setBudgetLimits?(limits: Partial<BudgetLimits>): BudgetLimits;
   isBusy(): boolean;
   setModel(adapter: ModelAdapter): Promise<void>;
   modelInfo(): ModelInfo;
@@ -101,6 +115,8 @@ export interface AgentSession {
   listSessions?(): Promise<string[]>;
   usageSummary?(): CostSnapshot;
   exportMarkdown?(): string;
+  /** Live MCP / external connector hub for this session. */
+  connects?: ConnectManager;
 }
 
 export interface AgentSessionRuntime {
@@ -178,24 +194,54 @@ async function buildSessionWithRuntime(
     logger.warn("hook_config_load_failed", { error: error instanceof Error ? error.message : String(error) });
   });
   const hookExecutor = new HookExecutor(hookRegistry);
+  const backgroundJobs = new BackgroundJobManager();
   const tools = new ToolRegistry({
     workspaceRoot: options.cwd,
     policy,
     maxToolMs: 120_000,
     requestApproval: options.requestApproval,
+    askUser: options.askUser,
+    ...(options.auditLogger ? { auditLogger: options.auditLogger } : {}),
     sessionId: manager.sessionId ?? undefined,
     hookExecutor,
   });
   tools.register(createReadTool(options.cwd));
   tools.register(createWriteTool(options.cwd));
   tools.register(createEditTool(options.cwd));
-  tools.register(createBashTool({ root: options.cwd }));
+  tools.register(createBashTool({ root: options.cwd, backgroundManager: backgroundJobs }));
+  tools.register(createBashStatusTool(backgroundJobs));
+  tools.register(createBashStopTool(backgroundJobs));
   tools.register(createGitStatusTool(options.cwd));
   tools.register(createGitDiffTool(options.cwd));
   tools.register(createGitLogTool(options.cwd));
   tools.register(createGrepTool(options.cwd));
   tools.register(createFindTool(options.cwd));
   tools.register(createTodoTool(options.cwd));
+  tools.register(createWebFetchTool());
+  tools.register(createAskUserTool());
+
+  const ownsConnectManager = !options.connectManager;
+  const connectManager =
+    options.connectManager ??
+    new ConnectManager({
+      cwd: options.cwd,
+      logger,
+      ...(options.connectsOptions ?? {}),
+    });
+  connectManager.bindRegistry(tools);
+  if (options.enableConnects !== false && ownsConnectManager) {
+    try {
+      const { warnings } = await connectManager.discoverAndConnect();
+      for (const w of warnings) {
+        logger.warn("mcp_connect_notice", { message: w });
+      }
+    } catch (error) {
+      logger.warn("mcp_connect_disabled", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   for (const extra of options.extraTools ?? []) {
     if (tools.has(extra.name)) {
       logger.warn("extra_tool_name_collision", { name: extra.name });
@@ -206,41 +252,10 @@ async function buildSessionWithRuntime(
 
   const events = new EventBus(logger);
 
-  const repoIndex = new RepoIndex({ root: options.cwd });
-  const symbolStore = new SymbolStore(repoIndex);
-  const semanticSearch = new SemanticSearch(repoIndex, symbolStore);
-  const projectMemory = new ProjectMemory(new ProjectMemoryStore({ root: options.cwd }));
-  const repoResolver = async (query: string): Promise<import("@kern/agent-core").RepoAwareContext> => {
-    const intent = {
-      query,
-      fileHints: query.split(/\s+/).filter((part) => part.length > 2),
-      symbolHints: query.split(/\s+/).filter((part) => /[A-Z]/.test(part) || part.includes("-") || part.includes("_")),
-    };
-    let hits: Awaited<ReturnType<typeof semanticSearch.retrieve>> = [];
-    let notes: Awaited<ReturnType<typeof projectMemory.search>> = [];
-    try {
-      hits = await semanticSearch.retrieve(intent);
-    } catch (error) {
-      logger.warn("repo_context_search_failed", { error: error instanceof Error ? error.message : String(error) });
-    }
-    try {
-      notes = await projectMemory.search(query);
-    } catch (error) {
-      logger.warn("project_memory_search_failed", { error: error instanceof Error ? error.message : String(error) });
-    }
-    return {
-      query,
-      likelyFiles: hits.slice(0, 8).map((hit) => hit.path),
-      relevantSymbols: [...new Set(hits.flatMap((hit) => hit.symbolMatches ?? []))].slice(0, 12),
-      projectNotes: notes.slice(0, 5).map((note) => `${note.type}: ${note.content}`),
-    };
-  };
-
   const contextBuilder = new ContextBuilder({
     baseSystemPrompt: "You are Kern, a minimal coding agent. Use tools when needed.",
     toolRegistry: tools,
     logger,
-    repoResolver,
   });
 
   if (options.loadResources !== false) {
@@ -286,6 +301,7 @@ async function buildSessionWithRuntime(
     subscribe: (l) => events.subscribe(l),
     budgetUsage: () => runtime.budgetUsage(),
     budgetLimits: () => runtime.budgetLimits(),
+    setBudgetLimits: (limits) => runtime.setBudgetLimits(limits),
     isBusy: () => runtime.isBusy(),
     setModel: (adapter) => runtime.setModel(adapter),
     modelInfo: () => runtime.modelInfo(),
@@ -300,7 +316,12 @@ async function buildSessionWithRuntime(
     allowToolForSession: (toolName) => runtime.allowToolForSession(toolName),
     toolNames: () => runtime.toolNames(),
     callToolAsUser: (name, args, signal) => runtime.callToolAsUser(name, args, signal),
-    dispose: () => runtime.dispose(),
+    dispose: () => {
+      void backgroundJobs.dispose();
+      if (ownsConnectManager) void connectManager.dispose();
+      runtime.dispose();
+    },
+    connects: connectManager,
     isDisposed: () => runtime.isDisposed(),
     sessionName: () => manager.sessionName,
     activeLeafId: () => manager.activeLeafId,

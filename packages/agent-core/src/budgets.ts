@@ -63,6 +63,15 @@ export class BudgetTracker {
     return { ...this.limits };
   }
 
+  updateLimits(partial: Partial<BudgetLimits>): BudgetLimits {
+    for (const [k, v] of Object.entries(partial)) {
+      if (v !== undefined) {
+        (this.limits as unknown as Record<string, number>)[k] = v;
+      }
+    }
+    return this.limitsSnapshot;
+  }
+
   usage(): BudgetUsage {
     return {
       inputTokens: this.inputTokens,

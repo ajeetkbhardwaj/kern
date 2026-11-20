@@ -6,15 +6,15 @@
 
 ## 1. First-Principle Question
 
-How do 12 small, focused packages compose into a minimal, from-first-principles terminal coding agent — without a heavy framework — while keeping boundaries clean, dependencies explicit, and each package independently testable?
+How do 8 small, focused packages compose into a minimal, from-first-principles terminal coding agent — without a heavy framework — while keeping boundaries clean, dependencies explicit, and each package independently testable?
 
 ---
 
 ## 2. Mental Model
 
-Kern (Pi-style) is a monorepo of 12 workspace packages under `packages/`. Each package has a single responsibility and depends only on what it needs (mostly `@kern/protocol`). Composition happens in `@kern/coding-agent` (`createAgentSession`), which wires agent-core, session-store, tools, model, repo-index, symbol-store, semantic-search, and project-memory into an `AgentSession` facade.
+Kern (Pi-style) is a monorepo of 8 workspace packages under `packages/`. Each package has a single responsibility and depends only on what it needs (mostly `@kern/protocol`). Composition happens in `@kern/coding-agent` (`createAgentSession`), which wires agent-core, session-store, tools, and model into an `AgentSession` facade.
 
-The **protocol package** is the narrow waist: zero runtime behavior, only shared types/contracts. Every cross-package shape lives there. The **agent-core** is the agent loop (turn runner, context builder, compactor, budgets, retry, event bus, resource loader). The **tools** package is the capability layer (registry, policy, built-in read/write/edit/bash, optional MCP bridge). Everything else is a supporting concern: model (provider adapters + discovery), session-store (JSONL + branch tree), repo-index/symbol-store/semantic-search (repo-aware retrieval), project-memory (explicit notes), cli (entry point), and tui (interactive UI).
+The **protocol package** is the narrow waist: zero runtime behavior, only shared types/contracts. Every cross-package shape lives there. The **agent-core** is the agent loop (turn runner, context builder, compactor, budgets, retry, event bus, resource loader). The **tools** package is the capability layer (registry, policy, built-in read/write/edit/bash/git/grep/find/todo, optional MCP bridge). Everything else is a supporting concern: model (provider adapters + discovery), session-store (JSONL + branch tree), cli (entry point), and tui (interactive UI).
 
 ---
 
@@ -28,10 +28,6 @@ The **protocol package** is the narrow waist: zero runtime behavior, only shared
 | `@kern/tools` | Tool contract, registry, policy engine, built-in read/write/edit/bash, optional MCP bridge | `@kern/protocol`, zod |
 | `@kern/model` | Provider-neutral model adapter (OpenAI-compatible), model discovery, credential resolution | `@kern/protocol` |
 | `@kern/coding-agent` | Composition root: `createAgentSession`, `AgentSession` facade, settings | All of the above |
-| `@kern/repo-index` | Workspace indexing: file records, imports/exports, FileGraph | `@kern/protocol` |
-| `@kern/symbol-store` | Lightweight TS/JS symbol extraction and lookup | `@kern/repo-index`, `@kern/protocol` |
-| `@kern/semantic-search` | Repo-aware retrieval + ranking; ReadStrategy/ReadPlan | `@kern/repo-index`, `@kern/symbol-store`, `@kern/protocol` |
-| `@kern/project-memory` | Explicit project notes (decision/architecture/bug/pattern/task) persisted to JSON | `@kern/protocol` |
 | `@kern/cli` | CLI entry point: flag parsing, model resolution, session creation, TUI or print mode | `@kern/coding-agent`, `@kern/model`, `@kern/tools`, `@kern/tui` |
 | `@kern/tui` | Interactive terminal UI: transcript, tool cards, approval dialog, model picker, connect wizard, slash commands | `@earendil-works/pi-tui`, `@kern/coding-agent`, `@kern/model`, `@kern/protocol`, `@kern/session-store` |
 
@@ -57,10 +53,6 @@ flowchart TD
     AgentCore --> Model[ModelAdapter]
     AgentCore --> Sessions[SessionManager]
     
-    CB --> RI[RepoIndex]
-    CB --> Sym[SymbolStore]
-    CB --> SS[SemanticSearch]
-    CB --> PM[ProjectMemory]
     CB --> Tools
     
     Tools --> BuiltIn[read/write/edit/bash]
@@ -93,8 +85,6 @@ flowchart TD
     RT --> SM1[SessionManager.appendUserMessage]
     SM1 --> CI[ensureCompactIfNeeded before_prompt]
     CI --> CB[ContextBuilder.build]
-    CB -->|repoResolver| RI[RepoIndex + SymbolStore + SemanticSearch]
-    CB -->|projectMemory| PM[ProjectMemory.search]
     CB -->|AGENTS.md + skills| ResourceLoader[ResourceLoader]
     CB --> TR[ToolRegistry.listModelSchemas]
     CB --> CT[countContextTokens]
@@ -124,7 +114,7 @@ flowchart TD
 
 1. **`@kern/protocol` has no runtime deps** (except zod for schemas). It's the foundation everything imports.
 2. **No package imports `@kern/coding-agent`** — it's the composition root (leaf in the import graph).
-3. **`@kern/agent-core` depends on protocol, model, session-store, tools** — but not on cli, tui, repo-index, etc.
+3. **`@kern/agent-core` depends on protocol, model, session-store, tools** — not on cli or tui.
 4. **`@kern/tools` depends only on protocol** (+ zod) — the MCP bridge is opt-in and fail-closed.
 5. **`@kern/model` depends only on protocol** — no coupling to agent-core or tools.
 6. **`@kern/session-store` depends only on protocol** — pure persistence.
@@ -148,7 +138,7 @@ flowchart TD
 
 ## 8. Design Rules
 
-1. One responsibility per package; 12 packages, each under ~500 lines of core logic.
+1. One responsibility per package; 8 focused packages.
 2. Composition happens in `@kern/coding-agent` (`createAgentSession`); no package imports it.
 3. The protocol is the narrow waist — all cross-package shapes live there, nowhere else.
 4. The agent core is dependency-minimal: protocol + model + session-store + tools only.
@@ -160,7 +150,7 @@ flowchart TD
 
 ## 9. Checkpoint
 
-- [ ] 12 packages cataloged with responsibilities and dependencies
+- [ ] 8 packages cataloged with responsibilities and dependencies
 - [ ] Composition root identified: `@kern/coding-agent` → `createAgentSession`
 - [ ] Narrow waist: `@kern/protocol` with zero runtime behavior
 - [ ] End-to-end turn data flow diagrammed

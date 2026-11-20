@@ -1,32 +1,37 @@
 /**
  * @kern/tui — interactive orchestrator on @earendil-works/pi-tui.
  *
- * Main-screen renderer (native scrollback), transcript Container, streaming
- * Markdown with syntax highlighting, Editor with slash/file completion,
- * SelectList overlays for approvals / model picker / history, Loader
- * spinner while busy. Observes `AgentEvent`s; acts only via `AgentSession`.
- *
- * pi-tui adaptation notes:
- * - Overlays are shown with `showOverlay(c, {anchor:"center", width:"80%",
- *   maxHeight:"80%"})`, which returns a handle with `.hide()`.
- * - SelectList takes no title and no disabled items: titles render as a
- *   `Text` header above the list, and unavailable options get a suffix with
- *   their selection ignored.
- * - Editor has no onEscape: prompt dialogs emulate Esc-cancel via the
- *   input listener, which runs BEFORE focused components (a handled Esc
- *   returns `{consume:true}` to preempt the dialog's editor).
- * - Input keys reach the focused component; overlay roots are wrapped in a
- *   local `OverlayDialog` that forwards keys to the interactive child.
+ * Fullscreen alt-screen TUI with scrollable viewport, live inline transcript search,
+ * session history replay, streaming Markdown with syntax highlighting, Editor with
+ * slash/file/skill completion, command palette, and SelectList overlays.
+ * Observes `AgentEvent`s; acts only via `AgentSession`.
  */
 
-import { writeFile, readFile, stat, mkdir, unlink, readdir } from "node:fs/promises";
+import { writeFile, readFile, stat, mkdir, unlink } from "node:fs/promises";
 import { join, resolve, dirname, relative } from "node:path";
 import { spawn } from "node:child_process";
-import type { AgentEvent, Logger, ModelAdapter } from "@kern/protocol";
+import type { AgentEvent, AskUserRequest, Logger, ModelAdapter, ThinkingLevel } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
-import type { AgentSession } from "@kern/coding-agent";
+import { ResourceLoader, resolveSkillInvocation, type AgentSession } from "@kern/coding-agent";
+import { CONNECTOR_PRESETS, type McpServerConfigEntry, type McpServerStatus } from "@kern/connects";
 import type { SessionManager } from "@kern/session-store";
-import { createAdapterFor, discoverModels, loadModelsFile, readLastUsed, recordLastUsed, resolveApiKey, saveAuthKey, saveProviderToUserFile, testProvider, PROVIDER_PRESETS, type ModelsFile, type ProviderConfig } from "@kern/model";
+import {
+  clearAuthKey,
+  createAdapterFor,
+  discoverModels,
+  loadAuth,
+  loadModelsFile,
+  maskKey,
+  readLastUsed,
+  recordLastUsed,
+  resolveApiKey,
+  saveAuthKey,
+  saveProviderToUserFile,
+  testProvider,
+  PROVIDER_PRESETS,
+  type ModelsFile,
+  type ProviderConfig,
+} from "@kern/model";
 import {
   TuiAltScreen,
   ProcessTerminal,
@@ -36,15 +41,34 @@ import {
   ScrollView,
   VStack,
   HStack,
+  KeybindingsManager,
+  TUI_KEYBINDINGS,
+  setKeybindings,
   matchesKey,
   type Component,
   type OverlayHandle,
 } from "@earendil-works/pi-tui";
 import { KillRing } from "@earendil-works/pi-tui/dist/kill-ring.js";
-import { theme, buildMarkdownTheme, buildSelectTheme, buildEditorTheme } from "./theme.js";
+import { theme, statusBg, buildMarkdownTheme, buildSelectTheme, buildEditorTheme } from "./theme.js";
 import { Box, StatusBar, ToolCard, Rule, SidebarPanel, Container, Text, Spacer, CollapsibleText } from "./components.js";
 import { buildAutocomplete } from "./autocomplete.js";
-import { homedir } from "node:os";
+import {
+  TUI_COMMANDS,
+  TUI_HINTS,
+  QUICK_HELP,
+  INVISIBLE_RE,
+  isDestructiveApproval,
+  cmdPatternFromPrompt,
+  formatReasoningSteps,
+  parseBudgetArgs,
+  resolveExportPath,
+  buildSessionExportMarkdown,
+  collectReplayItems,
+  loadTuiState,
+  saveTuiState,
+  summarizeArgs,
+  getOverlayOpts,
+} from "./helpers.js";
 
 export interface InteractiveOptions {
   session: AgentSession;
@@ -59,43 +83,17 @@ export interface InteractiveOptions {
   logger?: Logger;
   /** Called by the kernel approval sink. Set by the CLI wiring. */
   approvalHook: { current: ((prompt: string, meta?: { toolName: string }) => Promise<boolean | "session" | string>) | null };
+  /** Called by the ask-user tool when running interactively. */
+  askUserHook?: { current: ((request: AskUserRequest) => Promise<string | null>) | null };
   /** Optional prompt to submit automatically when the TUI starts. */
   initialPrompt?: string;
 }
 
-const COMMANDS = [
-  { name: "help", description: "show the command list" },
-  { name: "session", description: "manage sessions (list/switch/rename/new/info/export)" },
-  { name: "model", description: "pick provider/model" },
-  { name: "safety", description: "pick safety mode (strict/balanced/restricted/autonomous)" },
-  { name: "budget", description: "configure session cost and token limits" },
-  { name: "connect", description: "connect or re-auth a provider" },
-  { name: "undo", description: "undo file changes from the last turn" },
-  { name: "redo", description: "redo previously undone file changes" },
-  { name: "new", description: "start a fresh session" },
-  { name: "export", description: "export the transcript" },
-  { name: "clear", description: "clear the transcript" },
-  { name: "quit", description: "exit the session" },
-];
-
-const ADVANCED_COMMANDS = {
-  compact: "summarize history into a checkpoint",
-  diff: "show working-tree changes",
-  budget: "show usage, limits, and timing",
-  keys: "re-auth the current provider",
-  branch: "record a branch summary",
-};
-
-const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · click headers to expand/collapse details · Ctrl+C abort · Shift+B tighter safety · Shift+A looser safety";
-const QUICK_HELP = "Quick actions: /model · /safety · /budget · /session · /connect · /undo · /redo · /help";
 const MAX_QUEUE = 5;
-// Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
-const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
 
 /**
- * Overlay root: renders a teammate-owned Box, forwards keys/mouse to the
- * interactive child. pi-tui focuses the overlay root component, so without
- * this wrapper keys/clicks would never reach a SelectList/Editor nested inside.
+ * Overlay root: renders a framed Box and forwards keys/mouse to the
+ * interactive child.
  */
 class OverlayDialog implements Component {
   constructor(
@@ -123,17 +121,6 @@ class OverlayDialog implements Component {
   }
 }
 
-const OVERLAY_OPTS = { anchor: "center" as const, width: "80%" as const, maxHeight: "80%" as const };
-
-// Compute adaptive overlay options based on current terminal width.
-// Narrow terminals (<100 cols): full width, taller. Wide: centered 80%.
-function getOverlayOpts(): { anchor: "center"; width: "80%" | "90%" | "95%"; maxHeight: "80%" | "85%" | "90%" } {
-  const cols = process.stdout.columns ?? 80;
-  if (cols < 80) return { anchor: "center", width: "95%", maxHeight: "90%" };
-  if (cols < 120) return { anchor: "center", width: "90%", maxHeight: "85%" };
-  return OVERLAY_OPTS;
-}
-
 export async function runInteractive(options: InteractiveOptions): Promise<void> {
   const logger = options.logger ?? nullLogger;
   let session = options.session;
@@ -143,7 +130,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   }
   const cwd = resolve(options.cwd);
 
-  const tui = new TuiAltScreen(new ProcessTerminal());
+  // Enable Ctrl+F alongside Ctrl+Shift+F for live viewport search.
+  setKeybindings(
+    new KeybindingsManager(TUI_KEYBINDINGS, {
+      "tui.altScreen.search": ["ctrl+f", "ctrl+shift+f"],
+    }),
+  );
+
+  const tui = new TuiAltScreen(new ProcessTerminal(), undefined, undefined, {
+    mouse: true,
+    wheelScrollLines: "auto",
+    searchMatchStyle: (s) => theme.warn(s),
+    searchCurrentMatchStyle: (s) => statusBg(theme.bold(s)),
+    searchNavigationButtonStyle: (s, hovered) => (hovered ? theme.accent(s) : theme.muted(s)),
+    scrollToEndIndicator: () => statusBg(theme.accent(" ↓ Jump to bottom (Ctrl+End) ")),
+  });
   const transcript = new Container();
 
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -158,10 +159,25 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   if (process.stdout.isTTY) {
     process.on("SIGWINCH", handleResize);
   }
+
   const statusBar = new StatusBar();
   const editor = new Editor(tui, buildEditorTheme(), { autocompleteMaxVisible: 8 });
-  const autocomplete = buildAutocomplete(COMMANDS, cwd);
-  editor.setAutocompleteProvider(autocomplete);
+  const commandCatalog = [...TUI_COMMANDS];
+  editor.setAutocompleteProvider(buildAutocomplete(commandCatalog, cwd));
+
+  void new ResourceLoader({ logger })
+    .load(cwd)
+    .then((project) => {
+      if (exiting || project.skills.length === 0) return;
+      for (const s of project.skills) {
+        commandCatalog.push({
+          name: `skill:${s.name}`,
+          description: s.description,
+        });
+      }
+      editor.setAutocompleteProvider(buildAutocomplete(commandCatalog, cwd));
+    })
+    .catch(() => { /* best-effort */ });
 
   let busy = false;
   let abort: AbortController | null = null;
@@ -174,66 +190,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const recentPrompts: string[] = [];
   let lastUserPrompt = "";
   let authOverlayOpen = false;
-  /** Assigned after runCommand/runTurn exist; subscribe() may fire earlier. */
   let handleAuthError: (message: string) => void = () => {};
-  /** Open text-prompt dialog (Esc cancels via the input listener). */
   let promptDialog: { cancel: () => void } | null = null;
-  /** Session state persisted across TUI restarts (draft text, recent prompts, queue). */
-  let draftText = "";
-  let searchQuery: string = "";
-  let searchResults: number[] = [];
-  let searchActiveIndex = 0;
-  let searchOpen = false;
-  /** Transcript lines for search (plain text, no ANSI). */
-  const transcriptLines: string[] = [];
-  /** Add line to transcript history for search. */
-  const addTranscriptLine = (text: string) => {
-    transcriptLines.push(text.replace(/\x1b\[[0-9;]*m/g, ""));
-    if (transcriptLines.length > 10000) transcriptLines.shift();
-  };
-  /** Empty-state suggestion overlay state (digits 1-3 fill, never send). */
-  let suggestionsOpen = false;
-  let suggestionPick: ((value: string) => void) | null = null;
-  const SUGGESTION_DIGITS = ["1", "2", "3"] as const;
 
-  // Kill ring for Emacs-style kill/yank (copy/paste within TUI).
   const killRing = new KillRing();
 
-  // State saved to ~/.kern/tui-state.json alongside the kernel session.
-  const STATE_FILE = join(homedir(), ".kern", "tui-state.json");
-
-  const saveState = async (): Promise<void> => {
-    try {
-      await mkdir(dirname(STATE_FILE), { recursive: true });
-      await writeFile(STATE_FILE, JSON.stringify({
-        draftText,
-        recentPrompts,
-        stash,
-        queue,
-        lastUserPrompt,
-      }), "utf8");
-    } catch { /* best-effort */ }
-  };
-
-  const loadState = async (): Promise<void> => {
-    try {
-      const raw = await readFile(STATE_FILE, "utf8");
-      const data = JSON.parse(raw);
-      if (typeof data === "object" && data !== null) {
-        if (typeof data.draftText === "string") draftText = data.draftText;
-        if (Array.isArray(data.recentPrompts)) recentPrompts.push(...data.recentPrompts);
-        if (typeof data.stash === "string") stash = data.stash;
-        if (Array.isArray(data.queue)) queue.push(...data.queue);
-        if (typeof data.lastUserPrompt === "string") lastUserPrompt = data.lastUserPrompt;
-      }
-    } catch { /* best-effort */ }
-  };
-  void loadState().then(() => {
-    if (draftText) editor.setText(draftText);
+  void loadTuiState().then((data) => {
+    if (exiting) return;
+    if (data.draftText) editor.setText(data.draftText);
+    if (data.recentPrompts) recentPrompts.push(...data.recentPrompts);
+    if (data.stash) stash = data.stash;
+    if (data.queue) queue.push(...data.queue);
+    if (data.lastUserPrompt) lastUserPrompt = data.lastUserPrompt;
   });
 
-  // Batched rendering: accumulate render requests and flush at ~60fps
-  // to avoid layout thrashing during high-frequency streaming/scrolling.
+  // Batched rendering: accumulate render requests at ~60fps.
   let renderBatched = false;
   const requestRender = () => {
     if (!renderBatched) {
@@ -245,7 +216,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     }
   };
   const requestRenderBatched = requestRender;
-  const MAX_TRANSCRIPT_CHILDREN = 300;
+  const MAX_TRANSCRIPT_CHILDREN = 400;
+  const detailCards: Array<ToolCard | CollapsibleText> = [];
   const pruneTranscript = () => {
     const children = (transcript as any).children as unknown[] | undefined;
     if (!Array.isArray(children)) return;
@@ -255,12 +227,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       const first = children[0];
       if (!first) break;
       transcript.removeChild(first as any);
+      const cardIdx = detailCards.indexOf(first as ToolCard | CollapsibleText);
+      if (cardIdx >= 0) detailCards.splice(cardIdx, 1);
     }
   };
 
-  // Toasts live one row above the queue panel: transient notices that
-  // auto-expire without disturbing the transcript. Errors stay persistent
-  // via err()/say() and never route here.
+  // Toasts live one row above the queue panel.
   const toastLine = new Text("", 0, 0);
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let toastToken = 0;
@@ -276,8 +248,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     }, 4000);
   };
 
-  // Live agent phase indicator pinned above the editor so the user can see
-  // what the agent is doing while it writes, thinks, or calls tools.
+  // Live agent phase indicator.
   const activityLine = new Text(theme.muted("ready"), 0, 0);
   const ACTIVITY_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"] as const;
   let activityDots = 0;
@@ -310,8 +281,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     if (typeof updateSidebar === "function") updateSidebar();
   };
 
-  // Queue visibility: numbered list above the editor. Reads `queue` live;
-  // callers just mutate the array and request a render.
+  // Queue panel.
   const queuePanel: Component = {
     render(_width: number): string[] {
       if (queue.length === 0) return [];
@@ -333,7 +303,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
 
   // --- best-effort file undo/redo (workspace snapshots around turns) -----------------------
-  type FileSnapshot = Map<string, Uint8Array | null>; // relative path -> bytes, null means deleted/missing
+  type FileSnapshot = Map<string, Uint8Array | null>;
   interface FileHistoryEntry {
     label: string;
     before: FileSnapshot;
@@ -370,7 +340,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     });
 
   const readHeadVersion = async (relPath: string): Promise<Uint8Array | null | undefined> => {
-    // Returns bytes if file exists in HEAD, null if not in HEAD, undefined on error/too large/unsupported.
     try {
       const exists = await runGit(["cat-file", "-e", `HEAD:${relPath}`]);
       if (exists.code !== 0) return null;
@@ -390,17 +359,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const paths = new Set<string>();
     for (let i = 0; i < out.length; ) {
       const code = out.slice(i, i + 2);
-      i += 3; // "XY "
+      i += 3;
       if (i > out.length) break;
       const nul = out.indexOf("\0", i);
       if (nul < 0) break;
       let path = out.slice(i, nul);
       i = nul + 1;
-      // renames/copies: "R  old\0new\0" or "C  old\0new\0"
       if ((code.startsWith("R") || code.startsWith("C")) && i <= out.length) {
         const nul2 = out.indexOf("\0", i);
         if (nul2 >= 0) {
-          path = out.slice(i, nul2); // new path
+          path = out.slice(i, nul2);
           i = nul2 + 1;
         }
       }
@@ -423,11 +391,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           snap.set(relNorm, null);
           continue;
         }
-        if (st.size > MAX_SNAPSHOT_FILE_BYTES) {
-          // too large to snapshot safely; mark as unsupported by omitting? keep placeholder
-          // we cannot restore reliably, so skip this path from snapshot tracking
-          continue;
-        }
+        if (st.size > MAX_SNAPSHOT_FILE_BYTES) continue;
         const data = await readFile(abs);
         snap.set(relNorm, new Uint8Array(data));
       } catch {
@@ -460,7 +424,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         await mkdir(dirname(abs), { recursive: true });
         await writeFile(abs, value);
       } else {
-        // null or absent => remove file if exists
         try {
           await unlink(abs);
         } catch {
@@ -475,7 +438,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       const paths = await getWorkspaceChangedPaths();
       if (paths === null) {
         fileHistorySupported = false;
-        return; // not a git repo / unavailable
+        return;
       }
       fileHistorySupported = true;
       pendingHistoryBefore = await snapshotWorkspaceFiles(paths);
@@ -502,19 +465,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       const union = [...new Set([...before.keys(), ...paths])].sort();
       if (union.length === 0) return;
       const after = await snapshotWorkspaceFiles(union);
-      // normalize maps to union keys for comparison/apply
       const beforeNorm: FileSnapshot = new Map();
       const afterNorm: FileSnapshot = new Map();
       for (const p of union) {
         let beforeVal: Uint8Array | null = before.has(p) ? (before.get(p) ?? null) : null;
         if (!before.has(p)) {
-          // File was clean (or untracked-absent) before turn but changed during turn.
           const head = await readHeadVersion(p);
-          if (head === undefined) {
-            // Can't determine/restore safely (e.g. too large) -> skip this path from history.
-            continue;
-          }
-          beforeVal = head; // null if not in HEAD (created during turn), else HEAD content
+          if (head === undefined) continue;
+          beforeVal = head;
         }
         const afterVal = after.has(p) ? (after.get(p) ?? null) : null;
         beforeNorm.set(p, beforeVal);
@@ -574,8 +532,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     }
   };
 
-  // Pi-style fullscreen dock: scrollable transcript on top, prompt +
-  // status pinned to the viewport bottom (editor never floats mid-screen).
+  // --- Layout & sidebar -------------------------------------------------------
   const scrollTranscript = new ScrollView(transcript, { follow: "end", primary: true });
   const dock = new VStack([
     { component: queuePanel, shrink: 1, minSize: 0 },
@@ -591,7 +548,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const sidebarPanel = new SidebarPanel({ leftBorder: true });
   const sidebarScroll = new ScrollView(sidebarPanel);
   let sidebarVisible = false;
-  const modelUsageHistory = new Map<string, { provider: string; model: string; switches: number; lastContext?: string; cost: number; input: number; output: number }>();
+  const modelUsageHistory = new Map<
+    string,
+    { provider: string; model: string; switches: number; lastContext?: string; cost: number; input: number; output: number }
+  >();
   const noteModelUsage = () => {
     try {
       const m = session.modelInfo();
@@ -607,7 +567,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       modelUsageHistory.set(key, {
         provider: m.provider,
         model: m.modelId,
-        switches: (prev?.switches ?? 0),
+        switches: prev?.switches ?? 0,
         lastContext: ctx ?? prev?.lastContext,
         cost: mu?.cost ?? 0,
         input: mu?.input ?? 0,
@@ -635,12 +595,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     tui.setFocus(editor);
     try { updateSidebar(); } catch { /* best-effort */ }
   };
+
+  let apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+  const modeLabel = () => {
+    const mode = session.approvalMode();
+    return mode === "ask" ? "manual" : (mode ?? "manual");
+  };
+
   const updateSidebar = () => {
     try {
       noteModelUsage();
       const cols = process.stdout.columns ?? 80;
       if (cols < 110) {
-        sidebarPanel.setSections([{ key: "info", title: "Session info", lines: [theme.muted("Widen terminal to show panel")], collapsible: false }]);
+        sidebarPanel.setSections([
+          { key: "info", title: "Session info", lines: [theme.muted("Widen terminal to show panel")], collapsible: false },
+        ]);
         return;
       }
       const m = session.modelInfo();
@@ -662,6 +632,31 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       });
       if (modelLines.length === 0) modelLines.push(theme.muted("No model usage tracked yet."));
       const sessionId = manager.sessionId ?? "—";
+      const mcpServers = session.connects?.listStatuses() ?? [];
+      const connectedMcp = mcpServers.filter((s) => s.state === "connected");
+      const mcpToolTotal = connectedMcp.reduce((sum, s) => sum + s.tools.length, 0);
+      const mcpSummary =
+        mcpServers.length === 0
+          ? "none (/mcp)"
+          : `${connectedMcp.length}/${mcpServers.length} · ${mcpToolTotal} tool(s)`;
+      const mcpLines =
+        mcpServers.length === 0
+          ? [theme.muted("No MCP servers connected. Run /mcp.")]
+          : mcpServers.map((s) => {
+              const mark =
+                s.state === "connected"
+                  ? theme.success("●")
+                  : s.state === "error"
+                    ? theme.error("✖")
+                    : s.state === "untrusted"
+                      ? theme.warn("!")
+                      : theme.muted("○");
+              const detail =
+                s.state === "connected"
+                  ? `${s.tools.length} tool(s)`
+                  : s.state;
+              return `${mark} ${s.name} ${theme.muted(`(${s.transport} · ${detail})`)}`;
+            });
       sidebarPanel.setSections([
         {
           key: "session",
@@ -670,13 +665,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           lines: [
             `${theme.muted("Model")}`,
             `  ${m.provider}/${m.modelId}`,
+            `${theme.muted("Think")} ${session.thinkingMode()}`,
             `${theme.muted("ID")} ${sessionId}`,
             `${theme.muted("Name")} ${sessionName}`,
-            `${theme.muted("Mode")} ${modeLabel()}`,
+            `${theme.muted("Mode")} ${modeLabel()} · ${session.safetyMode?.() ?? "balanced"}`,
+            `${theme.muted("MCP")} ${mcpSummary}`,
             `${theme.muted("State")} ${busy ? `running (${activity})` : "ready"}`,
             `${theme.muted("CWD")}`,
             `  ${cwd}`,
           ],
+        },
+        {
+          key: "connects",
+          title: "Connectors (MCP)",
+          collapsible: true,
+          defaultExpanded: mcpServers.length > 0,
+          lines: mcpLines,
         },
         {
           key: "usage",
@@ -706,6 +710,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
                 `${theme.muted("input tokens")} ${limits.maxInputTokens === 0 ? "∞" : limits.maxInputTokens.toLocaleString()}`,
                 `${theme.muted("output tokens")} ${limits.maxOutputTokens === 0 ? "∞" : limits.maxOutputTokens.toLocaleString()}`,
                 `${theme.muted("total tokens")} ${limits.maxTotalTokens === 0 ? "∞" : limits.maxTotalTokens.toLocaleString()}`,
+                ...(limits.maxTurns ? [`${theme.muted("max turns")} ${limits.maxTurns}`] : []),
               ]
             : [theme.muted("Limits unavailable")],
         },
@@ -729,7 +734,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     transcript.addChild(new Text(text, 0, 0));
     lastTranscriptBlock = "other";
     pruneTranscript();
-    addTranscriptLine(text);
     requestRender();
   };
   const info = (text: string) => say(theme.muted(text));
@@ -747,22 +751,101 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     requestRender();
   };
 
-  const modeLabel = () => {
-    const mode = session.approvalMode();
-    return mode === "ask" ? "manual" : (mode ?? "manual");
-  };
-
   const printHeader = () => {
     const m = session.modelInfo();
     const name = session.sessionName() ? `  ·  ${session.sessionName()}` : "";
     transcript.addChild(new Spacer(1));
-    transcript.addChild(new Text(`${theme.bold("kern v1.0.0")}  ${theme.muted(`${m.provider}/${m.modelId}${name} · ${modeLabel()} · ${cwd}`)}`, 0, 0));
-    info("Type a task, or /help for commands.");
-    info(HINTS);
-    info(theme.muted(QUICK_HELP));
+    transcript.addChild(
+      new Text(
+        `${theme.bold("kern v1.0.0")}  ${theme.muted(`${m.provider}/${m.modelId}${name} · ${modeLabel()} · think:${session.thinkingMode()} · ${cwd}`)}`,
+        0,
+        0,
+      ),
+    );
+    info("Type a task, /help for commands, or Ctrl+P for palette.");
+    info(TUI_HINTS);
+    info(QUICK_HELP);
     transcript.addChild(new Rule());
     lastTranscriptBlock = "other";
     pruneTranscript();
+    requestRender();
+  };
+
+  const replaySessionHistory = () => {
+    const { items, userTurns } = collectReplayItems(manager.getActivePath());
+    const u = session.budgetUsage();
+    apiUsage = { input: u.inputTokens, output: u.outputTokens, cacheRead: 0, cacheWrite: 0 };
+    turnNumber = userTurns;
+    if (items.length === 0) return;
+
+    info(`Replaying ${items.length} history item${items.length === 1 ? "" : "s"}…`);
+    for (const item of items) {
+      if (item.kind === "user") {
+        addTranscriptGap(true);
+        transcript.addChild(new Text(theme.user("you"), 0, 0));
+        transcript.addChild(new Text(item.text, 0, 0));
+        lastTranscriptBlock = "user";
+      } else if (item.kind === "reasoning") {
+        if (lastTranscriptBlock !== "reasoning" && lastTranscriptBlock !== "tool") addTranscriptGap();
+        const block = new CollapsibleText("thinking", { expanded: false, style: theme.muted });
+        block.setText(item.text);
+        detailCards.push(block);
+        transcript.addChild(block);
+        lastTranscriptBlock = "reasoning";
+      } else if (item.kind === "assistant") {
+        if (lastTranscriptBlock !== "user") addTranscriptGap();
+        transcript.addChild(new Text(theme.accent("assistant"), 0, 0));
+        transcript.addChild(new Markdown(item.text, 0, 0, buildMarkdownTheme()));
+        lastTranscriptBlock = "assistant";
+      } else if (item.kind === "tool") {
+        if (lastTranscriptBlock !== "tool" && lastTranscriptBlock !== "reasoning") {
+          transcript.addChild(new Spacer(1));
+        }
+        const card = new ToolCard(item.toolName, item.argsSummary);
+        if (item.output) card.appendOutput(item.output);
+        if (item.done) card.finish(item.isError);
+        detailCards.push(card);
+        transcript.addChild(card);
+        lastTranscriptBlock = "tool";
+      } else if (item.kind === "checkpoint") {
+        addTranscriptGap(true);
+        transcript.addChild(new Text(theme.accent(`[${item.label}]`), 0, 0));
+        transcript.addChild(new Markdown(item.summary, 0, 0, buildMarkdownTheme()));
+        lastTranscriptBlock = "other";
+      }
+      pruneTranscript();
+    }
+    requestRender();
+  };
+
+  const toggleAllDetails = (force?: boolean) => {
+    if (detailCards.length === 0) {
+      toast("No collapsible thinking or tool cards in transcript.");
+      return;
+    }
+    const next = force ?? detailCards.some((c) => !c.isExpanded());
+    for (const c of detailCards) c.setExpanded(next);
+    toast(`${next ? "Expanded" : "Collapsed"} ${detailCards.length} detail card${detailCards.length === 1 ? "" : "s"}.`);
+    requestRender();
+  };
+
+  const openLiveSearch = (initialQuery?: string) => {
+    const anyTui = tui as unknown as {
+      activeSearch?: { component?: { input?: { setValue?: (v: string) => void } } };
+      toggleSearch?: () => void;
+      updateSearchQuery?: (q: string) => void;
+    };
+    if (typeof anyTui.toggleSearch !== "function") {
+      toast("Live search is unavailable on this terminal.");
+      return;
+    }
+    if (!anyTui.activeSearch) {
+      anyTui.toggleSearch();
+    }
+    if (initialQuery && initialQuery.trim()) {
+      anyTui.activeSearch?.component?.input?.setValue?.(initialQuery.trim());
+      anyTui.updateSearchQuery?.(initialQuery.trim());
+    }
     requestRender();
   };
 
@@ -782,7 +865,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       const name = await session.setSessionName?.(value);
       if (name) {
         toast(`Session renamed to ${name}.`);
-        printHeader();
+        printStatus();
       }
     } catch (error) {
       err(`Rename failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -827,11 +910,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         : "ctx —";
     const sessionName = session.sessionName() ? ` · ${session.sessionName()}` : "";
     const safetyMode = session.safetyMode?.() ?? "balanced";
+    const think = session.thinkingMode();
+    const scrollBadge = tui.isFollowingOutput ? [] : [theme.warn("↑ scrolled")];
     statusBar.setSegments([
       `${m.provider}/${m.modelId}${sessionName}`,
       modeLabel(),
+      `think: ${think}`,
       `safety: ${safetyMode}`,
       ctx,
+      ...scrollBadge,
       `$${u.cost.toFixed(4)} · ${u.inputTokens.toLocaleString()} in / ${u.outputTokens.toLocaleString()} out`,
     ]);
     updateSidebar();
@@ -848,6 +935,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       say(
         `  limits: $${limits.maxCost === 0 ? "∞" : limits.maxCost.toFixed(4)} cost, ${limits.maxInputTokens === 0 ? "∞" : limits.maxInputTokens.toLocaleString()} in, ${limits.maxOutputTokens === 0 ? "∞" : limits.maxOutputTokens.toLocaleString()} out, ${limits.maxTotalTokens === 0 ? "∞" : limits.maxTotalTokens.toLocaleString()} total`,
       );
+      if (limits.maxTurns || limits.maxTotalToolCalls || limits.maxToolCallsPerTurn || limits.maxWallTimeMs) {
+        say(
+          `  guards: turns=${limits.maxTurns || "∞"}, toolCalls=${limits.maxTotalToolCalls || "∞"}, perTurn=${limits.maxToolCallsPerTurn || "∞"}, wallMs=${limits.maxWallTimeMs || "∞"}`,
+        );
+      }
     } else {
       info("  limits: unavailable from session runtime");
     }
@@ -857,7 +949,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         say(`    ${model}: $${mu.cost.toFixed(4)} · ${mu.input.toLocaleString()} in / ${mu.output.toLocaleString()} out`);
       }
     }
-    info("Tip: adjust with --max-cost, --max-input-tokens, --max-output-tokens, --max-total-tokens");
+    info("Tip: update live with `/budget maxCost=0.05 maxTurns=12` (0 resets to unlimited)");
   };
 
   // --- event → transcript -----------------------------------------------------
@@ -868,30 +960,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let turnNumber = 0;
   const cards = new Map<string, ToolCard>();
   let lastTranscriptBlock: "none" | "user" | "assistant" | "reasoning" | "tool" | "other" = "none";
-  /** Cumulative API token usage (best-effort from usage events). */
-  let apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-  const formatReasoningSteps = (text: string): string => {
-    const normalized = text.replace(/\r\n/g, "\n").trim();
-    if (!normalized) return "";
-    const blocks = normalized.split(/\n{2,}/).map((b) => b.trim()).filter(Boolean);
-    if (blocks.length <= 1) return normalized;
-
-    const hasExplicitMarkers = blocks.some((b) => /^(?:step\s*\d+[:.)-]?|\d+[.)]|[-*•]|#{1,6}\s)/i.test(b));
-    if (hasExplicitMarkers) {
-      return blocks.join("\n\n");
-    }
-
-    return blocks.map((b, i) => `Step ${i + 1}: ${b}`).join("\n\n");
-  };
-  /** Pending approval finish callbacks — resolved fail-closed (deny) on abort/exit. */
   const pendingApprovals = new Set<(value: string | null) => void>();
   const denyPendingApprovals = () => {
     if (pendingApprovals.size === 0) return;
     for (const finish of [...pendingApprovals]) finish(null);
     pendingApprovals.clear();
   };
-  /** Mark in-flight tool cards done so a cancelled/failed turn never leaves a stuck ◈. */
   const settleCards = (failed: boolean) => {
     if (cards.size === 0) return;
     for (const card of cards.values()) {
@@ -913,13 +988,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     transcript.addChild(new Spacer(1));
   };
 
-  const renderUserPrompt = (text: string) => {
+  const renderUserPrompt = (text: string, label = "you") => {
     addTranscriptGap(true);
-    transcript.addChild(new Text(theme.user("you"), 0, 0));
+    transcript.addChild(new Text(theme.user(label), 0, 0));
     transcript.addChild(new Text(text, 0, 0));
     lastTranscriptBlock = "user";
     pruneTranscript();
-    addTranscriptLine(`you: ${text}`);
     requestRender();
   };
   const renderAssistantBlock = () => {
@@ -936,18 +1010,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     if (reasoningView) return;
     if (lastTranscriptBlock !== "reasoning" && lastTranscriptBlock !== "tool") addTranscriptGap();
     reasoningView = new CollapsibleText("thinking", { expanded: false, style: theme.muted, streaming: true });
+    detailCards.push(reasoningView);
     transcript.addChild(reasoningView);
     lastTranscriptBlock = "reasoning";
     pruneTranscript();
     requestRender();
   };
 
-  /** Persistent error card for auth failures; recovery choices follow via overlay. */
   const showAuthCard = (message: string) => {
     addTranscriptGap(true);
     transcript.addChild(new Text(theme.error("Auth failed — the model rejected our credentials."), 0, 0));
     transcript.addChild(new Text(theme.muted(message), 0, 0));
-    transcript.addChild(new Text(theme.muted("Pick a fix in the dialog above (Esc dismisses). /keys re-auths, /model switches."), 0, 0));
+    transcript.addChild(new Text(theme.muted("Pick a fix in the dialog above (Esc dismisses). /login re-auths, /logout clears keys, /model switches."), 0, 0));
     lastTranscriptBlock = "other";
     tui.requestRender();
   };
@@ -977,8 +1051,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             closeReasoning();
             settleCards(false);
             setActivity("ready");
-            if (mdText) addTranscriptLine(`assistant: ${mdText}`);
-            if (reasoningBuffer) addTranscriptLine(`reasoning: ${formatReasoningSteps(reasoningBuffer)}`);
             noteModelUsage();
             updateSidebar();
             requestRender();
@@ -988,6 +1060,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             setActivity(`tool: ${event.toolName}`);
             const card = new ToolCard(event.toolName, summarizeArgs(event.arguments));
             cards.set(event.toolCallId, card);
+            detailCards.push(card);
             if (lastTranscriptBlock !== "tool" && lastTranscriptBlock !== "reasoning") {
               transcript.addChild(new Spacer(1));
             }
@@ -1007,9 +1080,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           case "tool_execution_end": {
             const card = cards.get(event.toolCallId);
             cards.delete(event.toolCallId);
-            const output = event.result
-              ? event.result.content.map((c) => c.text).join("\n")
-              : "";
+            const output = event.result ? event.result.content.map((c) => c.text).join("\n") : "";
             if (card) {
               if (output && (!card.hasOutput() || event.isError)) card.appendOutput(output);
               if (event.isError && !card.hasOutput()) card.appendOutput(`Tool ${event.toolName} failed.`);
@@ -1019,7 +1090,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
               say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
               if (output) info(output.split("\n").slice(0, 20).join("\n"));
             }
-            if (output) addTranscriptLine(`${event.toolName}: ${output}`);
             setActivity(event.isError ? "tool failed" : "ready");
             updateSidebar();
             requestRender();
@@ -1076,10 +1146,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
               const kind = event.error.details?.budget;
               if (limits) {
                 info(
-                  `Budget exceeded (${kind || "unknown"}). Current: $${u.cost.toFixed(4)} cost, ${u.inputTokens.toLocaleString()} in / ${u.outputTokens.toLocaleString()} out tok. Tip: split/resume the task or raise limits.`,
+                  `Budget exceeded (${kind || "unknown"}). Current: $${u.cost.toFixed(4)} cost, ${u.inputTokens.toLocaleString()} in / ${u.outputTokens.toLocaleString()} out tok. Tip: adjust with /budget maxCost=...`,
                 );
               } else {
-                info("Budget exceeded. Split the task, resume later, or increase limits (e.g. --max-cost / --max-total-tokens).");
+                info("Budget exceeded. Adjust with /budget maxCost=... or --max-total-tokens.");
               }
             }
             break;
@@ -1096,49 +1166,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         }
       } catch (e) {
         err(`Event handler error: ${e instanceof Error ? e.message : String(e)}`);
-        // Continue processing other events; don't crash the TUI
       }
     });
   };
   subscribe();
 
-// Small local list of destructive shell patterns. Matched against the
-// approval prompt text; hits render the dialog in a danger style.
-const DESTRUCTIVE_PATTERNS: RegExp[] = [
-  /\brm\s+.*-[a-z]*r[a-z]*f\b/i,
-  /\brm\s+-rf?\b/,
-  /\bgit\s+reset\s+--hard\b/,
-  /\bgit\s+clean\s+-[a-z]*f\b/,
-  /:\(\)\s*\{[^}]*\}\s*;/,
-  /\bmkfs\b/,
-  /\bdd\b.*\bof=\/dev\//,
-  />\s*\/dev\/[a-z]/,
-  /\b(shutdown|reboot|halt|poweroff)\b/i,
-  /\bDROP\s+(TABLE|DATABASE)\b/i,
-];
-
-/** Extract a command-like pattern from an approval prompt for use as a default in the pattern prompt. */
-const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
-  // The prompt often contains the command text. Try to extract a trailing command-like substring.
-  if (argsFull) {
-    try {
-      const parsed = JSON.parse(argsFull);
-      if (typeof parsed.command === "string") return parsed.command;
-      if (typeof parsed.path === "string") return parsed.path;
-    } catch { /* ignore */ }
-  }
-  // Fallback: return the last word-like token from the prompt
-  const m = prompt.match(/([^\s]+)$/);
-  return m ? m[1]! : prompt;
-};
-
-  /** Wrap content + interactive child in a centered overlay; keys forward to the child. */
   const showDialog = (content: Component, target: Component, framed = true): OverlayHandle => {
     const root = framed ? new Box(content, {}) : content;
     return tui.showOverlay(new OverlayDialog(root, target), getOverlayOpts());
   };
 
-  /** Titled single-choice SelectList in a centered overlay. Resolves null on Esc. */
   const pickOne = async (
     title: string,
     items: Array<{ value: string; label: string; description?: string; disabled?: boolean }>,
@@ -1183,9 +1220,6 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
     meta?: { toolName: string },
   ): Promise<boolean | "session" | string> => {
     const tool = meta?.toolName ?? "tool";
-    // The kernel contract carries only (prompt, { toolName }), so the full
-    // arguments arrive inside the prompt text — except when a caller passes
-    // them through at runtime, in which case we pretty-print them too.
     const runtimeArgs = (meta as unknown as { arguments?: unknown } | undefined)?.arguments;
     let argsDetail = "";
     let argsFull = "";
@@ -1199,7 +1233,7 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
         argsFull = argsDetail;
       }
     }
-    const danger = DESTRUCTIVE_PATTERNS.some((re) => re.test(prompt) || (argsFull && re.test(argsFull)));
+    const danger = isDestructiveApproval(prompt, argsFull);
     const picked = await new Promise<string | null>((resolve) => {
       const body = new Container();
       body.addChild(new Text(danger ? theme.error(prompt) : theme.warn(prompt), 0, 0));
@@ -1261,48 +1295,57 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
     return approved;
   };
 
+  if (options.askUserHook) {
+    options.askUserHook.current = async (req: AskUserRequest): Promise<string | null> => {
+      if (exiting) return null;
+      if (req.options && req.options.length > 0) {
+        const allowCustom = req.allowCustom !== false;
+        const items = [
+          ...req.options.map((opt) => ({ value: opt, label: opt })),
+          ...(allowCustom ? [{ value: "__custom__", label: "Other (type custom answer)…" }] : []),
+        ];
+        const picked = await pickOne(req.question, items);
+        if (picked === null) {
+          info("Question cancelled.");
+          return null;
+        }
+        if (picked === "__custom__") {
+          const typed = await promptText(req.question, "");
+          if (typed === null || !typed.trim()) {
+            info("Question cancelled.");
+            return null;
+          }
+          const ans = typed.trim();
+          info(`Answered: ${ans}`);
+          return ans;
+        }
+        info(`Answered: ${picked}`);
+        return picked;
+      }
+      const typed = await promptText(req.question, "");
+      if (typed === null || !typed.trim()) {
+        info("Question cancelled.");
+        return null;
+      }
+      const ans = typed.trim();
+      info(`Answered: ${ans}`);
+      return ans;
+    };
+  }
+
   // --- transcript export ----------------------------------------------------------
   const exportTranscript = async (file?: string): Promise<void> => {
-    const path = manager.getActivePath();
-    const rawTarget = file ?? join(cwd, `kern-session-${manager.sessionId ?? "export"}.md`);
-    let target = rawTarget;
-    try {
-      target = resolve(cwd, rawTarget);
-      const rel = resolve(target);
-      if (!rel.startsWith(resolve(cwd) + "/") && rel !== resolve(cwd)) {
-        err(`Export refused: path escapes workspace: ${file}`);
-        return;
-      }
-    } catch (error) {
-      err(`Export refused: ${error instanceof Error ? error.message : String(error)}`);
+    const resolved = resolveExportPath(cwd, file, manager.sessionId);
+    if (!resolved.ok) {
+      err(resolved.error);
       return;
     }
-    const lines: string[] = [`# kern session`, ""];
-    const m = session.modelInfo();
-    lines.push(`- model: ${m.provider}/${m.modelId}`, `- cwd: ${cwd}`, "");
-    for (const entry of path) {
-      if (entry.type === "message") {
-        const msg = entry.message;
-        lines.push(`## ${msg.role}`, "");
-        for (const block of msg.content) {
-          if (block.type === "text") lines.push(block.text, "");
-          else if (block.type === "reasoning") lines.push(`> thinking: ${block.text.slice(0, 500)}`, "");
-          else if (block.type === "tool_call") lines.push(`\`\`\`tool ${block.name}`, `${JSON.stringify(block.arguments, null, 2)}`, "````", "");
-          else if (block.type === "tool_result") {
-            lines.push(`**tool result${block.isError ? " (error)" : ""}:**`, "");
-            for (const c of block.content) lines.push(c.text, "");
-          }
-        }
-      } else if (entry.type === "compaction") {
-        lines.push("## compaction checkpoint", "", entry.summary, "");
-      } else if (entry.type === "model_change") {
-        lines.push(`*model → ${entry.provider}/${entry.model}*`, "");
-      } else if (entry.type === "branch") {
-        lines.push(`*branch from ${entry.forkedFromId}${entry.note ? `: ${entry.note}` : ""}*`, "");
-      }
-    }
-    await writeFile(target, lines.join("\n"), "utf8");
-    ok(`Exported to ${target}`);
+    const markdown = buildSessionExportMarkdown(manager.getActivePath(), {
+      ...session.modelInfo(),
+      cwd,
+    });
+    await writeFile(resolved.path, markdown, "utf8");
+    ok(`Exported to ${resolved.path}`);
   };
 
   // --- @mention expansion -----------------------------------------------------------
@@ -1347,7 +1390,7 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
     return { text: out, missing };
   };
 
-  // --- overlays: model picker, history -------------------------------------------------
+  // --- overlays -------------------------------------------------
   const withOverlay = async (
     title: string,
     list: SelectList,
@@ -1371,12 +1414,6 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
     });
   };
 
-  /**
-   * Bordered text prompt. Enter resolves the typed text; Esc resolves null
-   * via the global input listener (pi-tui's Editor has no onEscape — the
-   * listener runs first and consumes the key). Typed secrets are never
-   * echoed back by the caller.
-   */
   const promptText = async (title: string, initial?: string): Promise<string | null> => {
     const ed = new Editor(tui, buildEditorTheme());
     if (initial) ed.setText(initial);
@@ -1397,6 +1434,24 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
       };
       promptDialog = { cancel: () => finish(null) };
       ed.onSubmit = (text) => finish(text);
+    });
+  };
+
+  const openCommandPalette = async () => {
+    const items = commandCatalog.map((c) => ({
+      value: `/${c.name}`,
+      label: `/${c.name}`,
+      description: c.shortcut ? `${c.description} [${c.shortcut}]` : c.description,
+    }));
+    const list = new SelectList(items, 14, buildSelectTheme());
+    await withOverlay("command palette (type to filter · Esc closes)", list, async (cmd) => {
+      if (cmd.startsWith("/skill:")) {
+        editor.setText(`${cmd} `);
+        tui.requestRender();
+        return;
+      }
+      const keep = await runCommand(cmd);
+      if (!keep) exit();
     });
   };
 
@@ -1429,8 +1484,7 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
         .map((m) => {
           const prov = providers[m.provider]?.displayName || m.provider;
           const isCurrent = m.provider === current.provider && m.id === current.modelId;
-          const isLastUsed =
-            !isCurrent && lastUsed?.provider === m.provider && lastUsed?.model === m.id;
+          const isLastUsed = !isCurrent && lastUsed?.provider === m.provider && lastUsed?.model === m.id;
           return {
             value: `${m.provider}/${m.id}`,
             label: `${prov}/${m.id}${isCurrent ? "  (current)" : isLastUsed ? "  (last used)" : ""}`,
@@ -1441,7 +1495,7 @@ const cmdPatternFromPrompt = (prompt: string, argsFull?: string): string => {
       buildSelectTheme(),
     );
     if (initialFilter) list.setFilter(initialFilter);
-await withOverlay("model", list, async (value) => {
+    await withOverlay("model", list, async (value) => {
       const slash = value.indexOf("/");
       const provider = value.slice(0, slash);
       const id = value.slice(slash + 1);
@@ -1455,9 +1509,50 @@ await withOverlay("model", list, async (value) => {
         );
         await session.setModel(adapter);
         await recordLastUsed(provider, id).catch(() => undefined);
+        printStatus();
       } catch (error) {
         err(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+    });
+  };
+
+  const pickThinkingLevel = async (arg?: string) => {
+    if (busy) {
+      toast("Wait for the current turn to settle before changing thinking level.");
+      return;
+    }
+    const trimmed = (arg ?? "").trim().toLowerCase();
+    const valid: ThinkingLevel[] = ["off", "low", "medium", "high"];
+    if (trimmed) {
+      if (!valid.includes(trimmed as ThinkingLevel)) {
+        err(`Invalid thinking level "${trimmed}". Use: off, low, medium, high.`);
+        return;
+      }
+      await session.setThinkingLevel(trimmed as ThinkingLevel);
+      toast(`Thinking level: ${trimmed}`);
+      printStatus();
+      return;
+    }
+    const current = session.thinkingMode();
+    const descriptions: Record<ThinkingLevel, string> = {
+      off: "Disable explicit reasoning budget",
+      low: "Light reasoning overhead",
+      medium: "Balanced reasoning effort (default)",
+      high: "Deep extended reasoning effort",
+    };
+    const list = new SelectList(
+      valid.map((level) => ({
+        value: level,
+        label: `${level}${level === current ? "  (current)" : ""}`,
+        description: descriptions[level],
+      })),
+      4,
+      buildSelectTheme(),
+    );
+    await withOverlay("thinking level", list, async (value) => {
+      await session.setThinkingLevel(value as ThinkingLevel);
+      toast(`Thinking level: ${value}`);
+      printStatus();
     });
   };
 
@@ -1480,8 +1575,8 @@ await withOverlay("model", list, async (value) => {
     const list = new SelectList(modes, 4, buildSelectTheme());
     if (initialFilter) list.setFilter(initialFilter);
     await withOverlay("safety", list, async (value) => {
-      const ok = session.setSafetyMode(value as "strict" | "balanced" | "restricted" | "autonomous");
-      if (ok) {
+      const okSet = session.setSafetyMode(value as "strict" | "balanced" | "restricted" | "autonomous");
+      if (okSet) {
         toast(`Safety mode: ${value}`);
         printStatus();
       } else {
@@ -1491,87 +1586,95 @@ await withOverlay("model", list, async (value) => {
   };
 
   const pickBudget = async (arg?: string) => {
-    if (busy) {
-      toast("Wait for the current turn to settle before adjusting budget.");
-      return;
-    }
-    const current = session.budgetLimits?.();
-    const currentValues: Record<string, number | string> = {
-      maxCost: current?.maxCost ?? 0,
-      maxInputTokens: current?.maxInputTokens ?? 0,
-      maxOutputTokens: current?.maxOutputTokens ?? 0,
-      maxTotalTokens: current?.maxTotalTokens ?? 0,
-    };
-
-    const floatFields = new Set(["maxCost"]);
-    const intFields = new Set(["maxInputTokens", "maxOutputTokens", "maxTotalTokens"]);
-
     if (arg && arg.trim()) {
-      const budgets: Record<string, number> = {};
-      const pairs = arg.trim().split(/\s+/);
-      for (const pair of pairs) {
-        const [key, valStr] = pair.split("=");
-        if (!key || !valStr) {
-          err(`Invalid format: "${pair}". Use field=value (e.g. maxCost=0.05)`);
-          return;
-        }
-        const val = Number(valStr);
-        if (!Number.isFinite(val) || val < 0) {
-          err(`Invalid value for ${key}: must be non-negative number`);
-          return;
-        }
-        if (intFields.has(key) && !Number.isInteger(val)) {
-          err(`Invalid value for ${key}: must be a non-negative integer`);
-          return;
-        }
-        if (val > 0) budgets[key] = val;
+      if (busy) {
+        toast("Wait for the current turn to settle before adjusting budget.");
+        return;
       }
-      if (Object.keys(budgets).length > 0) {
-        toast("Budget limits set. Restart session (/new) to apply.");
+      if (arg.trim().toLowerCase() === "set") {
+        const typed = await promptText("budget limits (e.g. maxCost=0.05 maxTurns=12, 0=unlimited)", "");
+        if (typed === null || !typed.trim()) return;
+        await pickBudget(typed);
+        return;
+      }
+      const parsed = parseBudgetArgs(arg);
+      if (!parsed.ok) {
+        err(parsed.error);
+        return;
+      }
+      if (Object.keys(parsed.limits).length === 0) {
+        printBudgetDetails();
+        return;
+      }
+      if (session.setBudgetLimits) {
+        session.setBudgetLimits(parsed.limits);
+        ok("Live budget limits updated.");
         printBudgetDetails();
       } else {
-        toast("No budgets set (all unlimited).");
+        err("Live budget updates are unavailable for this session.");
       }
       return;
     }
 
-    // Display current values directly (no overlay needed for read-only)
-    printStatus();
-    say(theme.bold("budget limits (0 = unlimited)"));
-    say(`  maxCost: $${(currentValues.maxCost as number) === 0 ? "∞" : (currentValues.maxCost as number).toFixed(4)}`);
-    say(`  maxInputTokens: ${currentValues.maxInputTokens || "unlimited"}`);
-    say(`  maxOutputTokens: ${currentValues.maxOutputTokens || "unlimited"}`);
-    say(`  maxTotalTokens: ${currentValues.maxTotalTokens || "unlimited"}`);
-    info("  (use /budget <field>=<value> to set, e.g. /budget maxCost=0.05)");
+    printBudgetDetails();
   };
 
-  /** `/connect` wizard: preset → key → test → model → save. Esc at any step cancels with nothing written. */
-  const runConnect = async (): Promise<void> => {
+  /** `/login [provider]` wizard: provider → key → test → model → save. Esc cancels cleanly. */
+  const runLogin = async (arg?: string): Promise<void> => {
     if (busy) {
-      toast("Wait for the current turn to settle before connecting a provider.");
+      toast("Wait for the current turn to settle before logging in to a provider.");
       return;
     }
-    // a. Preset picker.
-    const picked = await pickOne("connect — provider", [
-      ...PROVIDER_PRESETS.map((p) => ({
-        value: p.name,
-        label: p.name,
-        description: `${p.baseUrl} · ${p.hint}`,
-      })),
-      { value: "__custom__", label: "Custom…", description: "enter name + base URL manually" },
-    ]);
-    if (picked === null) {
-      toast("Connect cancelled.");
-      return;
-    }
+    const authStore = await loadAuth();
+    const configuredProviders = options.modelsFile.providers ?? {};
+    const requested = arg?.trim();
+
     let name: string;
     let baseUrl: string;
     let presetEnv = "";
+    let picked: string | null = null;
+
+    if (requested) {
+      picked = requested;
+    } else {
+      const seen = new Set<string>();
+      const candidateItems: Array<{ value: string; label: string; description: string }> = [];
+
+      for (const [cfgName, cfg] of Object.entries(configuredProviders)) {
+        seen.add(cfgName);
+        const saved = authStore[cfgName]?.apiKey;
+        const badge = saved ? `logged in (${maskKey(saved)})` : "configured";
+        candidateItems.push({
+          value: cfgName,
+          label: cfgName,
+          description: `${cfg.baseUrl} · ${badge}`,
+        });
+      }
+
+      for (const p of PROVIDER_PRESETS) {
+        if (seen.has(p.name)) continue;
+        seen.add(p.name);
+        const saved = authStore[p.name]?.apiKey;
+        const badge = saved ? `logged in (${maskKey(saved)}) · ${p.hint}` : p.hint;
+        candidateItems.push({
+          value: p.name,
+          label: p.name,
+          description: `${p.baseUrl} · ${badge}`,
+        });
+      }
+
+      candidateItems.push({ value: "__custom__", label: "Custom…", description: "enter name + base URL manually" });
+      picked = await pickOne("login — provider", candidateItems);
+      if (picked === null) {
+        toast("Login cancelled.");
+        return;
+      }
+    }
+
     if (picked === "__custom__") {
-      // b. Custom name + URL.
       const rawName = await promptText("provider name ([a-z0-9.-], Esc cancels)");
       if (rawName === null) {
-        toast("Connect cancelled.");
+        toast("Login cancelled.");
         return;
       }
       const clean = rawName.trim().toLowerCase();
@@ -1582,7 +1685,7 @@ await withOverlay("model", list, async (value) => {
       name = clean;
       const rawUrl = await promptText("base URL", "http://localhost:11434/v1");
       if (rawUrl === null) {
-        toast("Connect cancelled.");
+        toast("Login cancelled.");
         return;
       }
       baseUrl = rawUrl.trim();
@@ -1590,22 +1693,41 @@ await withOverlay("model", list, async (value) => {
         err(`Bad baseUrl ${JSON.stringify(rawUrl)} — must start with http:// or https://.`);
         return;
       }
+    } else if (configuredProviders[picked]) {
+      const cfg = configuredProviders[picked]!;
+      const preset = PROVIDER_PRESETS.find((p) => p.name === picked);
+      name = picked;
+      baseUrl = cfg.baseUrl;
+      presetEnv = cfg.apiKeyEnv ?? preset?.apiKeyEnv ?? "";
     } else {
       const preset = PROVIDER_PRESETS.find((p) => p.name === picked);
-      if (!preset) {
-        err(`Unknown preset: ${picked}`);
-        return;
+      if (preset) {
+        name = preset.name;
+        baseUrl = preset.baseUrl;
+        presetEnv = preset.apiKeyEnv;
+      } else {
+        const clean = picked.trim().toLowerCase();
+        if (!/^[a-z0-9.-]{1,32}$/.test(clean)) {
+          err(`Bad provider name ${JSON.stringify(picked)} — use [a-z0-9.-] (up to 32 chars).`);
+          return;
+        }
+        name = clean;
+        const rawUrl = await promptText(`base URL for ${name}`, "http://localhost:11434/v1");
+        if (rawUrl === null) {
+          toast("Login cancelled.");
+          return;
+        }
+        baseUrl = rawUrl.trim();
+        if (!/^https?:\/\//i.test(baseUrl)) {
+          err(`Bad baseUrl ${JSON.stringify(rawUrl)} — must start with http:// or https://.`);
+          return;
+        }
       }
-      name = preset.name;
-      baseUrl = preset.baseUrl;
-      presetEnv = preset.apiKeyEnv;
     }
 
-    // c. Key step. Resolves the stored key form: literal, `$VAR`, `!cmd`,
-    // or undefined for keyless local servers. Null = cancelled.
     const askKey = async (): Promise<string | undefined | null> => {
-      const choice = await pickOne("connect — API key", [
-        { value: "enter", label: "Enter key", description: "paste the API key" },
+      const choice = await pickOne("login — API key", [
+        { value: "enter", label: "Enter key", description: "paste the API key (stored in ~/.kern/auth.json)" },
         {
           value: "env",
           label: presetEnv ? `Use $${presetEnv}` : "Use $ENV_VAR",
@@ -1642,11 +1764,10 @@ await withOverlay("model", list, async (value) => {
     };
     let apiKey = await askKey();
     if (apiKey === null) {
-      toast("Connect cancelled.");
+      toast("Login cancelled.");
       return;
     }
 
-    // d. Test loop.
     let liveModels: string[] = [];
     let manualId: string | null = null;
     for (;;) {
@@ -1659,24 +1780,24 @@ await withOverlay("model", list, async (value) => {
       }
       if (result.ok) {
         liveModels = result.models;
-        ok(`Connected: ${liveModels.length} model(s) found.`);
+        ok(`Logged in to ${name}: ${liveModels.length} model(s) found.`);
         break;
       }
       err(`Test failed: ${result.message}`);
-      const fix = await pickOne("connect — test failed", [
+      const fix = await pickOne("login — test failed", [
         { value: "url", label: "Edit URL", description: baseUrl },
         { value: "key", label: "Edit key", description: "re-enter credential" },
         { value: "manual", label: "Enter model id manually", description: "skip the live test" },
         { value: "cancel", label: "Cancel", description: "write nothing (Esc)" },
       ]);
       if (fix === null || fix === "cancel") {
-        toast("Connect cancelled.");
+        toast("Login cancelled.");
         return;
       }
       if (fix === "url") {
         const typed = await promptText("base URL", baseUrl);
         if (typed === null) {
-          toast("Connect cancelled.");
+          toast("Login cancelled.");
           return;
         }
         baseUrl = typed.trim();
@@ -1685,7 +1806,7 @@ await withOverlay("model", list, async (value) => {
       if (fix === "key") {
         const k = await askKey();
         if (k === null) {
-          toast("Connect cancelled.");
+          toast("Login cancelled.");
           return;
         }
         apiKey = k;
@@ -1693,37 +1814,36 @@ await withOverlay("model", list, async (value) => {
       }
       const typed = await promptText("model id");
       if (typed === null || !typed.trim()) {
-        toast("Connect cancelled.");
+        toast("Login cancelled.");
         return;
       }
       manualId = typed.trim();
       break;
     }
 
-    // e. Model step.
     let modelId = manualId;
     if (!modelId) {
       if (liveModels.length === 0) {
         toast("No models returned — enter one manually.");
         const typed = await promptText("model id");
         if (typed === null || !typed.trim()) {
-          toast("Connect cancelled.");
+          toast("Login cancelled.");
           return;
         }
         modelId = typed.trim();
       } else {
-        const choice = await pickOne("connect — model", [
+        const choice = await pickOne("login — model", [
           ...liveModels.map((m) => ({ value: m, label: m, description: "live" })),
           { value: "__manual__", label: "Enter model id manually…", description: "" },
         ]);
         if (choice === null) {
-          toast("Connect cancelled.");
+          toast("Login cancelled.");
           return;
         }
         if (choice === "__manual__") {
           const typed = await promptText("model id");
           if (typed === null || !typed.trim()) {
-            toast("Connect cancelled.");
+            toast("Login cancelled.");
             return;
           }
           modelId = typed.trim();
@@ -1738,11 +1858,9 @@ await withOverlay("model", list, async (value) => {
       { value: "no", label: "No", description: "keep current default" },
     ]);
     if (asDefault === null) {
-      toast("Connect cancelled.");
+      toast("Login cancelled.");
       return;
     }
-    // If the key is `$VAR`, also record apiKeyEnv so env-based resolution
-    // works even when the variable is unset at resolve time.
     let apiKeyEnvOut: string | undefined = presetEnv || undefined;
     const envMatch = apiKey?.match(/^\$([A-Za-z_][A-Za-z0-9_]*)$/);
     if (envMatch?.[1]) apiKeyEnvOut = envMatch[1];
@@ -1752,9 +1870,6 @@ await withOverlay("model", list, async (value) => {
       ...(apiKeyEnvOut ? { apiKeyEnv: apiKeyEnvOut } : {}),
       models: [{ id: modelId }],
     };
-    // saveProviderToUserFile moves a literal apiKey into auth.json itself;
-    // call saveAuthKey too for literal keys (idempotent), never for
-    // `$VAR` / `!cmd` references (those must stay resolvable, not stored).
     try {
       const saved = await saveProviderToUserFile(name, cfg, { makeDefault: asDefault === "yes" });
       if (apiKey && !apiKey.startsWith("$") && !apiKey.startsWith("!")) {
@@ -1781,6 +1896,64 @@ await withOverlay("model", list, async (value) => {
     } catch (error) {
       err(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+  };
+
+  /** `/logout [provider|--all]`: clear saved provider credentials from ~/.kern/auth.json. */
+  const runLogout = async (arg?: string): Promise<void> => {
+    if (busy) {
+      toast("Wait for the current turn to settle before logging out.");
+      return;
+    }
+    const auth = await loadAuth();
+    const providers = Object.keys(auth);
+    if (providers.length === 0) {
+      toast("No saved provider credentials in ~/.kern/auth.json (unset env vars in your shell if set).");
+      return;
+    }
+
+    const activeProvider = session.modelInfo().provider;
+    const requested = arg?.trim();
+    const targets: string[] = [];
+
+    if (requested === "--all" || requested === "all") {
+      targets.push(...providers);
+    } else if (requested) {
+      if (!auth[requested]) {
+        err(`No saved credentials for "${requested}" in ~/.kern/auth.json (saved: ${providers.join(", ")}).`);
+        return;
+      }
+      targets.push(requested);
+    } else {
+      const picked = await pickOne("logout — select provider to clear", [
+        ...providers.map((p) => ({
+          value: p,
+          label: p,
+          description: `${maskKey(auth[p]?.apiKey ?? "")}${p === activeProvider ? " · active" : ""}`,
+        })),
+        ...(providers.length > 1
+          ? [{ value: "__all__", label: "All providers", description: `clear all ${providers.length} saved credential(s)` }]
+          : []),
+      ]);
+      if (picked === null) {
+        toast("Logout cancelled.");
+        return;
+      }
+      if (picked === "__all__") {
+        targets.push(...providers);
+      } else {
+        targets.push(picked);
+      }
+    }
+
+    for (const p of targets) {
+      await clearAuthKey(p);
+    }
+    ok(`Logged out of ${targets.join(", ")} (removed from ~/.kern/auth.json).`);
+    if (targets.includes(activeProvider)) {
+      toast(`Active provider "${activeProvider}" credentials cleared — use /login ${activeProvider} or /model to switch.`);
+    }
+    options.modelsFile = await loadModelsFile(cwd).catch(() => options.modelsFile);
+    printStatus();
   };
 
   const historySearch = async () => {
@@ -1818,12 +1991,6 @@ await withOverlay("model", list, async (value) => {
     "restricted",
     "autonomous",
   ];
-  const SAFETY_MODE_LABELS: Record<"strict" | "balanced" | "restricted" | "autonomous", string> = {
-    strict: "strict",
-    balanced: "balanced",
-    restricted: "restricted",
-    autonomous: "autonomous",
-  };
   const cycleSafetyMode = (direction: "tighter" | "looser") => {
     if (busy) {
       toast("Mode changes apply when idle.");
@@ -1832,7 +1999,10 @@ await withOverlay("model", list, async (value) => {
     const current = (session.safetyMode?.() ?? "balanced") as "strict" | "balanced" | "restricted" | "autonomous";
     const idx = SAFETY_MODES.indexOf(current);
     if (idx === -1) return;
-    const next = direction === "tighter" ? SAFETY_MODES[Math.max(0, idx - 1)] : SAFETY_MODES[Math.min(SAFETY_MODES.length - 1, idx + 1)];
+    const next =
+      direction === "tighter"
+        ? SAFETY_MODES[Math.max(0, idx - 1)]
+        : SAFETY_MODES[Math.min(SAFETY_MODES.length - 1, idx + 1)];
     if (!next || next === current) {
       toast(`Safety mode already at ${next === "strict" ? "most restrictive" : "most permissive"}: ${next}`);
       return;
@@ -1845,44 +2015,6 @@ await withOverlay("model", list, async (value) => {
     }
   };
 
-  // --- empty-state suggestions ------------------------------------------------------
-  // First run with no session history: 2-3 suggestion chips. Selecting one
-  // fills the editor (never auto-sends). Up/Down+Enter via the overlay list,
-  // or the 1-3 number keys handled in the global input hook below.
-  const SUGGESTIONS = ["Summarize this repo", "Find TODOs", "Run tests"];
-  const showSuggestions = async (): Promise<void> => {
-    const list = new SelectList(
-      SUGGESTIONS.map((s, i) => ({ value: s, label: `${i + 1}. ${s}` })),
-      5,
-      buildSelectTheme(),
-    );
-    const body = new Container();
-    body.addChild(new Text(theme.bold("try — ↑↓+Enter or 1-3 fills the prompt (no send) · Esc dismisses"), 0, 0));
-    body.addChild(list);
-    const handle = showDialog(body, list);
-    suggestionsOpen = true;
-    await new Promise<void>((resolve) => {
-      let done = false;
-      const finish = (fill: string | null) => {
-        if (done) return;
-        done = true;
-        suggestionsOpen = false;
-        suggestionPick = null;
-        handle.hide();
-        tui.setFocus(editor);
-        if (fill !== null) {
-          editor.setText(fill);
-          toast(`Filled: ${fill}`);
-        }
-        resolve();
-      };
-      suggestionPick = (value) => finish(value);
-      list.onSelect = (item) => finish(item.value);
-      list.onCancel = () => finish(null);
-    });
-  };
-
-  /** `/keys`: re-auth the CURRENT provider. Tests first; only a 401/403 offers re-entry. */
   const runReauth = async (): Promise<void> => {
     if (busy) {
       toast("Wait for the current turn to settle before re-authenticating.");
@@ -1891,7 +2023,7 @@ await withOverlay("model", list, async (value) => {
     const current = session.modelInfo();
     const cfg = (options.modelsFile.providers ?? {})[current.provider];
     if (!cfg) {
-      err(`Unknown provider ${JSON.stringify(current.provider)} — use /connect to add it.`);
+      err(`Unknown provider ${JSON.stringify(current.provider)} — use /login to add it.`);
       return;
     }
     toast(`Testing ${current.provider} (${cfg.baseUrl}) …`);
@@ -1976,6 +2108,36 @@ await withOverlay("model", list, async (value) => {
     else err(`Retest failed: ${retest.message}`);
   };
 
+  const resetTranscriptForRuntime = (next: { session: AgentSession; manager: SessionManager }) => {
+    unsubscribe?.();
+    const prevSession = session;
+    session = next.session;
+    manager = next.manager;
+    if (prevSession && prevSession !== next.session) {
+      void prevSession.connects?.dispose().catch(() => {});
+      prevSession.dispose();
+    }
+    queue = [];
+    cards.clear();
+    detailCards.length = 0;
+    modelUsageHistory.clear();
+    apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    closeAssistant();
+    closeReasoning();
+    lastUserPrompt = "";
+    undoStack.length = 0;
+    redoStack.length = 0;
+    pendingHistoryBefore = null;
+    pendingHistoryLabel = "";
+    renderQueue();
+    subscribe();
+    transcript.clear();
+    lastTranscriptBlock = "none";
+    printHeader();
+    replaySessionHistory();
+    printStatus();
+  };
+
   const switchSessionTo = async (file: string): Promise<void> => {
     try {
       const next = await session.switchSession?.(file);
@@ -1983,28 +2145,28 @@ await withOverlay("model", list, async (value) => {
         toast("Session switch is unavailable right now.");
         return;
       }
-      unsubscribe?.();
-      session = next.session;
-      manager = next.manager;
-      queue = [];
-      apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-      cards.clear();
-      closeAssistant();
-      closeReasoning();
-      lastUserPrompt = "";
-      undoStack.length = 0;
-      redoStack.length = 0;
-      pendingHistoryBefore = null;
-      pendingHistoryLabel = "";
-      renderQueue();
-      subscribe();
-      transcript.clear();
-      lastTranscriptBlock = "none";
-      printHeader();
-      printStatus();
+      resetTranscriptForRuntime(next);
       ok(`Session switched: ${file}`);
     } catch (error) {
       err(`Session switch failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const forkActiveSession = async (): Promise<void> => {
+    if (busy) {
+      toast("Wait for the current turn to settle before forking.");
+      return;
+    }
+    try {
+      const next = await session.fork?.();
+      if (!next) {
+        toast("Session fork is unavailable right now.");
+        return;
+      }
+      resetTranscriptForRuntime(next);
+      ok(`Forked to new session ${next.manager.sessionId ?? ""}`.trim());
+    } catch (error) {
+      err(`Fork failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -2014,7 +2176,7 @@ await withOverlay("model", list, async (value) => {
       return;
     }
     try {
-      const items = await manager.listSessions?.() ?? [];
+      const items = (await manager.listSessions?.()) ?? [];
       if (items.length === 0) {
         toast("No saved sessions yet.");
         return;
@@ -2031,7 +2193,7 @@ await withOverlay("model", list, async (value) => {
       );
       const body = new Container();
       body.addChild(new Text(theme.bold("session · switch"), 0, 0));
-      body.addChild(new Text(theme.muted("Select a saved session to load from its path."), 0, 0));
+      body.addChild(new Text(theme.muted("Select a saved session to load and replay its transcript."), 0, 0));
       body.addChild(list);
       const handle = showDialog(body, list);
       await new Promise<void>((resolve) => {
@@ -2057,11 +2219,12 @@ await withOverlay("model", list, async (value) => {
     const id = manager.sessionId ?? "—";
     const path = (manager as any).sessionFile ?? (manager as any).getActivePath?.() ?? "—";
     say(theme.bold("session"));
-    say(`  ${theme.muted("id")}    ${id}`);
-    say(`  ${theme.muted("name")}  ${name}`);
-    say(`  ${theme.muted("model")} ${m.provider}/${m.modelId}`);
-    say(`  ${theme.muted("cwd")}   ${cwd}`);
-    say(`  ${theme.muted("path")}  ${String(path)}`);
+    say(`  ${theme.muted("id")}     ${id}`);
+    say(`  ${theme.muted("name")}   ${name}`);
+    say(`  ${theme.muted("model")}  ${m.provider}/${m.modelId}`);
+    say(`  ${theme.muted("think")}  ${session.thinkingMode()}`);
+    say(`  ${theme.muted("cwd")}    ${cwd}`);
+    say(`  ${theme.muted("path")}   ${String(path)}`);
     info("Tip: resume later with `kern --session <id|path>` (or `--resume` for most recent).");
   };
 
@@ -2076,6 +2239,7 @@ await withOverlay("model", list, async (value) => {
       }
       const choice = await pickOne("session", [
         { value: "switch", label: "Switch session", description: "pick another saved session" },
+        { value: "fork", label: "Fork session", description: "branch current conversation to a new session" },
         { value: "rename", label: "Rename session", description: "set a name for this session" },
         { value: "new", label: "New session", description: "start a fresh session" },
         { value: "info", label: "Session info", description: "show id, name, path, model" },
@@ -2083,6 +2247,7 @@ await withOverlay("model", list, async (value) => {
       ]);
       if (choice === null) return;
       if (choice === "switch") return sessionSwitcher();
+      if (choice === "fork") return forkActiveSession();
       if (choice === "rename") return renameSession();
       if (choice === "new") return runCommand("/new").then(() => undefined);
       if (choice === "info") return showSessionInfo();
@@ -2094,6 +2259,10 @@ await withOverlay("model", list, async (value) => {
     }
     if (sub === "list" || sub === "switch") {
       await sessionSwitcher();
+      return;
+    }
+    if (sub === "fork") {
+      await forkActiveSession();
       return;
     }
     if (sub === "rename" || sub === "name") {
@@ -2121,7 +2290,393 @@ await withOverlay("model", list, async (value) => {
       try { await exportTranscript(subArg || undefined); } catch (error) { err(`Export failed: ${error instanceof Error ? error.message : String(error)}`); }
       return;
     }
-    err(`Unknown session action: ${sub}. Try /session, /session switch, /session rename, /session new, /session info.`);
+    err(`Unknown session action: ${sub}. Try /session, /session switch, /session fork, /session rename, /session new, /session info.`);
+  };
+
+  const printMcpStatus = (servers: McpServerStatus[]) => {
+    say(theme.bold("mcp connectors"));
+    if (servers.length === 0) {
+      info("  No MCP servers configured. Use `/mcp` to add a preset, remote HTTP/SSE server, or stdio server.");
+      return;
+    }
+    for (const s of servers) {
+      const badge =
+        s.state === "connected"
+          ? theme.success(`connected · ${s.tools.length} tool(s)`)
+          : s.state === "error"
+            ? theme.error(`error: ${s.error ?? "failed"}`)
+            : s.state === "untrusted"
+              ? theme.warn(`untrusted (run /mcp trust ${s.name})`)
+              : theme.muted(s.state);
+      say(`  ${theme.accent(s.name)}  ${theme.muted(`${s.transport} · ${s.origin}`)}  ${badge}`);
+      info(`    target: ${s.target}`);
+      if (s.tools.length > 0) {
+        info(`    tools: ${s.tools.map((t) => t.registeredName).join(", ")}`);
+      }
+      if (s.resources.length > 0) {
+        info(`    resources: ${s.resources.map((r) => r.uri).join(", ")}`);
+      }
+      if (s.prompts.length > 0) {
+        info(`    prompts: ${s.prompts.map((p) => p.name).join(", ")}`);
+      }
+      if (s.warning) {
+        info(`    warning: ${s.warning}`);
+      }
+    }
+  };
+
+  const inspectMcpServer = (s: McpServerStatus) => {
+    say(theme.bold(`mcp · ${s.name}`));
+    info(`  transport: ${s.transport} (${s.origin}) · state: ${s.state}`);
+    info(`  target: ${s.target}`);
+    if (s.serverInfo?.name) info(`  serverInfo: ${s.serverInfo.name}${s.serverInfo.version ? ` v${s.serverInfo.version}` : ""}`);
+    if (s.error) err(`  error: ${s.error}`);
+    if (s.warning) info(`  warning: ${s.warning}`);
+    if (s.tools.length > 0) {
+      say(theme.muted(`  tools (${s.tools.length}):`));
+      for (const t of s.tools) {
+        say(`    ${theme.accent(t.registeredName)}${t.description ? theme.muted(` — ${t.description}`) : ""}`);
+      }
+    } else {
+      info("  tools: none");
+    }
+    if (s.resources.length > 0) {
+      say(theme.muted(`  resources (${s.resources.length}):`));
+      for (const r of s.resources) {
+        say(`    ${r.uri}${r.description ? theme.muted(` — ${r.description}`) : ""}`);
+      }
+    }
+    if (s.prompts.length > 0) {
+      say(theme.muted(`  prompts (${s.prompts.length}):`));
+      for (const p of s.prompts) {
+        say(`    ${p.name}${p.description ? theme.muted(` — ${p.description}`) : ""}`);
+      }
+    }
+  };
+
+  const connectAndReportMcp = async (name: string, entry: McpServerConfigEntry, scope: "user" | "project" | "memory") => {
+    const mgr = session.connects;
+    if (!mgr) {
+      err("MCP connects manager is unavailable on this session.");
+      return;
+    }
+    toast(`Connecting MCP server "${name}"…`);
+    try {
+      const status = await mgr.addServer(name, entry, { scope });
+      updateSidebar();
+      printStatus();
+      if (status.state === "connected") {
+        ok(`Connected MCP "${status.name}" (${status.tools.length} tool(s), ${status.resources.length} resource(s), ${status.prompts.length} prompt(s)).`);
+        if (status.tools.length > 0) info(`  tools: ${status.tools.map((t) => t.registeredName).join(", ")}`);
+      } else if (status.state === "error") {
+        err(`Saved "${status.name}" (${scope}), but connection failed: ${status.error ?? "unknown error"}`);
+      } else {
+        info(`Saved "${status.name}" (${scope}): state=${status.state}`);
+      }
+    } catch (error) {
+      err(`Failed adding MCP server "${name}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const runMcpWizard = async (): Promise<void> => {
+    const mgr = session.connects;
+    if (!mgr) {
+      err("MCP connects manager is unavailable on this session.");
+      return;
+    }
+    if (busy) {
+      toast("Wait for the current turn to settle before modifying MCP connectors.");
+      return;
+    }
+
+    const servers = mgr.listStatuses();
+    const menuItems: Array<{ value: string; label: string; description?: string }> = [
+      { value: "__preset__", label: "Connect preset…", description: "Context7, GitHub, Playwright, Filesystem, Postgres, Linear, Notion…" },
+      { value: "__remote__", label: "Add remote HTTP / SSE MCP URL…", description: "Connect hosted MCP endpoint (Streamable HTTP or SSE)" },
+      { value: "__stdio__", label: "Add local stdio MCP command…", description: "Spawn local MCP server (npx, uvx, node, python…)" },
+      { value: "__reload__", label: "Reload & reconnect all", description: "Re-read ~/.kern/mcp.json and .mcp.json" },
+      ...servers.map((s) => ({
+        value: `server:${s.name}`,
+        label: `${s.state === "connected" ? "●" : s.state === "error" ? "✖" : s.state === "untrusted" ? "!" : "○"} ${s.name}`,
+        description: `${s.transport} · ${s.state}${s.state === "connected" ? ` · ${s.tools.length} tool(s)` : ""}`,
+      })),
+    ];
+
+    const pick = await pickOne("mcp connectors", menuItems);
+    if (pick === null) return;
+
+    if (pick === "__reload__") {
+      toast("Reloading MCP connectors…");
+      const res = await mgr.discoverAndConnect();
+      updateSidebar();
+      printStatus();
+      printMcpStatus(res.servers);
+      return;
+    }
+
+    if (pick === "__preset__") {
+      const presetId = await pickOne(
+        "mcp — choose preset",
+        CONNECTOR_PRESETS.map((p) => ({
+          value: p.id,
+          label: `${p.name} (${p.id})`,
+          description: `${p.transport} · ${p.description}`,
+        })),
+      );
+      if (!presetId) return;
+      const preset = CONNECTOR_PRESETS.find((p) => p.id === presetId);
+      if (!preset) return;
+
+      const entry: McpServerConfigEntry = {
+        ...preset.entry,
+        ...(preset.entry.args ? { args: [...preset.entry.args] } : {}),
+        ...(preset.entry.env ? { env: { ...preset.entry.env } } : {}),
+        ...(preset.entry.headers ? { headers: { ...preset.entry.headers } } : {}),
+      };
+
+      for (const v of preset.variables ?? []) {
+        const val = await promptText(
+          `${v.label}${v.required ? " (required)" : " (optional, empty to skip)"}`,
+          v.placeholder ?? "",
+        );
+        if (val === null) {
+          toast("MCP preset cancelled.");
+          return;
+        }
+        const trimmed = val.trim();
+        if (!trimmed) {
+          if (v.required) {
+            err(`${v.key} is required for ${preset.name}.`);
+            return;
+          }
+          if (v.target === "header" && v.headerName && entry.headers) {
+            delete entry.headers[v.headerName];
+          }
+          continue;
+        }
+        if (v.target === "env") {
+          entry.env = { ...(entry.env ?? {}), [v.key]: trimmed };
+        } else if (v.target === "header" && v.headerName) {
+          const formatted = v.headerName.toLowerCase() === "authorization" && !/^bearer\s+/i.test(trimmed) && !trimmed.startsWith("${")
+            ? `Bearer ${trimmed}`
+            : trimmed;
+          entry.headers = { ...(entry.headers ?? {}), [v.headerName]: formatted };
+        } else if (v.target === "arg" && entry.args) {
+          entry.args = entry.args.map((a) => a.replace(`\${${v.key}}`, trimmed));
+        } else if (v.target === "url" && entry.url) {
+          entry.url = entry.url.replace(`\${${v.key}}`, trimmed);
+        }
+      }
+
+      const scope = await pickOne("save scope", [
+        { value: "user", label: "User (~/.kern/mcp.json)", description: "available in all workspaces" },
+        { value: "project", label: "Project (.mcp.json)", description: "saved in current repo" },
+      ]);
+      if (!scope) return;
+      await connectAndReportMcp(preset.id, entry, scope as "user" | "project");
+      return;
+    }
+
+    if (pick === "__remote__") {
+      const name = (await promptText("server name ([A-Za-z0-9_.-])"))?.trim();
+      if (!name) return;
+      const url = (await promptText("MCP server URL", "https://"))?.trim();
+      if (!url || !/^https?:\/\//i.test(url)) {
+        err("URL must start with http:// or https://");
+        return;
+      }
+      const transport = await pickOne("remote transport", [
+        { value: "http", label: "Streamable HTTP (recommended)", description: "POST JSON-RPC + Mcp-Session-Id" },
+        { value: "sse", label: "Legacy HTTP + SSE", description: "GET event:endpoint + POST" },
+      ]);
+      if (!transport) return;
+      const authVal = await promptText("Bearer token / Authorization header (optional, Esc cancels)", "");
+      if (authVal === null) return;
+      const token = authVal.trim();
+      const scope = await pickOne("save scope", [
+        { value: "user", label: "User (~/.kern/mcp.json)", description: "available in all workspaces" },
+        { value: "project", label: "Project (.mcp.json)", description: "saved in current repo" },
+      ]);
+      if (!scope) return;
+      const entry: McpServerConfigEntry = {
+        transport: transport as "http" | "sse",
+        url,
+        ...(token ? { headers: { Authorization: /^bearer\s+/i.test(token) ? token : `Bearer ${token}` } } : {}),
+      };
+      await connectAndReportMcp(name, entry, scope as "user" | "project");
+      return;
+    }
+
+    if (pick === "__stdio__") {
+      const name = (await promptText("server name ([A-Za-z0-9_.-])"))?.trim();
+      if (!name) return;
+      const cmdLine = (await promptText("command + args (e.g. npx -y @modelcontextprotocol/server-memory)"))?.trim();
+      if (!cmdLine) return;
+      const parts = cmdLine.split(/\s+/).filter(Boolean);
+      const command = parts[0]!;
+      const args = parts.slice(1);
+      const envRaw = await promptText("env vars (KEY=VAL comma-separated, optional)", "");
+      if (envRaw === null) return;
+      const env: Record<string, string> = {};
+      for (const pair of envRaw.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const eq = pair.indexOf("=");
+        if (eq > 0) env[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+      }
+      const scope = await pickOne("save scope", [
+        { value: "user", label: "User (~/.kern/mcp.json)", description: "available in all workspaces" },
+        { value: "project", label: "Project (.mcp.json)", description: "saved in current repo (auto-trusted)" },
+      ]);
+      if (!scope) return;
+      const entry: McpServerConfigEntry = {
+        transport: "stdio",
+        command,
+        ...(args.length > 0 ? { args } : {}),
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+      };
+      await connectAndReportMcp(name, entry, scope as "user" | "project");
+      return;
+    }
+
+    if (pick.startsWith("server:")) {
+      const serverName = pick.slice(7);
+      const target = mgr.getServerStatus(serverName);
+      if (!target) return;
+      const action = await pickOne(`mcp · ${serverName} (${target.state})`, [
+        { value: "inspect", label: "Inspect tools, resources & prompts", description: `${target.tools.length} tool(s)` },
+        { value: "reconnect", label: "Reconnect / test connection", description: "re-establish transport and refresh tools" },
+        ...(target.state === "untrusted"
+          ? [{ value: "trust", label: "Trust project stdio server", description: "approve fingerprint in ~/.kern/mcp-trust.json" }]
+          : []),
+        {
+          value: target.disabled ? "enable" : "disable",
+          label: target.disabled ? "Enable server" : "Disable server",
+          description: target.disabled ? "reconnect and expose tools" : "disconnect without deleting config",
+        },
+        { value: "remove", label: "Remove server", description: "disconnect and delete from mcp.json" },
+      ]);
+      if (!action) return;
+      if (action === "inspect") {
+        inspectMcpServer(target);
+      } else if (action === "reconnect") {
+        toast(`Reconnecting "${serverName}"…`);
+        const next = await mgr.reconnectServer(serverName);
+        updateSidebar();
+        printStatus();
+        inspectMcpServer(next);
+      } else if (action === "trust") {
+        const next = await mgr.trustServer(serverName);
+        updateSidebar();
+        printStatus();
+        inspectMcpServer(next);
+      } else if (action === "disable" || action === "enable") {
+        const next = await mgr.toggleServer(serverName, action === "disable");
+        updateSidebar();
+        printStatus();
+        ok(`${serverName}: ${next.state}`);
+      } else if (action === "remove") {
+        await mgr.removeServer(serverName);
+        updateSidebar();
+        printStatus();
+        ok(`Removed MCP server "${serverName}".`);
+      }
+    }
+  };
+
+  const runMcpCommand = async (arg: string): Promise<void> => {
+    const mgr = session.connects;
+    if (!mgr) {
+      err("MCP connects manager is unavailable on this session.");
+      return;
+    }
+    const tokens = arg.trim().split(/\s+/).filter(Boolean);
+    const sub = (tokens[0] ?? "").toLowerCase();
+    if (!sub) {
+      await runMcpWizard();
+      return;
+    }
+    if (sub === "list" || sub === "ls" || sub === "status") {
+      printMcpStatus(mgr.listStatuses());
+      return;
+    }
+    if (sub === "presets") {
+      say(theme.bold("mcp presets"));
+      for (const p of CONNECTOR_PRESETS) {
+        say(`  ${theme.accent(p.id)}  ${theme.muted(`${p.transport} — ${p.description}`)}`);
+      }
+      return;
+    }
+    if (busy) {
+      toast("Wait for the current turn to settle before modifying MCP connectors.");
+      return;
+    }
+    if (sub === "reconnect" || sub === "reload") {
+      const targetName = tokens[1];
+      if (targetName) {
+        const next = await mgr.reconnectServer(targetName);
+        updateSidebar();
+        printStatus();
+        inspectMcpServer(next);
+      } else {
+        const res = await mgr.discoverAndConnect();
+        updateSidebar();
+        printStatus();
+        printMcpStatus(res.servers);
+      }
+      return;
+    }
+    if (sub === "trust") {
+      const targetName = tokens[1];
+      if (!targetName) {
+        err("Usage: /mcp trust <name>");
+        return;
+      }
+      const next = await mgr.trustServer(targetName);
+      updateSidebar();
+      printStatus();
+      inspectMcpServer(next);
+      return;
+    }
+    if (sub === "remove" || sub === "rm") {
+      const targetName = tokens[1];
+      if (!targetName) {
+        err("Usage: /mcp remove <name>");
+        return;
+      }
+      const removed = await mgr.removeServer(targetName);
+      updateSidebar();
+      printStatus();
+      if (removed) ok(`Removed MCP server "${targetName}".`);
+      else info(`MCP server "${targetName}" was not configured.`);
+      return;
+    }
+    if (sub === "enable" || sub === "disable") {
+      const targetName = tokens[1];
+      if (!targetName) {
+        err(`Usage: /mcp ${sub} <name>`);
+        return;
+      }
+      const next = await mgr.toggleServer(targetName, sub === "disable");
+      updateSidebar();
+      printStatus();
+      ok(`${targetName}: ${next.state}`);
+      return;
+    }
+    if (sub === "add") {
+      const name = tokens[1];
+      const target = tokens[2];
+      const extraArgs = tokens.slice(3);
+      if (!name || !target) {
+        err("Usage: /mcp add <name> <https://url | command> [args...]");
+        return;
+      }
+      const isRemote = /^https?:\/\//i.test(target);
+      const entry: McpServerConfigEntry = isRemote
+        ? { transport: /\/sse(?:[/?#]|$)/i.test(target) ? "sse" : "http", url: target }
+        : { transport: "stdio", command: target, ...(extraArgs.length > 0 ? { args: extraArgs } : {}) };
+      await connectAndReportMcp(name, entry, "user");
+      return;
+    }
+    err(`Unknown /mcp action "${sub}". Try /mcp, /mcp list, /mcp presets, /mcp add <name> <url|cmd>, /mcp reconnect, /mcp trust <name>, /mcp remove <name>.`);
   };
 
   // --- slash commands -------------------------------------------------------------------
@@ -2131,15 +2686,32 @@ await withOverlay("model", list, async (value) => {
     const normalized = cmd?.toLowerCase();
     switch (normalized) {
       case "/help":
-        for (const c of COMMANDS) say(`  ${theme.accent("/" + c.name)}  ${theme.muted(c.description)}`);
-        {
-          const advanced = Object.entries(ADVANCED_COMMANDS);
-          if (advanced.length > 0) {
-            info(theme.muted(`Advanced: ${advanced.map(([name, description]) => `/${name} (${description})`).join(" · ")}`));
-          }
+        for (const c of TUI_COMMANDS) {
+          const badge = c.shortcut ? ` [${c.shortcut}]` : "";
+          say(`  ${theme.accent("/" + c.name)}  ${theme.muted(`${c.description}${badge}`)}`);
         }
-        info(HINTS);
-        info(theme.muted("Tips: use @path to attach files, !cmd for shell. While running, thinking/tools show a running state; click headers after completion to expand/collapse details. /undo and /redo are best-effort in git workspaces. /budget shows session limits/usage."));
+        info(TUI_HINTS);
+        info("Skills: force any discovered skill with `/skill:<name> [prompt]`.");
+        info("Scroll: PageUp / PageDown / Ctrl+Up / Ctrl+Down / Ctrl+Home / Ctrl+End · Search matches highlight live in the viewport.");
+        return true;
+      case "/palette":
+        await openCommandPalette();
+        return true;
+      case "/search":
+      case "/find":
+        openLiveSearch(arg || undefined);
+        return true;
+      case "/expand":
+        toggleAllDetails(true);
+        return true;
+      case "/collapse":
+        toggleAllDetails(false);
+        return true;
+      case "/thinking":
+        await pickThinkingLevel(arg || undefined);
+        return true;
+      case "/fork":
+        await forkActiveSession();
         return true;
       case "/branch":
         await recordBranchSummary();
@@ -2149,6 +2721,7 @@ await withOverlay("model", list, async (value) => {
         return false;
       case "/clear":
         transcript.clear();
+        detailCards.length = 0;
         lastTranscriptBlock = "none";
         cards.clear();
         closeAssistant();
@@ -2172,8 +2745,16 @@ await withOverlay("model", list, async (value) => {
       case "/keys":
         await runReauth();
         return true;
+      case "/login":
       case "/connect":
-        await runConnect();
+        await runLogin(arg || undefined);
+        return true;
+      case "/logout":
+        await runLogout(arg || undefined);
+        return true;
+      case "/mcp":
+      case "/connects":
+        await runMcpCommand(arg);
         return true;
       case "/compact": {
         if (busy) {
@@ -2235,25 +2816,7 @@ await withOverlay("model", list, async (value) => {
         }
         try {
           const fresh = await options.newSession();
-          unsubscribe?.();
-          session = fresh.session;
-          manager = fresh.manager;
-          queue = [];
-          apiUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-          cards.clear();
-          closeAssistant();
-          closeReasoning();
-          lastUserPrompt = "";
-          undoStack.length = 0;
-          redoStack.length = 0;
-          pendingHistoryBefore = null;
-          pendingHistoryLabel = "";
-          renderQueue();
-          subscribe();
-          transcript.clear();
-          lastTranscriptBlock = "none";
-          printHeader();
-          printStatus();
+          resetTranscriptForRuntime(fresh);
           toast("New session started.");
         } catch (error) {
           err(`New session failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -2273,29 +2836,13 @@ await withOverlay("model", list, async (value) => {
         return true;
       }
       default:
-        err(`Unknown command: ${cmd ?? ""}. Try /help.`);
+        err(`Unknown command: ${cmd ?? ""}. Try /help or Ctrl+P.`);
         return true;
     }
   };
 
   // --- prompt submission ---------------------------------------------------------------------
-  /** One-line arg summary for tool cards (path/command first, capped). */
-  const summarizeArgs = (args: unknown): string => {
-    if (typeof args !== "object" || args === null) return "";
-    const record = args as Record<string, unknown>;
-    const first =
-      typeof record["path"] === "string"
-        ? record["path"]
-        : typeof record["command"] === "string"
-          ? record["command"]
-          : Object.entries(record)
-              .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-              .join(" ");
-    const text = String(first);
-    return text.length > 100 ? text.slice(0, 100) + "…" : text;
-  };
-
-  const runTurn = (text: string) => {
+  const runTurn = (text: string, displayLabel?: string, displayText?: string) => {
     if (busy) return;
     busy = true;
     abort = new AbortController();
@@ -2304,7 +2851,7 @@ await withOverlay("model", list, async (value) => {
     lastUserPrompt = text;
     setBusy(true);
     turnNumber += 1;
-    renderUserPrompt(text);
+    renderUserPrompt(displayText ?? text, displayLabel ?? "you");
     void (async () => {
       await beginTurnHistory(`turn ${turnNumber}`);
       try {
@@ -2342,14 +2889,11 @@ await withOverlay("model", list, async (value) => {
     denyPendingApprovals();
     closeAssistant();
     closeReasoning();
-    // Global running state is shown in the dock activity line below the input.
-    void 0;
     toast("Stopped current run.");
     setActivity("ready");
     return true;
   };
 
-  /** `!cmd`: run directly, show output, and have the agent respond to it. */
   const runShellMode = async (command: string) => {
     if (busy) {
       toast("A turn is running — shell mode waits for settle.");
@@ -2381,7 +2925,7 @@ await withOverlay("model", list, async (value) => {
       if (!text) return;
       if (text.startsWith("/") || (text.startsWith("!") && !text.startsWith("!="))) {
         const cmd = text.split(/\s+/)[0]?.toLowerCase();
-        if (cmd === "/help" || cmd === "/budget") {
+        if (cmd === "/help" || cmd === "/budget" || cmd === "/search" || cmd === "/find" || cmd === "/expand" || cmd === "/collapse") {
           editor.setText("");
           editor.addToHistory(text);
           void (async () => {
@@ -2417,6 +2961,22 @@ await withOverlay("model", list, async (value) => {
       void runShellMode(command);
       return;
     }
+    if (trimmed.toLowerCase().startsWith("/skill:")) {
+      editor.addToHistory(trimmed);
+      void (async () => {
+        const resolved = await resolveSkillInvocation(trimmed, cwd);
+        if (resolved.error) {
+          err(resolved.error);
+          return;
+        }
+        if (resolved.expandedPrompt && resolved.skill) {
+          recentPrompts.push(trimmed);
+          if (recentPrompts.length > 200) recentPrompts.splice(0, recentPrompts.length - 200);
+          runTurn(resolved.expandedPrompt, `you (skill:${resolved.skill.name})`, trimmed);
+        }
+      })();
+      return;
+    }
     if (trimmed.startsWith("/")) {
       editor.addToHistory(trimmed);
       void (async () => {
@@ -2444,19 +3004,16 @@ await withOverlay("model", list, async (value) => {
       recentPrompts.push(raw);
       if (recentPrompts.length > 200) recentPrompts.splice(0, recentPrompts.length - 200);
       editor.addToHistory(raw);
-      runTurn(text);
+      runTurn(text, "you", raw);
     })();
   };
 
-  // Auth-failure recovery (wired to the agent_error handler above). Offers
-  // immediate actions; Retry re-submits the last user prompt, /connect and
-  // /model reuse the existing runCommand paths.
   handleAuthError = (_message: string) => {
     if (authOverlayOpen) return;
     authOverlayOpen = true;
     void (async () => {
       const pick = await pickOne("auth error — how to recover?", [
-        { value: "connect", label: "Reconnect with /connect", description: "run the connect wizard" },
+        { value: "login", label: "Log in with /login", description: "run the provider login wizard" },
         {
           value: "retry",
           label: "Retry turn",
@@ -2467,7 +3024,7 @@ await withOverlay("model", list, async (value) => {
         { value: "dismiss", label: "Dismiss", description: "stay here (Esc)" },
       ]);
       authOverlayOpen = false;
-      if (pick === "connect") await runCommand("/connect");
+      if (pick === "login") await runCommand("/login");
       else if (pick === "model") await runCommand("/model");
       else if (pick === "retry") {
         if (!lastUserPrompt) {
@@ -2486,7 +3043,7 @@ await withOverlay("model", list, async (value) => {
         toast("Retrying last prompt…");
         runTurn(lastUserPrompt);
       } else {
-        toast("Auth error dismissed — /connect, /model, or retry when ready.");
+        toast("Auth error dismissed — /login, /model, or retry when ready.");
       }
     })();
   };
@@ -2503,13 +3060,24 @@ await withOverlay("model", list, async (value) => {
     if (resizeTimer) clearTimeout(resizeTimer);
     if (process.stdout.isTTY) process.off("SIGWINCH", handleResize);
     options.approvalHook.current = null;
+    if (options.askUserHook) options.askUserHook.current = null;
     unsubscribe?.();
+    const draftText = editor.getText();
     tui.stop();
-    // Fullscreen alt-screen restores the previous screen on stop, so the
-    // farewell must go to stdout after (it would vanish otherwise).
     process.stdout.write(theme.muted("bye.\n"));
-    void saveState();
-    process.exit(0);
+    void Promise.allSettled([
+      saveTuiState({
+        draftText,
+        recentPrompts,
+        stash,
+        queue,
+        lastUserPrompt,
+      }),
+      session.connects?.dispose(),
+    ]).finally(() => {
+      session.dispose();
+      process.exit(0);
+    });
   };
 
   const requestExit = () => {
@@ -2523,17 +3091,21 @@ await withOverlay("model", list, async (value) => {
   };
 
   // --- global keys ----------------------------------------------------------------------------
-  // Registered via addInputListener, which runs BEFORE focused components, so
-  // Esc-cancel for prompt dialogs is emulated here (pi-tui's Editor has no
-  // onEscape): a handled Esc returns `{consume:true}` to preempt the dialog's editor.
   tui.addInputListener((key) => {
-    // Esc cancels an open text-prompt dialog (prevents the dialog's editor).
     if (promptDialog && matchesKey(key, "escape")) {
       promptDialog.cancel();
       return { consume: true };
     }
     if (tui.hasOverlay()) {
-      return undefined; // overlays own Esc/arrows/Enter
+      return undefined;
+    }
+    if (matchesKey(key, "ctrl+p")) {
+      void openCommandPalette();
+      return { consume: true };
+    }
+    if (matchesKey(key, "ctrl+o")) {
+      toggleAllDetails();
+      return { consume: true };
     }
     if (matchesKey(key, "escape")) {
       if (stopCurrentTurn()) return { consume: true };
@@ -2564,7 +3136,6 @@ await withOverlay("model", list, async (value) => {
       }
       return { consume: true };
     }
-    // Backspace on an empty editor removes the last queued item.
     if (matchesKey(key, "backspace") && editor.getText().length === 0 && queue.length > 0) {
       const removed = queue.pop();
       renderQueue();
@@ -2572,7 +3143,6 @@ await withOverlay("model", list, async (value) => {
       return { consume: true };
     }
     if (matchesKey(key, "ctrl+s")) {
-      // Stash/restore the draft (pi-tui's Editor has no stashPrompt).
       if (editor.getText().length > 0) {
         stash = editor.getText();
         editor.setText("");
@@ -2592,7 +3162,6 @@ await withOverlay("model", list, async (value) => {
       tui.requestRender();
       return { consume: true };
     }
-    // Ctrl+W: kill (copy) current editor line to kill ring.
     if (matchesKey(key, "ctrl+w")) {
       const text = editor.getText();
       if (text) {
@@ -2601,7 +3170,6 @@ await withOverlay("model", list, async (value) => {
       }
       return { consume: true };
     }
-    // Ctrl+Y: yank (paste) from kill ring into editor.
     if (matchesKey(key, "ctrl+y")) {
       const yanked = killRing.peek();
       if (yanked) {
@@ -2610,51 +3178,10 @@ await withOverlay("model", list, async (value) => {
       }
       return { consume: true };
     }
-    // Ctrl+F: search transcript text (shows matches; does not auto-scroll transcript).
-    if (matchesKey(key, "ctrl+f")) {
-      void (async () => {
-        const result = await promptText("search transcript", searchQuery);
-        if (result === null) return;
-        const q = result.trim();
-        searchQuery = q;
-        searchResults = [];
-        searchActiveIndex = 0;
-        if (!q) {
-          toast("Search cancelled (empty query).");
-          return;
-        }
-        const qLower = q.toLowerCase();
-        for (let i = 0; i < transcriptLines.length; i++) {
-          const line = transcriptLines[i] || "";
-          if (line.toLowerCase().includes(qLower)) searchResults.push(i);
-        }
-        if (searchResults.length === 0) {
-          toast("No matches found.");
-          return;
-        }
-        const picked = await pickOne(
-          `transcript search (${searchResults.length} match${searchResults.length === 1 ? "" : "es"})`,
-          searchResults.slice(0, 200).map((idx) => {
-            const ln = (transcriptLines[idx] || "").replace(/\s+/g, " ").trim();
-            const snippet = ln.length > 90 ? `${ln.slice(0, 90)}…` : ln || "(empty)";
-            return { value: String(idx), label: `L${idx + 1}: ${snippet}`, description: "select to print line to transcript" };
-          }),
-        );
-        if (picked === null) return;
-        const idx = Number(picked);
-        const ln = transcriptLines[idx] || "";
-        say(theme.bold(`search match L${idx + 1}`));
-        say(ln || "(empty line)");
-        info("Note: transcript search currently lists/prints matches; it does not auto-scroll the live transcript view.");
-      })();
-      return { consume: true };
-    }
     if (matchesKey(key, "shift+tab")) {
       if (!busy) cycleMode();
       return { consume: true };
     }
-    // B = tighter safety mode, A = looser safety mode (shift+key to avoid
-    // colliding with normal typing while the editor is focused).
     if (matchesKey(key, "shift+b")) {
       if (!busy) cycleSafetyMode("tighter");
       return { consume: true };
@@ -2666,11 +3193,13 @@ await withOverlay("model", list, async (value) => {
     return undefined;
   });
 
+  printHeader();
+  replaySessionHistory();
+  printStatus();
   updateSidebar();
   tui.start();
   if (options.initialPrompt?.trim()) {
     const initial = options.initialPrompt;
-    // Submit after the UI is ready; slight delay avoids racing initial render/state restore.
     setTimeout(() => {
       if (!exiting) submit(initial);
     }, 0);

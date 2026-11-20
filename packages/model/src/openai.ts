@@ -51,6 +51,15 @@ interface SSEChoice {
       function?: { name?: string; arguments?: string };
     }>;
   };
+  message?: {
+    content?: string | null;
+    reasoning_content?: string | null;
+    reasoning?: string | null;
+    tool_calls?: Array<{
+      id?: string;
+      function?: { name?: string; arguments?: string };
+    }>;
+  };
   finish_reason?: string | null;
 }
 
@@ -127,6 +136,46 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions): ModelAdapter
 
         const pending = new Map<number, { id: string; name: string; args: string }>();
         let finishReason: string | null = null;
+        const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+
+        if (contentType.includes("application/json")) {
+          let payload: SSEChunk;
+          try {
+            payload = (await res.json()) as SSEChunk;
+          } catch (error) {
+            throw KernError.model("malformed_response", `Invalid JSON response from ${options.provider}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          if (payload.error?.message) {
+            const errCode = typeof payload.error.code === "number" ? payload.error.code : undefined;
+            throw toKernError(new Error(payload.error.message), errCode, options);
+          }
+          if (payload.usage) {
+            yield { type: "usage", usage: toTokenCounts(payload.usage) };
+          }
+          const choice = payload.choices?.[0];
+          const msg = choice?.message;
+          if (typeof msg?.content === "string" && msg.content.length > 0) {
+            yield { type: "text_delta", delta: msg.content };
+          }
+          const reasoning = msg?.reasoning_content ?? msg?.reasoning;
+          if (typeof reasoning === "string" && reasoning.length > 0) {
+            yield { type: "reasoning_delta", delta: reasoning };
+          }
+          const msgToolCalls = msg?.tool_calls ?? [];
+          for (let i = 0; i < msgToolCalls.length; i++) {
+            const tc = msgToolCalls[i]!;
+            const call: ToolCallBlock = {
+              type: "tool_call",
+              id: tc.id || `call_${Math.random().toString(36).slice(2, 10)}`,
+              name: tc.function?.name ?? "",
+              arguments: parseArgs(tc.function?.arguments ?? ""),
+            };
+            yield { type: "tool_call_complete", call };
+          }
+          finishReason = choice?.finish_reason ?? null;
+          yield { type: "finished", reason: mapStopReason(finishReason, msgToolCalls.length > 0) };
+          return;
+        }
 
         for await (const eventText of sseEvents(res.body)) {
           if (eventText === "[DONE]") break;

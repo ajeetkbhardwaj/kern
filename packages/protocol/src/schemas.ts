@@ -86,6 +86,7 @@ export const BaseEntrySchema = z.object({
   id: z.string(),
   parentId: z.string().nullable(),
   timestamp: z.string().datetime(),
+  seq: z.number().int().nonnegative().optional(),
 });
 
 /** Session header */

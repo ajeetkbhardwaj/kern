@@ -13,6 +13,7 @@
     "@kern/coding-agent": "*",
     "@kern/model": "*",
     "@kern/protocol": "*",
-    "@kern/session-store": "*"
+    "@kern/session-store": "*",
+    "@kern/connects": "*"
   }
 }

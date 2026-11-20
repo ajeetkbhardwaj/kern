@@ -394,6 +394,47 @@ describe("openai adapter", () => {
       })(),
     ).rejects.toMatchObject({ kind: "rate_limit" });
   });
+
+  it("handles non-SSE application/json responses cleanly", async () => {
+    const adapter = createOpenAIAdapter({
+      provider: "test",
+      modelId: "json-compat",
+      baseUrl: "https://example.com/v1",
+      apiKey: "k",
+      contextWindow: 64000,
+      maxOutputTokens: 2000,
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: "hello from json",
+                  reasoning_content: "thought briefly",
+                  tool_calls: [{ id: "tc_1", function: { name: "read", arguments: '{"path":"README.md"}' } }],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+            usage: { prompt_tokens: 12, completion_tokens: 8 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        )) as typeof fetch,
+    });
+
+    const events: any[] = [];
+    for await (const ev of adapter.stream({ systemPrompt: "s", messages: [], tools: [] })) {
+      events.push(ev);
+    }
+    expect(events).toContainEqual({ type: "usage", usage: { input: 12, output: 8 } });
+    expect(events).toContainEqual({ type: "text_delta", delta: "hello from json" });
+    expect(events).toContainEqual({ type: "reasoning_delta", delta: "thought briefly" });
+    expect(events).toContainEqual({
+      type: "tool_call_complete",
+      call: { type: "tool_call", id: "tc_1", name: "read", arguments: { path: "README.md" } },
+    });
+    expect(events).toContainEqual({ type: "finished", reason: "tool_use" });
+  });
 });
 
 describe("fallback models", () => {
